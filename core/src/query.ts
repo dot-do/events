@@ -1,0 +1,200 @@
+/**
+ * Lakehouse Query Helpers for DuckDB
+ */
+
+export interface QueryOptions {
+  /** R2 bucket name */
+  bucket: string
+  /** Date range filter */
+  dateRange?: { start: Date; end: Date }
+  /** Filter by DO ID */
+  doId?: string
+  /** Filter by DO class */
+  doClass?: string
+  /** Filter by colo */
+  colo?: string
+  /** Filter by event types */
+  eventTypes?: string[]
+  /** Filter by collection name (for CDC events) */
+  collection?: string
+  /** Limit results */
+  limit?: number
+  /** Order by (default: ts DESC) */
+  orderBy?: string
+}
+
+/**
+ * Build a DuckDB query for events stored in R2
+ *
+ * @example
+ * ```typescript
+ * const sql = buildQuery({
+ *   bucket: 'my-events',
+ *   dateRange: { start: new Date('2024-01-01'), end: new Date('2024-01-31') },
+ *   eventTypes: ['rpc.call'],
+ *   doClass: 'ChatRoom',
+ * })
+ * // SELECT * FROM read_json_auto('r2://my-events/events/2024/01/**\/*.jsonl')
+ * // WHERE type IN ('rpc.call') AND "do".class = 'ChatRoom'
+ * ```
+ */
+export function buildQuery(options: QueryOptions): string {
+  const { bucket, dateRange, doId, doClass, colo, eventTypes, collection, limit, orderBy } = options
+
+  // Build path pattern based on date range
+  let pathPattern = `r2://${bucket}/events/`
+  if (dateRange) {
+    const start = dateRange.start
+    const end = dateRange.end
+
+    if (start.getFullYear() === end.getFullYear()) {
+      pathPattern += `${start.getFullYear()}/`
+      if (start.getMonth() === end.getMonth()) {
+        pathPattern += `${String(start.getMonth() + 1).padStart(2, '0')}/`
+        if (start.getDate() === end.getDate()) {
+          pathPattern += `${String(start.getDate()).padStart(2, '0')}/`
+        } else {
+          pathPattern += '**/'
+        }
+      } else {
+        pathPattern += '**/'
+      }
+    } else {
+      pathPattern += '**/'
+    }
+  } else {
+    pathPattern += '**/'
+  }
+  pathPattern += '*.jsonl'
+
+  // Build WHERE clauses
+  const conditions: string[] = []
+
+  if (doId) {
+    conditions.push(`"do".id = '${doId}'`)
+  }
+
+  if (doClass) {
+    conditions.push(`"do".class = '${doClass}'`)
+  }
+
+  if (colo) {
+    conditions.push(`"do".colo = '${colo}'`)
+  }
+
+  if (eventTypes && eventTypes.length > 0) {
+    conditions.push(`type IN (${eventTypes.map(t => `'${t}'`).join(', ')})`)
+  }
+
+  if (collection) {
+    conditions.push(`collection = '${collection}'`)
+  }
+
+  if (dateRange) {
+    conditions.push(`ts >= '${dateRange.start.toISOString()}'`)
+    conditions.push(`ts <= '${dateRange.end.toISOString()}'`)
+  }
+
+  // Build query
+  let query = `SELECT * FROM read_json_auto('${pathPattern}')`
+
+  if (conditions.length > 0) {
+    query += `\nWHERE ${conditions.join('\n  AND ')}`
+  }
+
+  query += `\nORDER BY ${orderBy ?? 'ts DESC'}`
+
+  if (limit) {
+    query += `\nLIMIT ${limit}`
+  }
+
+  return query
+}
+
+/**
+ * Build a query to reconstruct document history (time travel)
+ */
+export function buildHistoryQuery(options: {
+  bucket: string
+  collection: string
+  docId: string
+  dateRange?: { start: Date; end: Date }
+}): string {
+  const base = buildQuery({
+    bucket: options.bucket,
+    dateRange: options.dateRange,
+    eventTypes: ['collection.insert', 'collection.update', 'collection.delete'],
+    collection: options.collection,
+    orderBy: 'ts ASC',
+  })
+
+  return base.replace(
+    'WHERE',
+    `WHERE docId = '${options.docId}'\n  AND`
+  )
+}
+
+/**
+ * Build a query for RPC latency analytics
+ */
+export function buildLatencyQuery(options: {
+  bucket: string
+  dateRange?: { start: Date; end: Date }
+  doClass?: string
+  method?: string
+}): string {
+  const conditions: string[] = [`type = 'rpc.call'`]
+
+  if (options.doClass) {
+    conditions.push(`"do".class = '${options.doClass}'`)
+  }
+
+  if (options.method) {
+    conditions.push(`method = '${options.method}'`)
+  }
+
+  let pathPattern = `r2://${options.bucket}/events/`
+  if (options.dateRange) {
+    pathPattern += `${options.dateRange.start.getFullYear()}/`
+  }
+  pathPattern += '**/*.jsonl'
+
+  return `SELECT
+  "do".class,
+  method,
+  COUNT(*) as call_count,
+  AVG(durationMs) as avg_duration_ms,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY durationMs) as p50_ms,
+  PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY durationMs) as p95_ms,
+  PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY durationMs) as p99_ms,
+  MAX(durationMs) as max_duration_ms,
+  SUM(CASE WHEN success THEN 0 ELSE 1 END) as error_count
+FROM read_json_auto('${pathPattern}')
+WHERE ${conditions.join('\n  AND ')}
+GROUP BY "do".class, method
+ORDER BY call_count DESC`
+}
+
+/**
+ * Build a query to find events between two PITR bookmarks
+ */
+export function buildPITRRangeQuery(options: {
+  bucket: string
+  startBookmark: string
+  endBookmark: string
+  collection?: string
+}): string {
+  const conditions = [
+    `bookmark > '${options.startBookmark}'`,
+    `bookmark <= '${options.endBookmark}'`,
+  ]
+
+  if (options.collection) {
+    conditions.push(`collection = '${options.collection}'`)
+  }
+
+  return `SELECT *
+FROM read_json_auto('r2://${options.bucket}/events/**/*.jsonl')
+WHERE ${conditions.join('\n  AND ')}
+ORDER BY ts ASC`
+}

@@ -1,0 +1,24 @@
+{
+  "name": "events.do",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Event ingestion and streaming for Durable Objects - events.workers.do",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:e2e": "cd e2e && pnpm test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.10.15",
+    "@cloudflare/workers-types": "^4.20250121.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8",
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "@dotdo/events": "file:./core"
+  }
+}

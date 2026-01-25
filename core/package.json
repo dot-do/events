@@ -1,0 +1,61 @@
+{
+  "name": "@dotdo/events",
+  "version": "0.1.0",
+  "description": "Event emission, CDC, and lakehouse streaming for Durable Objects",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "keywords": [
+    "events",
+    "cdc",
+    "durable-objects",
+    "cloudflare",
+    "workers",
+    "lakehouse",
+    "analytics",
+    "streaming"
+  ],
+  "author": {
+    "name": "Platform.do",
+    "email": "npm@platform.do",
+    "url": "https://platform.do"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dot-do/events.git",
+    "directory": "core"
+  },
+  "homepage": "https://events.do",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250121.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  },
+  "peerDependencies": {
+    "@cloudflare/workers-types": "^4.0.0"
+  }
+}

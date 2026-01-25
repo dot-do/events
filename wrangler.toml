@@ -1,0 +1,35 @@
+name = "events-do"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Primary domain (once set up)
+# routes = [
+#   { pattern = "events.do/*", zone_name = "events.do" }
+# ]
+
+# Alias routes
+routes = [
+  { pattern = "events.workers.do/*", zone_name = "workers.do" }
+]
+
+# R2 bucket for event storage
+[[r2_buckets]]
+binding = "EVENTS_BUCKET"
+bucket_name = "events"
+
+# Optional: Queue for real-time streaming
+# [[queues.producers]]
+# binding = "EVENTS_QUEUE"
+# queue = "events"
+
+[vars]
+ENVIRONMENT = "production"
+
+# Development
+[env.dev]
+name = "events-do-dev"
+routes = []
+
+[env.dev.vars]
+ENVIRONMENT = "development"
