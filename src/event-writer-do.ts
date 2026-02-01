@@ -14,9 +14,17 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { writeEvents, type EventRecord, type WriteResult } from './event-writer'
+import { writeEvents, ulid, type EventRecord, type WriteResult } from './event-writer'
+
+/**
+ * Internal event with unique ID for deduplication
+ */
+interface BufferedEvent extends EventRecord {
+  _eventId: string
+}
 
 const BUFFER_KEY = '_eventWriter:buffer'
+const FLUSHED_KEY = '_eventWriter:flushed'
 
 import type { Env as FullEnv } from './env'
 
@@ -61,7 +69,8 @@ export interface StatsResult {
 // ============================================================================
 
 export class EventWriterDO extends DurableObject<Env> {
-  private buffer: EventRecord[] = []
+  private buffer: BufferedEvent[] = []
+  private flushedEventIds: Set<string> = new Set()
   private lastFlushTime = Date.now()
   private pendingWrites = 0
   private shardId = 0
@@ -83,13 +92,46 @@ export class EventWriterDO extends DurableObject<Env> {
 
   /**
    * Restore buffer from DO storage (after eviction or restart)
+   * Filters out any events that were already successfully flushed to R2
    */
   private async restoreBuffer(): Promise<void> {
     try {
-      const stored = await this.ctx.storage.get<EventRecord[]>(BUFFER_KEY)
+      // First, restore the set of flushed event IDs
+      const flushedIds = await this.ctx.storage.get<string[]>(FLUSHED_KEY)
+      if (flushedIds && flushedIds.length > 0) {
+        this.flushedEventIds = new Set(flushedIds)
+        console.log(`[EventWriterDO:${this.shardId}] Restored ${flushedIds.length} flushed event markers`)
+      }
+
+      // Then restore buffer, filtering out already-flushed events
+      const stored = await this.ctx.storage.get<BufferedEvent[]>(BUFFER_KEY)
       if (stored && stored.length > 0) {
-        this.buffer = stored
-        console.log(`[EventWriterDO:${this.shardId}] Restored ${stored.length} events from storage`)
+        // Filter out events that were already flushed (handles the partial flush race)
+        const unflushedEvents = stored.filter(e => !this.flushedEventIds.has(e._eventId))
+        const duplicateCount = stored.length - unflushedEvents.length
+
+        if (duplicateCount > 0) {
+          console.log(`[EventWriterDO:${this.shardId}] Filtered ${duplicateCount} already-flushed events`)
+        }
+
+        if (unflushedEvents.length > 0) {
+          this.buffer = unflushedEvents
+          console.log(`[EventWriterDO:${this.shardId}] Restored ${unflushedEvents.length} events from storage`)
+        }
+
+        // Clean up: if we filtered events, update persisted buffer and clear flushed markers
+        if (duplicateCount > 0) {
+          await this.persistBuffer()
+          // Clear flushed markers since we've now filtered the buffer
+          this.flushedEventIds.clear()
+          await this.ctx.storage.delete(FLUSHED_KEY)
+        }
+      } else {
+        // No buffer to restore, clear any stale flushed markers
+        if (this.flushedEventIds.size > 0) {
+          this.flushedEventIds.clear()
+          await this.ctx.storage.delete(FLUSHED_KEY)
+        }
       }
     } catch (error) {
       console.warn(`[EventWriterDO:${this.shardId}] Failed to restore buffer:`, error)
@@ -140,17 +182,15 @@ export class EventWriterDO extends DurableObject<Env> {
       return { ok: false, buffered: this.buffer.length, shard: this.shardId }
     }
 
-    // Add source if provided (and not already set on events)
-    if (source) {
-      for (const event of events) {
-        if (!event.source) {
-          event.source = source
-        }
-      }
-    }
+    // Convert to BufferedEvents with unique IDs for deduplication
+    const bufferedEvents: BufferedEvent[] = events.map(event => ({
+      ...event,
+      source: event.source || source,
+      _eventId: ulid(),
+    }))
 
     // Add to buffer and persist to storage
-    this.buffer.push(...events)
+    this.buffer.push(...bufferedEvents)
     await this.persistBuffer()
     console.log(`[EventWriterDO:${this.shardId}] Buffered ${events.length} events (total: ${this.buffer.length})`)
 
@@ -232,14 +272,20 @@ export class EventWriterDO extends DurableObject<Env> {
     this.buffer = []
     this.lastFlushTime = Date.now()
 
+    // Collect event IDs for deduplication tracking
+    const eventIds = events.map(e => e._eventId)
+
     // Group events by source for correct prefix routing
+    // Strip internal _eventId before writing to R2
     const eventsBySource = new Map<string, EventRecord[]>()
     for (const event of events) {
       const source = event.source || 'events'
       if (!eventsBySource.has(source)) {
         eventsBySource.set(source, [])
       }
-      eventsBySource.get(source)!.push(event)
+      // Remove internal _eventId field before writing
+      const { _eventId, ...eventRecord } = event
+      eventsBySource.get(source)!.push(eventRecord)
     }
 
     console.log(`[EventWriterDO:${this.shardId}] Flushing ${events.length} events across ${eventsBySource.size} source(s)`)
@@ -253,8 +299,17 @@ export class EventWriterDO extends DurableObject<Env> {
         results.push(result)
       }
 
-      // Clear persisted buffer on successful flush
+      // ATOMIC FLUSH PATTERN:
+      // Step 1: Mark these events as flushed BEFORE deleting buffer
+      // This survives the race condition where R2 write succeeds but buffer delete fails
+      await this.ctx.storage.put(FLUSHED_KEY, eventIds)
+      console.log(`[EventWriterDO:${this.shardId}] Marked ${eventIds.length} events as flushed`)
+
+      // Step 2: Delete the buffer (if this fails, flushed markers protect against duplication)
       await this.ctx.storage.delete(BUFFER_KEY)
+
+      // Step 3: Clear flushed markers (safe to fail - will be cleaned on next restore)
+      await this.ctx.storage.delete(FLUSHED_KEY)
 
       // Return the first result (or combine stats if needed)
       return results[0] ?? null

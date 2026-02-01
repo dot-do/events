@@ -13,6 +13,8 @@
  */
 
 import { readParquetRecords, writeCompactedParquet } from './compaction.js'
+import { readDeltaFile } from './cdc-delta.js'
+import type { DeltaRecord } from './cdc-delta.js'
 
 // ============================================================================
 // Types
@@ -87,40 +89,30 @@ export interface CollectionManifest {
 // ============================================================================
 
 /**
- * Parses JSONL content into delta records, handling malformed lines gracefully
- */
-function parseJsonlDeltas(content: string): { deltas: CompactionDeltaRecord[]; errors: string[] } {
-  const deltas: CompactionDeltaRecord[] = []
-  const errors: string[] = []
-
-  if (!content.trim()) {
-    return { deltas, errors }
-  }
-
-  const lines = content.split('\n')
-  for (const line of lines) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
-
-    try {
-      const delta = JSON.parse(trimmed) as CompactionDeltaRecord
-      deltas.push(delta)
-    } catch (e) {
-      errors.push(`Failed to parse line: ${trimmed}`)
-    }
-  }
-
-  return { deltas, errors }
-}
-
-/**
  * Extracts sequence number from delta file path
- * e.g., "cdc/ns/users/deltas/000001.jsonl" -> 1
+ * Supports both formats:
+ * - "ns/users/deltas/001_2024-01-15T12-30.parquet" -> 1
+ * - "ns/users/deltas/000001.parquet" -> 1
  */
 function extractSequenceNumber(path: string): number {
   const filename = path.split('/').pop() || ''
-  const match = filename.match(/^(\d+)\.jsonl$/)
+  // Match pattern: {seq}_{timestamp}.parquet (e.g., "001_2024-01-15T12-30.parquet")
+  // or simpler: {seq}.parquet (e.g., "000001.parquet")
+  const match = filename.match(/^(\d+)(?:_[^.]+)?\.parquet$/)
   return match ? parseInt(match[1], 10) : 0
+}
+
+/**
+ * Converts DeltaRecord to CompactionDeltaRecord format
+ */
+function deltaRecordToCompactionRecord(delta: DeltaRecord, seq: number): CompactionDeltaRecord {
+  return {
+    op: delta.op,
+    id: delta.pk,
+    doc: delta.data ?? undefined,
+    ts: new Date(delta.ts).getTime(),
+    seq,
+  }
 }
 
 // ============================================================================
@@ -150,7 +142,8 @@ export async function compactCollection(
   collection: string,
   options: CompactionOptions = {}
 ): Promise<CompactionResult> {
-  const basePath = `cdc/${ns}/${collection}`
+  // Path matches cdc-processor.ts: {ns}/{collection}/deltas/{seq}_{timestamp}.parquet
+  const basePath = `${ns}/${collection}`
   const deltasPath = `${basePath}/deltas/`
   const dataPath = `${basePath}/data.parquet`
   const manifestPath = `${basePath}/manifest.json`
@@ -159,10 +152,10 @@ export async function compactCollection(
   const errors: string[] = []
   const processedFiles: string[] = []
 
-  // 1. List all delta files
+  // 1. List all delta files (Parquet format)
   const deltasList = await bucket.list({ prefix: deltasPath })
   const deltaFiles = deltasList.objects
-    .filter((obj) => obj.key.endsWith('.jsonl'))
+    .filter((obj) => obj.key.endsWith('.parquet'))
     .sort((a, b) => a.key.localeCompare(b.key))
 
   // 2. Load existing data.parquet if it exists
@@ -179,22 +172,30 @@ export async function compactCollection(
     }
   }
 
-  // 3. Read and apply all delta files in order
+  // 3. Read and apply all delta files in order (Parquet format)
   let lastDeltaSequence = 0
   for (const deltaFile of deltaFiles) {
     const obj = await bucket.get(deltaFile.key)
     if (!obj) continue
 
-    const content = await obj.text()
-    const { deltas, errors: parseErrors } = parseJsonlDeltas(content)
-    errors.push(...parseErrors)
+    try {
+      const buffer = await obj.arrayBuffer()
+      const deltaRecords = await readDeltaFile(buffer)
+      const seq = extractSequenceNumber(deltaFile.key)
 
-    currentState = applyDeltasToState(currentState, deltas)
-    processedFiles.push(deltaFile.key)
+      // Convert DeltaRecords to CompactionDeltaRecords
+      const deltas: CompactionDeltaRecord[] = deltaRecords.map((dr, i) =>
+        deltaRecordToCompactionRecord(dr, seq * 1000 + i)
+      )
 
-    const seq = extractSequenceNumber(deltaFile.key)
-    if (seq > lastDeltaSequence) {
-      lastDeltaSequence = seq
+      currentState = applyDeltasToState(currentState, deltas)
+      processedFiles.push(deltaFile.key)
+
+      if (seq > lastDeltaSequence) {
+        lastDeltaSequence = seq
+      }
+    } catch (e) {
+      errors.push(`Failed to read delta file ${deltaFile.key}: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
 

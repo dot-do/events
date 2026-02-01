@@ -244,27 +244,31 @@ export async function handleWebhook(
     )
   }
 
-  // Get secret for provider (optional - skip verification if not configured)
+  // Get secret for provider - REQUIRED for all webhook requests
   const secret = getSecretForProvider(env, provider)
+
+  // Reject requests if webhook secret is not configured
+  if (!secret) {
+    console.error(`[webhook] Provider ${provider} secret not configured - rejecting request`)
+    return Response.json(
+      { error: 'Webhook secret not configured' },
+      { status: 500 }
+    )
+  }
 
   // CRITICAL: Get raw body FIRST (before any parsing)
   const rawBody = await request.text()
 
-  // Verify signature if secret is configured
-  let verified = false
-  if (secret) {
-    const verification = await verifySignature(provider, secret, rawBody, request.headers)
-    if (!verification.valid) {
-      console.warn(`[webhook] Signature verification failed for ${provider}: ${verification.error}`)
-      return Response.json(
-        { error: 'Invalid signature', details: verification.error },
-        { status: 401 }
-      )
-    }
-    verified = true
-  } else {
-    console.warn(`[webhook] Provider ${provider} secret not configured - skipping verification`)
+  // Verify signature - always required when secret is configured
+  const verification = await verifySignature(provider, secret, rawBody, request.headers)
+  if (!verification.valid) {
+    console.warn(`[webhook] Signature verification failed for ${provider}: ${verification.error}`)
+    return Response.json(
+      { error: 'Invalid signature', details: verification.error },
+      { status: 401 }
+    )
   }
+  const verified = true
 
   // Parse the body
   let payload: unknown

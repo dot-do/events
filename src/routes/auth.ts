@@ -6,6 +6,94 @@ import type { Env, AuthRequest } from '../env'
 import { corsHeaders, authCorsHeaders } from '../utils'
 import { optionalAuth } from 'oauth.do/rpc/itty'
 
+// ============================================================================
+// Open Redirect Prevention
+// ============================================================================
+
+/**
+ * Allowed origins for redirects (same-origin by default)
+ * Add additional trusted origins here if needed
+ */
+const ALLOWED_REDIRECT_ORIGINS: string[] = [
+  // Same-origin is always allowed (validated dynamically)
+]
+
+/**
+ * Validates and sanitizes a redirect URI to prevent open redirect attacks.
+ * Only allows:
+ * 1. Relative paths starting with / (same-origin)
+ * 2. Absolute URLs matching the current origin
+ * 3. Absolute URLs matching explicitly allowed origins
+ *
+ * @param redirectUri - The redirect URI to validate
+ * @param currentOrigin - The origin of the current request
+ * @param defaultPath - Default path to use if validation fails
+ * @returns Safe redirect URL string
+ */
+function validateRedirectUri(redirectUri: string, currentOrigin: string, defaultPath: string = '/events'): string {
+  // Handle empty or null values
+  if (!redirectUri || typeof redirectUri !== 'string') {
+    return `${currentOrigin}${defaultPath}`
+  }
+
+  // Trim whitespace
+  redirectUri = redirectUri.trim()
+
+  // Block javascript:, data:, and other dangerous protocols
+  const lowerUri = redirectUri.toLowerCase()
+  if (lowerUri.startsWith('javascript:') ||
+      lowerUri.startsWith('data:') ||
+      lowerUri.startsWith('vbscript:') ||
+      lowerUri.startsWith('file:')) {
+    return `${currentOrigin}${defaultPath}`
+  }
+
+  // Block protocol-relative URLs (//evil.com)
+  if (redirectUri.startsWith('//')) {
+    return `${currentOrigin}${defaultPath}`
+  }
+
+  // Allow relative paths starting with /
+  // But prevent //path which could be protocol-relative in some contexts
+  if (redirectUri.startsWith('/') && !redirectUri.startsWith('//')) {
+    // Ensure no protocol injection via encoded characters
+    if (redirectUri.includes('%') || redirectUri.includes('\\')) {
+      // Decode and re-validate to prevent encoded protocol attacks
+      try {
+        const decoded = decodeURIComponent(redirectUri)
+        if (decoded.includes(':') || decoded.startsWith('//')) {
+          return `${currentOrigin}${defaultPath}`
+        }
+      } catch {
+        // Invalid encoding, reject
+        return `${currentOrigin}${defaultPath}`
+      }
+    }
+    return `${currentOrigin}${redirectUri}`
+  }
+
+  // For absolute URLs, validate the origin
+  try {
+    const redirectUrl = new URL(redirectUri)
+
+    // Check if it matches the current origin
+    if (redirectUrl.origin === currentOrigin) {
+      return redirectUri
+    }
+
+    // Check against allowed origins list
+    if (ALLOWED_REDIRECT_ORIGINS.includes(redirectUrl.origin)) {
+      return redirectUri
+    }
+
+    // Origin not allowed - use default
+    return `${currentOrigin}${defaultPath}`
+  } catch {
+    // Invalid URL - use default
+    return `${currentOrigin}${defaultPath}`
+  }
+}
+
 export async function handleAuth(
   request: Request,
   env: Env,
@@ -14,13 +102,17 @@ export async function handleAuth(
   // Login - proxy to oauth.do/login with returnTo
   if (url.pathname === '/login') {
     let returnTo = url.searchParams.get('redirect_uri') || url.searchParams.get('returnTo') || '/events'
+
+    // Prevent redirect loops to /login
     if (returnTo === '/login' || returnTo.startsWith('/login?')) {
       returnTo = '/events'
     }
 
+    // Validate redirect URI to prevent open redirects
+    const safeReturnTo = validateRedirectUri(returnTo, url.origin, '/events')
+
     const oauthUrl = new URL('/login', 'https://oauth.do')
-    const returnToUrl = new URL(returnTo, url.origin)
-    oauthUrl.searchParams.set('returnTo', returnToUrl.toString())
+    oauthUrl.searchParams.set('returnTo', safeReturnTo)
 
     // Proxy to oauth.do via service binding
     return env.OAUTH.fetch(new Request(oauthUrl.toString(), {
@@ -39,7 +131,8 @@ export async function handleAuth(
   // Logout - clear auth cookie and redirect
   if (url.pathname === '/logout') {
     const redirectUri = url.searchParams.get('redirect_uri') || '/'
-    const redirectTo = redirectUri.startsWith('/') ? `${url.origin}${redirectUri}` : '/'
+    // Validate redirect URI to prevent open redirects
+    const redirectTo = validateRedirectUri(redirectUri, url.origin, '/')
     return new Response(null, {
       status: 302,
       headers: {
@@ -124,18 +217,8 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
   console.log('[callback] Setting cookie and redirecting to:', returnTo)
   console.log('[callback] Token length:', accessToken.length)
 
-  // Prevent open redirects
-  let redirectTo = returnTo
-  if (!redirectTo.startsWith('/')) {
-    try {
-      const redirectUrl = new URL(redirectTo)
-      if (redirectUrl.origin !== url.origin) {
-        redirectTo = '/events'
-      }
-    } catch {
-      redirectTo = '/events'
-    }
-  }
+  // Validate redirect URI to prevent open redirects
+  const redirectTo = validateRedirectUri(returnTo, url.origin, '/events')
 
   // Debug mode - return JSON instead of redirect
   if (debug) {
@@ -152,7 +235,7 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
   return new Response(null, {
     status: 302,
     headers: {
-      'Location': redirectTo.startsWith('/') ? `${url.origin}${redirectTo}` : redirectTo,
+      'Location': redirectTo,
       'Set-Cookie': cookie,
     },
   })

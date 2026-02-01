@@ -1,30 +1,29 @@
 /**
  * Webhook route handlers
+ *
+ * Events are sent directly to EventWriterDO (not buffered at module level)
+ * to prevent data loss on isolate eviction. The DO handles batching and
+ * persistence with alarm-based retries.
  */
 
 import type { Env } from '../env'
 import { handleWebhook, type NormalizedWebhookEvent } from '../webhook-handler'
-import { getEventBuffer, type EventRecord } from '../event-writer'
+import { ingestWithOverflow } from '../event-writer-do'
+import type { EventRecord } from '../event-writer'
 import { corsHeaders } from '../utils'
 
 const WEBHOOK_PROVIDERS = ['github', 'stripe', 'workos', 'slack', 'linear', 'svix']
 
 /**
- * Buffer a verified webhook event for batched Parquet writes.
- * Reads the response clone inline, then flushes in the background via ctx.waitUntil.
+ * Send a verified webhook event to EventWriterDO for batched Parquet writes.
+ * The DO handles buffering, persistence, and alarm-based flush retries.
  */
-async function bufferWebhookEvent(
+async function sendWebhookEvent(
   response: Response,
   env: Env,
-  ctx: ExecutionContext,
 ): Promise<void> {
   const result = await response.clone().json() as { event?: NormalizedWebhookEvent }
   if (!result.event) return
-
-  const buffer = getEventBuffer(env.EVENTS_BUCKET, 'events', {
-    countThreshold: 50,
-    timeThresholdMs: 5000,
-  })
 
   const record: EventRecord = {
     ts: result.event.ts,
@@ -36,16 +35,20 @@ async function bufferWebhookEvent(
     payload: result.event.payload,
   }
 
-  buffer.add(record)
-  ctx.waitUntil(buffer.maybeFlush(ctx).then(r => {
-    if (r) console.log(`[webhook] Flushed ${r.events} events to ${r.key}`)
-  }))
+  // Send directly to EventWriterDO - no module-level buffering.
+  // The DO handles batching and persistence with alarm-based retries.
+  const result2 = await ingestWithOverflow(env, [record], 'webhook')
+  if (!result2.ok) {
+    console.error(`[webhook] Failed to ingest event to EventWriterDO, shard ${result2.shard}`)
+  } else {
+    console.log(`[webhook] Ingested to shard ${result2.shard}, buffered: ${result2.buffered}`)
+  }
 }
 
 export async function handleWebhooks(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  _ctx: ExecutionContext,
   url: URL,
   isWebhooksDomain: boolean,
   startTime: number,
@@ -61,9 +64,9 @@ export async function handleWebhooks(
     }
     const response = await handleWebhook(request, env, provider)
 
-    // Buffer webhook events for batched Parquet writes
+    // Send webhook events to EventWriterDO for batched Parquet writes
     if (response.status === 200) {
-      await bufferWebhookEvent(response, env, ctx)
+      await sendWebhookEvent(response, env)
     }
 
     const cpuTime = performance.now() - startTime
@@ -77,9 +80,9 @@ export async function handleWebhooks(
     if (provider && WEBHOOK_PROVIDERS.includes(provider)) {
       const response = await handleWebhook(request, env, provider)
 
-      // Buffer webhook events for batched Parquet writes
+      // Send webhook events to EventWriterDO for batched Parquet writes
       if (response.status === 200) {
-        await bufferWebhookEvent(response, env, ctx)
+        await sendWebhookEvent(response, env)
       }
 
       const cpuTime = performance.now() - startTime

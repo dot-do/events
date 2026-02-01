@@ -5,6 +5,92 @@
 import type { Env } from '../env'
 import { authCorsHeaders } from '../utils'
 
+// ============================================================================
+// SQL Injection Prevention
+// ============================================================================
+
+/**
+ * Dangerous SQL keywords that should be rejected in where clauses
+ */
+const SQL_DANGEROUS_KEYWORDS = [
+  'UNION', 'DROP', 'DELETE', 'INSERT', 'UPDATE', 'CREATE', 'ALTER', 'TRUNCATE',
+  'EXEC', 'EXECUTE', 'GRANT', 'REVOKE', 'COMMIT', 'ROLLBACK', 'SAVEPOINT',
+  'ATTACH', 'DETACH', 'PRAGMA', 'VACUUM', 'COPY', 'LOAD', 'INSTALL',
+]
+
+/**
+ * Allowed column names for where clause filtering
+ */
+const ALLOWED_COLUMNS = new Set([
+  'id', 'ts', 'type', 'collection', 'provider', 'do_id', 'do_class', 'colo',
+  'method', 'status', 'latency', 'size', 'error', 'created_at', 'updated_at',
+  'name', 'namespace', 'path', 'format', 'record_count', 'file_size_bytes',
+])
+
+/**
+ * Validates a where clause for SQL injection vulnerabilities
+ */
+function validateWhereClause(where: string): { valid: boolean; reason?: string } {
+  // Check for SQL comment sequences
+  if (where.includes('--') || where.includes('/*') || where.includes('*/')) {
+    return { valid: false, reason: 'SQL comments are not allowed' }
+  }
+
+  // Check for semicolons (statement terminator)
+  if (where.includes(';')) {
+    return { valid: false, reason: 'Multiple statements are not allowed' }
+  }
+
+  // Check for dangerous keywords (case-insensitive, word boundary)
+  const upperWhere = where.toUpperCase()
+  for (const keyword of SQL_DANGEROUS_KEYWORDS) {
+    // Match keyword as a whole word
+    const regex = new RegExp(`\\b${keyword}\\b`, 'i')
+    if (regex.test(upperWhere)) {
+      return { valid: false, reason: `Keyword '${keyword}' is not allowed` }
+    }
+  }
+
+  // Check for hex escapes that could bypass string checks
+  if (/0x[0-9a-fA-F]+/.test(where)) {
+    return { valid: false, reason: 'Hex literals are not allowed' }
+  }
+
+  // Check for backslash escapes
+  if (where.includes('\\')) {
+    return { valid: false, reason: 'Backslash escapes are not allowed' }
+  }
+
+  // Extract column names from the where clause and validate them
+  // Match patterns like: column = , column >, column <, column LIKE, etc.
+  const columnPattern = /\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=|!=|<>|<=?|>=?|LIKE|IN|IS|BETWEEN)\b/gi
+  let match
+  while ((match = columnPattern.exec(where)) !== null) {
+    const column = match[1].toLowerCase()
+    // Skip SQL keywords that might match the pattern
+    if (['and', 'or', 'not', 'null', 'true', 'false'].includes(column)) {
+      continue
+    }
+    if (!ALLOWED_COLUMNS.has(column)) {
+      return { valid: false, reason: `Column '${column}' is not allowed. Allowed columns: ${[...ALLOWED_COLUMNS].join(', ')}` }
+    }
+  }
+
+  // Validate overall structure: only allow safe characters and patterns
+  // Allow: column names, comparison operators, numbers, quoted strings, AND/OR/NOT/IS/NULL/IN/LIKE/BETWEEN, parens, commas, whitespace
+  const safePattern = /^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]+)?|'[^']*'|[<>=!]+|[\s(),]|AND|OR|NOT|IS|NULL|IN|LIKE|BETWEEN|TRUE|FALSE)+$/i
+  if (!safePattern.test(where)) {
+    return { valid: false, reason: 'Contains disallowed characters or expressions' }
+  }
+
+  // Limit maximum length to prevent DoS
+  if (where.length > 1000) {
+    return { valid: false, reason: 'Where clause exceeds maximum length of 1000 characters' }
+  }
+
+  return { valid: true }
+}
+
 export async function handleCatalog(request: Request, env: Env, url: URL): Promise<Response> {
   const catalogId = env.CATALOG.idFromName('events-catalog')
   const catalog = env.CATALOG.get(catalogId)
@@ -80,7 +166,7 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
       const table = await catalog.createTable(
         namespace,
         name,
-        schema as { name: string; type: string; nullable?: boolean }[],
+        schema as { name: string; type: 'string' | 'int32' | 'int64' | 'float' | 'double' | 'boolean' | 'timestamp' | 'json'; nullable?: boolean }[],
         { location: location as string | undefined },
       )
       return Response.json({ ok: true, table }, { headers: authCorsHeaders(request, env) })
@@ -145,7 +231,10 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
       const snapshot = await catalog.commitSnapshot(
         namespace,
         table,
-        files as { path: string; format: 'parquet' | 'jsonl'; recordCount: number; fileSizeBytes: number }[],
+        files.map((f: { path: string; format: 'parquet' | 'jsonl'; recordCount: number; fileSizeBytes: number }) => ({
+          ...f,
+          createdAt: new Date().toISOString(),
+        })),
         { cdcBookmark: cdcBookmark as string | undefined },
       )
       return Response.json({ ok: true, snapshot }, { headers: authCorsHeaders(request, env) })
@@ -160,6 +249,18 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
       if (!name) {
         return Response.json({ error: 'table required' }, { status: 400, headers: authCorsHeaders(request, env) })
       }
+
+      // Validate where clause to prevent SQL injection
+      if (where) {
+        const validation = validateWhereClause(where)
+        if (!validation.valid) {
+          return Response.json(
+            { error: `Invalid where clause: ${validation.reason}` },
+            { status: 400, headers: authCorsHeaders(request, env) }
+          )
+        }
+      }
+
       const sql = await catalog.buildQuery(namespace, name, {
         where,
         limit: limit ? parseInt(limit) : undefined,

@@ -21,6 +21,7 @@ import {
   type CollectionManifest,
 } from '../cdc-compaction.js'
 import { readParquetRecords } from '../compaction.js'
+import { writeDeltaFile, type DeltaRecord } from '../cdc-delta.js'
 
 // ============================================================================
 // Mock Factories
@@ -101,10 +102,24 @@ function createDelta(
 }
 
 /**
- * Creates a JSONL string from delta records
+ * Converts CompactionDeltaRecords to DeltaRecords for Parquet writing
  */
-function deltasToJsonl(deltas: CompactionDeltaRecord[]): string {
-  return deltas.map((d) => JSON.stringify(d)).join('\n')
+function toDeltaRecords(deltas: CompactionDeltaRecord[]): DeltaRecord[] {
+  return deltas.map((d) => ({
+    pk: d.id,
+    op: d.op,
+    data: d.doc ?? null,
+    prev: null,
+    ts: new Date(d.ts).toISOString(),
+    bookmark: null,
+  }))
+}
+
+/**
+ * Creates a Parquet buffer from delta records
+ */
+function deltasToParquet(deltas: CompactionDeltaRecord[]): ArrayBuffer {
+  return writeDeltaFile(toDeltaRecords(deltas))
 }
 
 // ============================================================================
@@ -117,20 +132,20 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // Add delta files with inserts
-      const delta1 = deltasToJsonl([
+      const delta1 = deltasToParquet([
         createDelta('insert', 'user-1', { name: 'Alice', age: 30 }, 1),
         createDelta('insert', 'user-2', { name: 'Bob', age: 25 }, 2),
       ])
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', delta1)
+      await bucket.put('ns/users/deltas/000001.parquet', delta1)
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
       expect(result.success).toBe(true)
       expect(result.recordCount).toBe(2)
-      expect(result.dataFile).toBe('cdc/ns/users/data.parquet')
+      expect(result.dataFile).toBe('ns/users/data.parquet')
 
       // Verify data.parquet was written
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       expect(dataFile).not.toBeNull()
 
       // Read back and verify contents
@@ -153,19 +168,19 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // Add deltas in non-sorted order
-      const deltas = deltasToJsonl([
+      const deltas = deltasToParquet([
         createDelta('insert', 'user-c', { name: 'Charlie' }, 1),
         createDelta('insert', 'user-a', { name: 'Alice' }, 2),
         createDelta('insert', 'user-b', { name: 'Bob' }, 3),
       ])
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltas)
+      await bucket.put('ns/users/deltas/000001.parquet', deltas)
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
       expect(result.success).toBe(true)
 
       // Read back and verify sorted order
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       const buffer = await dataFile!.arrayBuffer()
       const records = await readParquetRecords(buffer)
 
@@ -278,16 +293,16 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // Delta files should be processed in numeric order
-      await bucket.put('cdc/ns/users/deltas/000003.jsonl', deltasToJsonl([createDelta('update', 'user-1', { v: 3 }, 3)]))
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('insert', 'user-1', { v: 1 }, 1)]))
-      await bucket.put('cdc/ns/users/deltas/000002.jsonl', deltasToJsonl([createDelta('update', 'user-1', { v: 2 }, 2)]))
+      await bucket.put('ns/users/deltas/000003.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 3 }, 3)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { v: 1 }, 1)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 2 }, 2)]))
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
       expect(result.success).toBe(true)
 
       // Final state should reflect order: insert v1 -> update v2 -> update v3
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       const buffer = await dataFile!.arrayBuffer()
       const records = await readParquetRecords(buffer)
 
@@ -299,15 +314,15 @@ describe('CDC Compaction', () => {
 
       // Simulate time-ordered operations
       await bucket.put(
-        'cdc/ns/users/deltas/000001.jsonl',
-        deltasToJsonl([
+        'ns/users/deltas/000001.parquet',
+        deltasToParquet([
           createDelta('insert', 'user-1', { name: 'Alice', status: 'active' }, 1),
           createDelta('insert', 'user-2', { name: 'Bob', status: 'active' }, 2),
         ])
       )
       await bucket.put(
-        'cdc/ns/users/deltas/000002.jsonl',
-        deltasToJsonl([
+        'ns/users/deltas/000002.parquet',
+        deltasToParquet([
           createDelta('update', 'user-1', { name: 'Alice', status: 'inactive' }, 3),
           createDelta('delete', 'user-2', undefined, 4),
         ])
@@ -318,7 +333,7 @@ describe('CDC Compaction', () => {
       expect(result.success).toBe(true)
       expect(result.recordCount).toBe(1) // Only user-1 remains
 
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       const buffer = await dataFile!.arrayBuffer()
       const records = await readParquetRecords(buffer)
 
@@ -331,16 +346,16 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // Files named out of order but should still be sorted by name
-      await bucket.put('cdc/ns/users/deltas/000010.jsonl', deltasToJsonl([createDelta('update', 'user-1', { v: 10 }, 10)]))
-      await bucket.put('cdc/ns/users/deltas/000002.jsonl', deltasToJsonl([createDelta('insert', 'user-1', { v: 2 }, 2)]))
-      await bucket.put('cdc/ns/users/deltas/000005.jsonl', deltasToJsonl([createDelta('update', 'user-1', { v: 5 }, 5)]))
+      await bucket.put('ns/users/deltas/000010.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 10 }, 10)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-1', { v: 2 }, 2)]))
+      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 5 }, 5)]))
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
       expect(result.success).toBe(true)
 
       // Order should be: 000002 -> 000005 -> 000010
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       const buffer = await dataFile!.arrayBuffer()
       const records = await readParquetRecords(buffer)
 
@@ -357,8 +372,8 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       await bucket.put(
-        'cdc/ns/users/deltas/000001.jsonl',
-        deltasToJsonl([
+        'ns/users/deltas/000001.parquet',
+        deltasToParquet([
           createDelta('insert', 'z-user', { name: 'Zara' }, 1),
           createDelta('insert', 'a-user', { name: 'Adam' }, 2),
           createDelta('insert', 'm-user', { name: 'Mary' }, 3),
@@ -367,7 +382,7 @@ describe('CDC Compaction', () => {
 
       await compactCollection(bucket, 'ns', 'users')
 
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       const buffer = await dataFile!.arrayBuffer()
       const records = await readParquetRecords(buffer)
 
@@ -381,18 +396,18 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       await bucket.put(
-        'cdc/ns/users/deltas/000001.jsonl',
-        deltasToJsonl([
+        'ns/users/deltas/000001.parquet',
+        deltasToParquet([
           createDelta('insert', 'user-1', { name: 'Alice' }, 1),
           createDelta('insert', 'user-2', { name: 'Bob' }, 2),
           createDelta('insert', 'user-3', { name: 'Charlie' }, 3),
         ])
       )
-      await bucket.put('cdc/ns/users/deltas/000002.jsonl', deltasToJsonl([createDelta('delete', 'user-2', undefined, 4)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('delete', 'user-2', undefined, 4)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       const buffer = await dataFile!.arrayBuffer()
       const records = await readParquetRecords(buffer)
 
@@ -412,11 +427,11 @@ describe('CDC Compaction', () => {
         metadata: JSON.stringify({ role: 'admin', permissions: ['read', 'write'] }),
       }
 
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('insert', 'user-1', complexDoc, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', complexDoc, 1)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       const buffer = await dataFile!.arrayBuffer()
       const records = await readParquetRecords(buffer)
 
@@ -493,47 +508,47 @@ describe('CDC Compaction', () => {
     it('lists processed delta files in result', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
-      await bucket.put('cdc/ns/users/deltas/000002.jsonl', deltasToJsonl([createDelta('insert', 'user-2', { name: 'Bob' }, 2)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-2', { name: 'Bob' }, 2)]))
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
       expect(result.deltasProcessed).toBe(2)
-      expect(result.processedFiles).toContain('cdc/ns/users/deltas/000001.jsonl')
-      expect(result.processedFiles).toContain('cdc/ns/users/deltas/000002.jsonl')
+      expect(result.processedFiles).toContain('ns/users/deltas/000001.parquet')
+      expect(result.processedFiles).toContain('ns/users/deltas/000002.parquet')
     })
 
     it('archives deltas to processed folder when archive option is set', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
 
       const result = await compactCollection(bucket, 'ns', 'users', { archiveDeltas: true })
 
       expect(result.success).toBe(true)
 
       // Original should be moved to processed folder
-      const archived = await bucket.get('cdc/ns/users/processed/000001.jsonl')
+      const archived = await bucket.get('ns/users/processed/000001.parquet')
       expect(archived).not.toBeNull()
 
       // Original should no longer exist in deltas folder
-      const original = await bucket.get('cdc/ns/users/deltas/000001.jsonl')
+      const original = await bucket.get('ns/users/deltas/000001.parquet')
       expect(original).toBeNull()
     })
 
     it('deletes old delta files after compaction when delete option is set', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
-      await bucket.put('cdc/ns/users/deltas/000002.jsonl', deltasToJsonl([createDelta('insert', 'user-2', { name: 'Bob' }, 2)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-2', { name: 'Bob' }, 2)]))
 
       const result = await compactCollection(bucket, 'ns', 'users', { deleteDeltas: true })
 
       expect(result.success).toBe(true)
 
       // Both deltas should be deleted
-      const delta1 = await bucket.get('cdc/ns/users/deltas/000001.jsonl')
-      const delta2 = await bucket.get('cdc/ns/users/deltas/000002.jsonl')
+      const delta1 = await bucket.get('ns/users/deltas/000001.parquet')
+      const delta2 = await bucket.get('ns/users/deltas/000002.parquet')
       expect(delta1).toBeNull()
       expect(delta2).toBeNull()
     })
@@ -541,12 +556,12 @@ describe('CDC Compaction', () => {
     it('keeps delta files by default', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
       // Delta should still exist
-      const delta = await bucket.get('cdc/ns/users/deltas/000001.jsonl')
+      const delta = await bucket.get('ns/users/deltas/000001.parquet')
       expect(delta).not.toBeNull()
     })
   })
@@ -560,8 +575,8 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       await bucket.put(
-        'cdc/ns/users/deltas/000001.jsonl',
-        deltasToJsonl([
+        'ns/users/deltas/000001.parquet',
+        deltasToParquet([
           createDelta('insert', 'user-1', { name: 'Alice' }, 1),
           createDelta('insert', 'user-2', { name: 'Bob' }, 2),
         ])
@@ -572,11 +587,11 @@ describe('CDC Compaction', () => {
       expect(result.success).toBe(true)
 
       // Check manifest was written
-      const manifestFile = await bucket.get('cdc/ns/users/manifest.json')
+      const manifestFile = await bucket.get('ns/users/manifest.json')
       expect(manifestFile).not.toBeNull()
 
       const manifest: CollectionManifest = await manifestFile!.json()
-      expect(manifest.dataFile).toBe('cdc/ns/users/data.parquet')
+      expect(manifest.dataFile).toBe('ns/users/data.parquet')
       expect(manifest.recordCount).toBe(2)
       expect(manifest.fileSizeBytes).toBeGreaterThan(0)
     })
@@ -585,11 +600,11 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       const beforeCompaction = Date.now()
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
-      const manifestFile = await bucket.get('cdc/ns/users/manifest.json')
+      const manifestFile = await bucket.get('ns/users/manifest.json')
       const manifest: CollectionManifest = await manifestFile!.json()
 
       expect(manifest.lastCompactionAt).toBeDefined()
@@ -602,8 +617,8 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       await bucket.put(
-        'cdc/ns/users/deltas/000001.jsonl',
-        deltasToJsonl([
+        'ns/users/deltas/000001.parquet',
+        deltasToParquet([
           createDelta('insert', 'user-1', { name: 'Alice', data: 'some data' }, 1),
           createDelta('insert', 'user-2', { name: 'Bob', data: 'more data' }, 2),
           createDelta('insert', 'user-3', { name: 'Charlie', data: 'extra data' }, 3),
@@ -615,7 +630,7 @@ describe('CDC Compaction', () => {
       expect(result.recordCount).toBe(3)
       expect(result.fileSizeBytes).toBeGreaterThan(0)
 
-      const manifestFile = await bucket.get('cdc/ns/users/manifest.json')
+      const manifestFile = await bucket.get('ns/users/manifest.json')
       const manifest: CollectionManifest = await manifestFile!.json()
 
       expect(manifest.recordCount).toBe(3)
@@ -626,14 +641,14 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // First compaction
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
       await compactCollection(bucket, 'ns', 'users', { deleteDeltas: true })
 
       // Second compaction with more data
-      await bucket.put('cdc/ns/users/deltas/000002.jsonl', deltasToJsonl([createDelta('insert', 'user-2', { name: 'Bob' }, 2)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-2', { name: 'Bob' }, 2)]))
       await compactCollection(bucket, 'ns', 'users', { deleteDeltas: true })
 
-      const manifestFile = await bucket.get('cdc/ns/users/manifest.json')
+      const manifestFile = await bucket.get('ns/users/manifest.json')
       const manifest: CollectionManifest = await manifestFile!.json()
 
       expect(manifest.recordCount).toBe(2) // Both users
@@ -643,12 +658,12 @@ describe('CDC Compaction', () => {
     it('tracks delta sequence number in manifest', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
-      await bucket.put('cdc/ns/users/deltas/000005.jsonl', deltasToJsonl([createDelta('insert', 'user-2', { name: 'Bob' }, 5)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('insert', 'user-2', { name: 'Bob' }, 5)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
-      const manifestFile = await bucket.get('cdc/ns/users/manifest.json')
+      const manifestFile = await bucket.get('ns/users/manifest.json')
       const manifest: CollectionManifest = await manifestFile!.json()
 
       expect(manifest.lastDeltaSequence).toBe(5)
@@ -669,12 +684,12 @@ describe('CDC Compaction', () => {
         ['user-2', { name: 'Bob', age: 25 }],
       ])
       const existingParquet = writeDataParquet(existingState)
-      await bucket.put('cdc/ns/users/data.parquet', existingParquet)
+      await bucket.put('ns/users/data.parquet', existingParquet)
 
       // Add delta that modifies existing and adds new
       await bucket.put(
-        'cdc/ns/users/deltas/000001.jsonl',
-        deltasToJsonl([
+        'ns/users/deltas/000001.parquet',
+        deltasToParquet([
           createDelta('update', 'user-1', { name: 'Alice', age: 31 }, 1),
           createDelta('insert', 'user-3', { name: 'Charlie', age: 35 }, 2),
         ])
@@ -685,7 +700,7 @@ describe('CDC Compaction', () => {
       expect(result.success).toBe(true)
       expect(result.recordCount).toBe(3)
 
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       const buffer = await dataFile!.arrayBuffer()
       const records = await readParquetRecords(buffer)
 
@@ -707,16 +722,16 @@ describe('CDC Compaction', () => {
         ['user-2', { name: 'Bob' }],
       ])
       const existingParquet = writeDataParquet(existingState)
-      await bucket.put('cdc/ns/users/data.parquet', existingParquet)
+      await bucket.put('ns/users/data.parquet', existingParquet)
 
       // Delta deletes user-1
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl([createDelta('delete', 'user-1', undefined, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('delete', 'user-1', undefined, 1)]))
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
       expect(result.recordCount).toBe(1)
 
-      const dataFile = await bucket.get('cdc/ns/users/data.parquet')
+      const dataFile = await bucket.get('ns/users/data.parquet')
       const buffer = await dataFile!.arrayBuffer()
       const records = await readParquetRecords(buffer)
 
@@ -766,7 +781,9 @@ describe('CDC Compaction', () => {
     it('handles empty delta file', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', '')
+      // Write a valid Parquet file with no records
+      const emptyParquet = deltasToParquet([])
+      await bucket.put('ns/users/deltas/000001.parquet', emptyParquet)
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
@@ -774,21 +791,20 @@ describe('CDC Compaction', () => {
       expect(result.recordCount).toBe(0)
     })
 
-    it('handles malformed JSONL lines gracefully', async () => {
+    it('handles malformed Parquet files gracefully', async () => {
       const bucket = createMockR2Bucket()
 
-      const badJsonl = `{"op":"insert","id":"user-1","doc":{"name":"Alice"},"ts":123,"seq":1}
-not valid json
-{"op":"insert","id":"user-2","doc":{"name":"Bob"},"ts":124,"seq":2}`
-
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', badJsonl)
+      // Add one valid delta file and one corrupted file
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000002.parquet', new TextEncoder().encode('not valid parquet data').buffer)
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
-      // Should process valid lines and skip invalid
+      // Should process valid file and report error for invalid
       expect(result.success).toBe(true)
-      expect(result.recordCount).toBe(2)
-      expect(result.errors).toHaveLength(1)
+      expect(result.recordCount).toBe(1)
+      expect(result.errors).toBeDefined()
+      expect(result.errors!.length).toBeGreaterThan(0)
     })
 
     it('handles very large delta files', async () => {
@@ -800,7 +816,7 @@ not valid json
         deltas.push(createDelta('insert', `user-${i.toString().padStart(4, '0')}`, { name: `User ${i}`, index: i }, i))
       }
 
-      await bucket.put('cdc/ns/users/deltas/000001.jsonl', deltasToJsonl(deltas))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet(deltas))
 
       const result = await compactCollection(bucket, 'ns', 'users')
 

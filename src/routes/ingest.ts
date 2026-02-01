@@ -190,22 +190,41 @@ export async function handleIngest(request: Request, env: Env, ctx: ExecutionCon
       }
 
       // Fan out all events to subscription matching and delivery
+      // Route to per-type-prefix shards (e.g., "collection.*" -> shard "collection")
       if (env.SUBSCRIPTIONS) {
-        const subId = env.SUBSCRIPTIONS.idFromName('global')
-        const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
-        const fanoutPromises = validatedBatch.events.map(async (event) => {
+        // Group events by shard key (first segment before '.', or 'default')
+        const eventsByShard = new Map<string, typeof validatedBatch.events>()
+        for (const event of validatedBatch.events) {
+          const dotIndex = event.type.indexOf('.')
+          const shardKey = dotIndex > 0 ? event.type.slice(0, dotIndex) : 'default'
+          const existing = eventsByShard.get(shardKey) ?? []
+          existing.push(event)
+          eventsByShard.set(shardKey, existing)
+        }
+
+        // Fan out each group to its corresponding shard
+        const shardPromises = Array.from(eventsByShard.entries()).map(async ([shardKey, events]) => {
           try {
-            await subscriptionDO.fanout({
-              id: ulid(),
-              type: event.type,
-              ts: event.ts,
-              payload: event,
+            const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
+            const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
+            const fanoutPromises = events.map(async (event) => {
+              try {
+                await subscriptionDO.fanout({
+                  id: ulid(),
+                  type: event.type,
+                  ts: event.ts,
+                  payload: event,
+                })
+              } catch (err) {
+                console.error(`[ingest] Subscription fanout error for event type ${event.type}:`, err)
+              }
             })
+            await Promise.all(fanoutPromises)
           } catch (err) {
-            console.error(`[ingest] Subscription fanout error for event type ${event.type}:`, err)
+            console.error(`[ingest] Subscription shard error for shard ${shardKey}:`, err)
           }
         })
-        await Promise.all(fanoutPromises)
+        await Promise.all(shardPromises)
       }
     } catch (err) {
       console.error('[ingest] CDC/subscription pipeline error:', err)
