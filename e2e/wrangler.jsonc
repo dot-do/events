@@ -11,8 +11,31 @@
     { "binding": "EVENTS_BUCKET", "bucket_name": "events-test" }
   ],
 
+  // Durable Objects for testing
+  "durable_objects": {
+    "bindings": [
+      { "name": "CATALOG", "class_name": "CatalogDO" },
+      { "name": "SUBSCRIPTIONS", "class_name": "SubscriptionDO" },
+      { "name": "CDC_PROCESSOR", "class_name": "CDCProcessorDO" },
+      { "name": "EVENT_WRITER", "class_name": "EventWriterDO" },
+      { "name": "RATE_LIMITER", "class_name": "RateLimiterDO" }
+    ]
+  },
+
+  // Migrations for DO
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["CatalogDO", "SubscriptionDO", "CDCProcessorDO", "RateLimiterDO"], "new_classes": ["EventWriterDO"] }
+  ],
+
   "vars": {
-    "ENVIRONMENT": "test"
+    "ENVIRONMENT": "test",
+    // Webhook secrets for testing
+    "GITHUB_WEBHOOK_SECRET": "test-github-secret",
+    "STRIPE_WEBHOOK_SECRET": "test-stripe-secret",
+    "WORKOS_WEBHOOK_SECRET": "test-workos-secret",
+    "SLACK_SIGNING_SECRET": "test-slack-secret",
+    "LINEAR_WEBHOOK_SECRET": "test-linear-secret",
+    "SVIX_WEBHOOK_SECRET": "whsec_dGVzdC1zdml4LXNlY3JldC1rZXktMzJieXRlcyEh"
   },
 
   // Dev settings

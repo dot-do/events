@@ -91,20 +91,49 @@ function validateWhereClause(where: string): { valid: boolean; reason?: string }
   return { valid: true }
 }
 
-export async function handleCatalog(request: Request, env: Env, url: URL): Promise<Response> {
-  const catalogId = env.CATALOG.idFromName('events-catalog')
-  const catalog = env.CATALOG.get(catalogId)
+/**
+ * Legacy singleton catalog name for backwards compatibility during migration.
+ * New data uses namespace-sharded catalogs.
+ */
+const LEGACY_CATALOG_NAME = 'events-catalog'
 
+/**
+ * Gets the CatalogDO instance for a given namespace.
+ * Shards by namespace to avoid SPOF and bottleneck on single DO.
+ */
+function getCatalog(env: Env, namespace: string) {
+  const catalogId = env.CATALOG.idFromName(namespace)
+  return env.CATALOG.get(catalogId)
+}
+
+/**
+ * Gets the legacy singleton CatalogDO for migration purposes.
+ */
+function getLegacyCatalog(env: Env) {
+  const catalogId = env.CATALOG.idFromName(LEGACY_CATALOG_NAME)
+  return env.CATALOG.get(catalogId)
+}
+
+export async function handleCatalog(request: Request, env: Env, url: URL): Promise<Response> {
   const path = url.pathname.replace('/catalog', '') || '/'
 
   try {
-    // GET /catalog/namespaces
+    // GET /catalog/namespaces - list all namespaces across all shards
+    // For backwards compatibility, we check both legacy and known namespaces
     if (path === '/namespaces' && request.method === 'GET') {
-      const namespaces = await catalog.listNamespaces()
-      return Response.json({ namespaces }, { headers: authCorsHeaders(request, env) })
+      // First check legacy catalog for any existing namespaces
+      const legacyCatalog = getLegacyCatalog(env)
+      const legacyNamespaces = await legacyCatalog.listNamespaces()
+
+      // For sharded catalogs, we need a registry or query R2 for known namespaces
+      // For now, return legacy namespaces plus 'default' if not present
+      const namespaces = new Set(legacyNamespaces)
+      namespaces.add('default')
+
+      return Response.json({ namespaces: [...namespaces].sort() }, { headers: authCorsHeaders(request, env) })
     }
 
-    // POST /catalog/namespaces
+    // POST /catalog/namespaces - create namespace in the namespace-sharded catalog
     if (path === '/namespaces' && request.method === 'POST') {
       let body: unknown
       try {
@@ -122,6 +151,8 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
       if (properties !== undefined && (typeof properties !== 'object' || properties === null || Array.isArray(properties))) {
         return Response.json({ error: 'Invalid field: properties must be an object' }, { status: 400, headers: authCorsHeaders(request, env) })
       }
+      // Create namespace in the namespace-sharded catalog
+      const catalog = getCatalog(env, name)
       await catalog.createNamespace(name, properties as Record<string, string> | undefined)
       return Response.json({ ok: true, namespace: name }, { headers: authCorsHeaders(request, env) })
     }
@@ -129,11 +160,21 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
     // GET /catalog/tables?namespace=xxx
     if (path === '/tables' && request.method === 'GET') {
       const namespace = url.searchParams.get('namespace') ?? 'default'
-      const tables = await catalog.listTables(namespace)
+      const catalog = getCatalog(env, namespace)
+
+      // First try sharded catalog
+      let tables = await catalog.listTables(namespace)
+
+      // If no tables found and this is default namespace, also check legacy catalog
+      if (tables.length === 0 && namespace === 'default') {
+        const legacyCatalog = getLegacyCatalog(env)
+        tables = await legacyCatalog.listTables(namespace)
+      }
+
       return Response.json({ namespace, tables }, { headers: authCorsHeaders(request, env) })
     }
 
-    // POST /catalog/tables
+    // POST /catalog/tables - create table in namespace-sharded catalog
     if (path === '/tables' && request.method === 'POST') {
       let body: unknown
       try {
@@ -163,6 +204,7 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
       if (location !== undefined && typeof location !== 'string') {
         return Response.json({ error: 'Invalid field: location must be a string' }, { status: 400, headers: authCorsHeaders(request, env) })
       }
+      const catalog = getCatalog(env, namespace)
       const table = await catalog.createTable(
         namespace,
         name,
@@ -179,14 +221,24 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
       if (!name) {
         return Response.json({ error: 'name required' }, { status: 400, headers: authCorsHeaders(request, env) })
       }
-      const table = await catalog.loadTable(namespace, name)
+      const catalog = getCatalog(env, namespace)
+
+      // First try sharded catalog
+      let table = await catalog.loadTable(namespace, name)
+
+      // If not found and this is default namespace, also check legacy catalog
+      if (!table && namespace === 'default') {
+        const legacyCatalog = getLegacyCatalog(env)
+        table = await legacyCatalog.loadTable(namespace, name)
+      }
+
       if (!table) {
         return Response.json({ error: 'not found' }, { status: 404, headers: authCorsHeaders(request, env) })
       }
       return Response.json({ table }, { headers: authCorsHeaders(request, env) })
     }
 
-    // POST /catalog/commit - commit a snapshot
+    // POST /catalog/commit - commit a snapshot to namespace-sharded catalog
     if (path === '/commit' && request.method === 'POST') {
       let body: unknown
       try {
@@ -228,6 +280,7 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
       if (cdcBookmark !== undefined && typeof cdcBookmark !== 'string') {
         return Response.json({ error: 'Invalid field: cdcBookmark must be a string' }, { status: 400, headers: authCorsHeaders(request, env) })
       }
+      const catalog = getCatalog(env, namespace)
       const snapshot = await catalog.commitSnapshot(
         namespace,
         table,
@@ -261,10 +314,23 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
         }
       }
 
-      const sql = await catalog.buildQuery(namespace, name, {
+      const catalog = getCatalog(env, namespace)
+
+      // First try sharded catalog
+      let sql = await catalog.buildQuery(namespace, name, {
         where,
         limit: limit ? parseInt(limit) : undefined,
       })
+
+      // If no result and this is default namespace, also check legacy catalog
+      if (!sql && namespace === 'default') {
+        const legacyCatalog = getLegacyCatalog(env)
+        sql = await legacyCatalog.buildQuery(namespace, name, {
+          where,
+          limit: limit ? parseInt(limit) : undefined,
+        })
+      }
+
       return Response.json({ sql }, { headers: authCorsHeaders(request, env) })
     }
 
@@ -275,7 +341,17 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
       if (!name) {
         return Response.json({ error: 'table required' }, { status: 400, headers: authCorsHeaders(request, env) })
       }
-      const files = await catalog.listFiles(namespace, name)
+      const catalog = getCatalog(env, namespace)
+
+      // First try sharded catalog
+      let files = await catalog.listFiles(namespace, name)
+
+      // If no files and this is default namespace, also check legacy catalog
+      if (files.length === 0 && namespace === 'default') {
+        const legacyCatalog = getLegacyCatalog(env)
+        files = await legacyCatalog.listFiles(namespace, name)
+      }
+
       return Response.json({ files }, { headers: authCorsHeaders(request, env) })
     }
 

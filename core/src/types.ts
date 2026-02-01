@@ -157,4 +157,33 @@ export interface EventEmitterOptions {
   trackPrevious?: boolean
   /** API key for authentication (optional) */
   apiKey?: string
+  /** Max retry queue size (default: 10000). When exceeded, oldest events are dropped. */
+  maxRetryQueueSize?: number
+  /** Max consecutive failures before circuit breaker opens (default: 10). Set to 0 to disable. */
+  maxConsecutiveFailures?: number
+  /** Circuit breaker reset timeout in ms (default: 300000 = 5 minutes) */
+  circuitBreakerResetMs?: number
+}
+
+/** Error thrown when the retry buffer is full and backpressure is needed */
+export class EventBufferFullError extends Error {
+  constructor(
+    message: string,
+    public readonly droppedCount: number
+  ) {
+    super(message)
+    this.name = 'EventBufferFullError'
+  }
+}
+
+/** Error thrown when the circuit breaker is open */
+export class CircuitBreakerOpenError extends Error {
+  constructor(
+    message: string,
+    public readonly consecutiveFailures: number,
+    public readonly resetAt: Date
+  ) {
+    super(message)
+    this.name = 'CircuitBreakerOpenError'
+  }
 }

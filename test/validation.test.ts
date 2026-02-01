@@ -545,3 +545,155 @@ describe('validateQueryRequest', () => {
     })
   })
 })
+
+// ============================================================================
+// Path Pattern validation (validatePathPattern) contract tests
+// events-fzu: Prevents SQL injection via path pattern interpolation
+// ============================================================================
+
+/**
+ * Regex whitelist for path patterns - only allows safe characters:
+ * alphanumeric, slashes, asterisks, dashes, underscores, and dots.
+ * Also rejects SQL comment syntax (--) to prevent injection.
+ */
+const SAFE_PATH_PATTERN = /^[a-zA-Z0-9\/_*.-]+$/
+
+function validatePathPattern(pattern: string): boolean {
+  // First check character whitelist
+  if (!SAFE_PATH_PATTERN.test(pattern)) {
+    return false
+  }
+  // Reject SQL comment syntax (double dashes)
+  if (pattern.includes('--')) {
+    return false
+  }
+  return true
+}
+
+describe('validatePathPattern', () => {
+  describe('valid patterns', () => {
+    it('accepts basic path', () => {
+      expect(validatePathPattern('events/')).toBe(true)
+    })
+
+    it('accepts path with year', () => {
+      expect(validatePathPattern('events/2024/')).toBe(true)
+    })
+
+    it('accepts path with wildcards', () => {
+      expect(validatePathPattern('events/**/')).toBe(true)
+      expect(validatePathPattern('events/*/*/*/')).toBe(true)
+    })
+
+    it('accepts full pattern with extension', () => {
+      expect(validatePathPattern('events/2024/01/15/*/*.parquet')).toBe(true)
+      expect(validatePathPattern('events/2024/01/15/*/*.jsonl')).toBe(true)
+    })
+
+    it('accepts pattern with dashes and underscores', () => {
+      expect(validatePathPattern('events_backup/2024-01/')).toBe(true)
+    })
+
+    it('accepts recursive glob pattern', () => {
+      expect(validatePathPattern('events/**/*.parquet')).toBe(true)
+    })
+  })
+
+  describe('SQL injection attempts', () => {
+    it('rejects single quote', () => {
+      expect(validatePathPattern("events/'; DROP TABLE events; --")).toBe(false)
+    })
+
+    it('rejects double quote', () => {
+      expect(validatePathPattern('events/"; DROP TABLE events; --')).toBe(false)
+    })
+
+    it('rejects parentheses', () => {
+      expect(validatePathPattern('events/test()')).toBe(false)
+    })
+
+    it('rejects semicolon', () => {
+      expect(validatePathPattern('events/test;delete')).toBe(false)
+    })
+
+    it('rejects equals sign', () => {
+      expect(validatePathPattern('events/test=1')).toBe(false)
+    })
+
+    it('rejects space', () => {
+      expect(validatePathPattern('events/test path')).toBe(false)
+    })
+
+    it('rejects newline', () => {
+      expect(validatePathPattern('events/test\npath')).toBe(false)
+    })
+
+    it('rejects backslash', () => {
+      expect(validatePathPattern('events\\test')).toBe(false)
+    })
+
+    it('rejects UNION SELECT injection', () => {
+      expect(validatePathPattern("events/' UNION SELECT * FROM secrets --")).toBe(false)
+    })
+
+    it('rejects comment injection', () => {
+      expect(validatePathPattern('events/test--comment')).toBe(false)
+    })
+
+    it('rejects backtick', () => {
+      expect(validatePathPattern('events/`test`')).toBe(false)
+    })
+
+    it('rejects angle brackets', () => {
+      expect(validatePathPattern('events/<script>')).toBe(false)
+    })
+
+    it('rejects curly braces', () => {
+      expect(validatePathPattern('events/{test}')).toBe(false)
+    })
+
+    it('rejects square brackets', () => {
+      expect(validatePathPattern('events/[test]')).toBe(false)
+    })
+
+    it('rejects pipe', () => {
+      expect(validatePathPattern('events/test|other')).toBe(false)
+    })
+
+    it('rejects dollar sign', () => {
+      expect(validatePathPattern('events/$test')).toBe(false)
+    })
+
+    it('rejects at sign', () => {
+      expect(validatePathPattern('events/@test')).toBe(false)
+    })
+
+    it('rejects hash', () => {
+      expect(validatePathPattern('events/#test')).toBe(false)
+    })
+
+    it('rejects percent (LIKE wildcard)', () => {
+      expect(validatePathPattern('events/%test%')).toBe(false)
+    })
+
+    it('rejects ampersand', () => {
+      expect(validatePathPattern('events/test&other')).toBe(false)
+    })
+
+    it('rejects null byte', () => {
+      expect(validatePathPattern('events/test\x00other')).toBe(false)
+    })
+  })
+
+  describe('edge cases', () => {
+    it('rejects empty string', () => {
+      expect(validatePathPattern('')).toBe(false)
+    })
+
+    it('accepts single character paths', () => {
+      expect(validatePathPattern('a')).toBe(true)
+      expect(validatePathPattern('/')).toBe(true)
+      expect(validatePathPattern('*')).toBe(true)
+    })
+  })
+})

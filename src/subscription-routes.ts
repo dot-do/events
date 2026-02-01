@@ -47,6 +47,61 @@ export const KNOWN_SUBSCRIPTION_SHARDS = [
 ]
 
 /**
+ * Maximum allowed length for subscription patterns
+ */
+const MAX_PATTERN_LENGTH = 256
+
+/**
+ * Validates a subscription pattern for safety and correctness.
+ *
+ * Rules:
+ * - Only alphanumeric characters, dots, asterisks, and underscores allowed
+ * - Maximum length of 256 characters
+ * - No patterns that could cause ReDoS (consecutive wildcards like **, ***, etc. are restricted)
+ * - Cannot start or end with a dot
+ * - Cannot have consecutive dots
+ *
+ * @returns null if valid, error message string if invalid
+ */
+export function validatePattern(pattern: string): string | null {
+  // Check max length
+  if (pattern.length > MAX_PATTERN_LENGTH) {
+    return `Pattern exceeds maximum length of ${MAX_PATTERN_LENGTH} characters`
+  }
+
+  // Check for allowed characters only: alphanumeric, dots, asterisks, underscores, hyphens
+  if (!/^[a-zA-Z0-9.*_-]+$/.test(pattern)) {
+    return 'Pattern contains invalid characters. Only alphanumeric, dots, asterisks, underscores, and hyphens are allowed'
+  }
+
+  // Prevent patterns that could cause ReDoS or excessive matching
+  // Allow single * and double ** (common glob patterns), but reject more than two consecutive asterisks
+  if (/\*{3,}/.test(pattern)) {
+    return 'Pattern contains more than two consecutive asterisks, which is not allowed'
+  }
+
+  // Reject patterns with alternating wildcards that could cause backtracking
+  // e.g., *a*b*c*d*e* patterns with many segments
+  const wildcardSegments = pattern.split('.').filter(seg => seg.includes('*')).length
+  const totalSegments = pattern.split('.').length
+  if (wildcardSegments > 5 && wildcardSegments > totalSegments / 2) {
+    return 'Pattern contains too many wildcard segments, which could cause performance issues'
+  }
+
+  // Cannot start or end with a dot
+  if (pattern.startsWith('.') || pattern.endsWith('.')) {
+    return 'Pattern cannot start or end with a dot'
+  }
+
+  // Cannot have consecutive dots
+  if (/\.{2,}/.test(pattern)) {
+    return 'Pattern cannot contain consecutive dots'
+  }
+
+  return null
+}
+
+/**
  * Extract the shard key from a subscription pattern or event type.
  * Uses the top-level prefix (first segment before '.') as the shard key.
  *
@@ -122,6 +177,14 @@ export async function handleSubscriptionRoutes(
       if (!pattern || typeof pattern !== 'string') {
         return Response.json(
           { ok: false, error: 'Missing required field: pattern (string)' },
+          { status: 400, headers: corsHeaders() }
+        )
+      }
+      // Validate pattern for safety
+      const patternError = validatePattern(pattern)
+      if (patternError) {
+        return Response.json(
+          { ok: false, error: `Invalid pattern: ${patternError}` },
           { status: 400, headers: corsHeaders() }
         )
       }

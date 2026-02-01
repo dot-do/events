@@ -32,6 +32,8 @@ export {
   isWebSocketEvent,
   isClientEvent,
   isCustomEvent,
+  EventBufferFullError,
+  CircuitBreakerOpenError,
 } from './types.js'
 
 // === CDC: Change Data Capture ===

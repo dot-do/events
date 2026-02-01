@@ -60,15 +60,143 @@ function createMockDurableObjectId(id = 'cdc-processor-test', name?: string): Du
 
 /**
  * Creates a mock SqlStorage with in-memory tables
+ * Returns arrays directly from exec() for iteration compatibility
  */
 function createMockSqlStorage() {
+  // In-memory tables: Map<tableName, Map<primaryKey, row>>
   const tables = new Map<string, Map<string, Record<string, unknown>>>()
-  const execFn = vi.fn((query: string, ...params: unknown[]) => {
-    // Track queries for assertions
-    return {
-      toArray: () => [],
-      changes: 0,
+  tables.set('cdc_state', new Map())
+  tables.set('pending_deltas', new Map())
+  tables.set('manifests', new Map())
+
+  // Auto-increment counter for pending_deltas.id
+  let pendingDeltaIdCounter = 0
+
+  const execFn = vi.fn((query: string, ...params: unknown[]): Record<string, unknown>[] => {
+    const trimmed = query.trim().toUpperCase()
+
+    // CREATE TABLE - no-op, return empty array
+    if (trimmed.startsWith('CREATE')) {
+      return []
     }
+
+    // SELECT queries
+    if (trimmed.startsWith('SELECT')) {
+      // Handle COUNT(*) queries
+      const countMatch = query.match(/SELECT\s+COUNT\s*\(\s*\*\s*\)\s*(?:as|AS)\s+(\w+)\s+FROM\s+(\w+)/i)
+      if (countMatch) {
+        const alias = countMatch[1]
+        const tableName = countMatch[2]
+        const table = tables.get(tableName)
+        const count = table ? table.size : 0
+        return [{ [alias]: count }]
+      }
+
+      // Parse table name from query
+      const fromMatch = query.match(/FROM\s+(\w+)/i)
+      if (!fromMatch) return []
+      const tableName = fromMatch[1]
+      const table = tables.get(tableName)
+      if (!table) return []
+
+      // Handle WHERE clause with collection and doc_id
+      const whereMatch = query.match(/WHERE\s+collection\s*=\s*\?\s+AND\s+doc_id\s*=\s*\?/i)
+      if (whereMatch && params.length >= 2) {
+        const key = `${params[0]}:${params[1]}`
+        const row = table.get(key)
+        return row ? [row] : []
+      }
+
+      // Handle WHERE with just collection
+      const collectionMatch = query.match(/WHERE\s+collection\s*=\s*\?/i)
+      if (collectionMatch && params.length >= 1) {
+        const collection = params[0] as string
+        const rows: Record<string, unknown>[] = []
+        for (const [key, row] of table) {
+          if (key.startsWith(`${collection}:`)) {
+            rows.push(row)
+          }
+        }
+        return rows
+      }
+
+      // Return all rows (sorted by id for pending_deltas ORDER BY id)
+      const rows = Array.from(table.values())
+      if (tableName === 'pending_deltas') {
+        return rows.sort((a, b) => (a.id as number) - (b.id as number))
+      }
+      return rows
+    }
+
+    // INSERT / INSERT OR REPLACE / UPSERT
+    if (trimmed.startsWith('INSERT')) {
+      const tableMatch = query.match(/INTO\s+(\w+)/i)
+      if (!tableMatch) return []
+      const tableName = tableMatch[1]
+      let table = tables.get(tableName)
+      if (!table) {
+        table = new Map()
+        tables.set(tableName, table)
+      }
+
+      // Parse columns
+      const colsMatch = query.match(/\(([^)]+)\)\s*VALUES/i)
+      if (!colsMatch) return []
+      const columns = colsMatch[1].split(',').map(c => c.trim())
+
+      // Build row
+      const row: Record<string, unknown> = {}
+      columns.forEach((col, i) => {
+        row[col] = params[i]
+      })
+
+      // Determine primary key based on table and add auto-increment id for pending_deltas
+      let key: string
+      if (tableName === 'cdc_state') {
+        key = `${row.collection}:${row.doc_id}`
+      } else if (tableName === 'manifests') {
+        key = row.collection as string
+      } else if (tableName === 'pending_deltas') {
+        // Auto-generate id for pending_deltas
+        row.id = ++pendingDeltaIdCounter
+        key = `${pendingDeltaIdCounter}`
+      } else {
+        key = `${Date.now()}-${Math.random()}`
+      }
+
+      table.set(key, row)
+      return []
+    }
+
+    // DELETE
+    if (trimmed.startsWith('DELETE')) {
+      const tableMatch = query.match(/FROM\s+(\w+)/i)
+      if (!tableMatch) return []
+      const tableName = tableMatch[1]
+      const table = tables.get(tableName)
+      if (!table) return []
+
+      // Handle DELETE without WHERE (clear all)
+      if (!query.includes('WHERE')) {
+        table.clear()
+        return []
+      }
+
+      // Handle WHERE clause
+      const whereMatch = query.match(/WHERE\s+collection\s*=\s*\?/i)
+      if (whereMatch && params.length >= 1) {
+        const collection = params[0] as string
+        for (const [key, row] of table) {
+          if ((row.collection as string) === collection) {
+            table.delete(key)
+          }
+        }
+      }
+      return []
+    }
+
+    // Default: return empty array
+    return []
   })
 
   return {

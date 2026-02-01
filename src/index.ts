@@ -32,6 +32,7 @@ import { compactCollection } from '../core/src/cdc-compaction'
 import { compactEventStream } from '../core/src/event-compaction'
 import { handleSubscriptionRoutes } from './subscription-routes'
 import { corsHeaders, getAllowedOrigin } from './utils'
+import { withSchedulerLock } from './scheduler-lock'
 
 // Route handlers
 import { handleHealth, handlePipelineCheck, handleBenchmark } from './routes/health'
@@ -100,7 +101,7 @@ export default {
       if (!result.user?.roles?.includes('admin')) {
         return Response.json({
           error: 'Admin access required',
-          user: result.user,
+          authenticated: true,
           message: 'You are logged in but do not have admin privileges'
         }, { status: 403 })
       }
@@ -174,6 +175,9 @@ export default {
   /**
    * Scheduled handler - runs CDC compaction, event compaction, and dedup marker cleanup.
    *
+   * Uses a distributed lock to ensure only one worker runs scheduled tasks at a time.
+   * The lock prevents duplicate work when multiple workers trigger on the same cron schedule.
+   *
    * Cron: every hour at :30 (30 * * * *)
    *
    * Tasks:
@@ -186,170 +190,240 @@ export default {
     console.log(`[SCHEDULED] Triggered at ${new Date().toISOString()}, cron: ${event.cron}`)
 
     ctx.waitUntil((async () => {
-      // ================================================================
-      // Task 1: Dedup marker cleanup (delete markers older than 24 hours)
-      // ================================================================
-      try {
-        const DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
-        const now = Date.now()
-        let dedupDeleted = 0
-        let dedupChecked = 0
-        let cursor: string | undefined
+      // Acquire distributed lock to prevent concurrent scheduled runs
+      const lockResult = await withSchedulerLock(
+        env.EVENTS_BUCKET,
+        async () => {
+          // ================================================================
+          // Task 1: Dedup marker cleanup (delete markers older than 24 hours)
+          // ================================================================
+          try {
+            const DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
+            const now = Date.now()
+            let dedupDeleted = 0
+            let dedupChecked = 0
+            let cursor: string | undefined
 
-        console.log('[DEDUP-CLEANUP] Starting dedup marker cleanup...')
+            console.log('[DEDUP-CLEANUP] Starting dedup marker cleanup...')
 
-        // Paginate through all dedup markers
-        do {
-          const list = await env.EVENTS_BUCKET.list({
-            prefix: 'dedup/',
-            limit: 1000,
-            cursor,
-          })
+            // Paginate through all dedup markers
+            do {
+              const list = await env.EVENTS_BUCKET.list({
+                prefix: 'dedup/',
+                limit: 1000,
+                cursor,
+              })
 
-          for (const obj of list.objects) {
-            dedupChecked++
-            // Check if marker is older than TTL based on uploaded timestamp
-            const uploadedAt = obj.uploaded.getTime()
-            if (now - uploadedAt > DEDUP_TTL_MS) {
-              await env.EVENTS_BUCKET.delete(obj.key)
-              dedupDeleted++
-            }
+              for (const obj of list.objects) {
+                dedupChecked++
+                // Check if marker is older than TTL based on uploaded timestamp
+                const uploadedAt = obj.uploaded.getTime()
+                if (now - uploadedAt > DEDUP_TTL_MS) {
+                  await env.EVENTS_BUCKET.delete(obj.key)
+                  dedupDeleted++
+                }
+              }
+
+              cursor = list.truncated ? list.cursor : undefined
+            } while (cursor)
+
+            console.log(`[DEDUP-CLEANUP] Completed: checked ${dedupChecked}, deleted ${dedupDeleted} expired markers`)
+          } catch (err) {
+            console.error('[DEDUP-CLEANUP] Error during dedup cleanup:', err)
           }
 
-          cursor = list.truncated ? list.cursor : undefined
-        } while (cursor)
+          // ================================================================
+          // Task 2: CDC Compaction
+          // ================================================================
+          try {
+            console.log('[COMPACT-CDC] Starting CDC compaction...')
 
-        console.log(`[DEDUP-CLEANUP] Completed: checked ${dedupChecked}, deleted ${dedupDeleted} expired markers`)
-      } catch (err) {
-        console.error('[DEDUP-CLEANUP] Error during dedup cleanup:', err)
-      }
+            // Discover namespaces by scanning R2 for cdc prefixes
+            // This is more reliable than relying on catalog state since we're sharding by namespace
+            const namespaces = new Set<string>()
 
-      // ================================================================
-      // Task 2: CDC Compaction
-      // ================================================================
-      try {
-        console.log('[COMPACT-CDC] Starting CDC compaction...')
+            // Scan R2 for existing CDC namespaces (format: cdc/{namespace}/{table}/...)
+            let cdcCursor: string | undefined
+            do {
+              const list = await env.EVENTS_BUCKET.list({
+                prefix: 'cdc/',
+                delimiter: '/',
+                cursor: cdcCursor,
+              })
 
-        // Get catalog to list namespaces and tables
-        const catalogId = env.CATALOG.idFromName('events-catalog')
-        const catalog = env.CATALOG.get(catalogId)
+              // Extract namespace from common prefixes (format: cdc/{namespace}/)
+              for (const prefix of list.delimitedPrefixes || []) {
+                const parts = prefix.split('/')
+                if (parts.length >= 2 && parts[1]) {
+                  namespaces.add(parts[1])
+                }
+              }
 
-        const namespaces = await catalog.listNamespaces()
-        console.log(`[COMPACT-CDC] Found ${namespaces.length} namespaces: ${namespaces.join(', ')}`)
+              cdcCursor = list.truncated ? list.cursor : undefined
+            } while (cdcCursor)
 
-        let totalCompacted = 0
-        let totalSkipped = 0
-        const results: { ns: string; table: string; result: string; recordCount?: number; deltasProcessed?: number }[] = []
-
-        // 2. For each namespace, list tables and check for pending deltas
-        for (const ns of namespaces) {
-          const tables = await catalog.listTables(ns)
-
-          for (const table of tables) {
-            const deltasPrefix = `cdc/${ns}/${table}/deltas/`
-
-            // Check if there are any pending delta files
-            const deltasList = await env.EVENTS_BUCKET.list({ prefix: deltasPrefix, limit: 1 })
-
-            if (deltasList.objects.length === 0) {
-              totalSkipped++
-              continue
+            // Also check legacy catalog for any namespaces (backwards compatibility)
+            const legacyCatalogId = env.CATALOG.idFromName('events-catalog')
+            const legacyCatalog = env.CATALOG.get(legacyCatalogId)
+            try {
+              const legacyNamespaces = await legacyCatalog.listNamespaces()
+              for (const ns of legacyNamespaces) {
+                namespaces.add(ns)
+              }
+            } catch {
+              // Ignore errors from legacy catalog
             }
 
-            // 3. Run compaction for this collection
+            const namespaceList = [...namespaces]
+            console.log(`[COMPACT-CDC] Found ${namespaceList.length} namespaces: ${namespaceList.join(', ')}`)
+
+            let totalCompacted = 0
+            let totalSkipped = 0
+            const results: { ns: string; table: string; result: string; recordCount?: number; deltasProcessed?: number }[] = []
+
+            // 2. For each namespace, get the sharded catalog and list tables
+            for (const ns of namespaceList) {
+              // Get namespace-sharded catalog
+              const catalogId = env.CATALOG.idFromName(ns)
+              const catalog = env.CATALOG.get(catalogId)
+
+              // Get tables from sharded catalog
+              let tables = await catalog.listTables(ns)
+
+              // Also check legacy catalog for this namespace (migration support)
+              if (tables.length === 0) {
+                try {
+                  tables = await legacyCatalog.listTables(ns)
+                } catch {
+                  // Ignore errors from legacy catalog
+                }
+              }
+
+              for (const table of tables) {
+                const deltasPrefix = `cdc/${ns}/${table}/deltas/`
+
+                // Check if there are any pending delta files
+                const deltasList = await env.EVENTS_BUCKET.list({ prefix: deltasPrefix, limit: 1 })
+
+                if (deltasList.objects.length === 0) {
+                  totalSkipped++
+                  continue
+                }
+
+                // 3. Run compaction for this collection
+                try {
+                  const compactionResult = await compactCollection(
+                    env.EVENTS_BUCKET,
+                    ns,
+                    table,
+                    { deleteDeltas: true }
+                  )
+
+                  if (compactionResult.success && compactionResult.deltasProcessed > 0) {
+                    totalCompacted++
+                    results.push({
+                      ns,
+                      table,
+                      result: 'compacted',
+                      recordCount: compactionResult.recordCount,
+                      deltasProcessed: compactionResult.deltasProcessed,
+                    })
+                    console.log(
+                      `[COMPACT-CDC] Compacted ${ns}/${table}: ${compactionResult.deltasProcessed} deltas -> ${compactionResult.recordCount} records`
+                    )
+                  } else {
+                    totalSkipped++
+                    results.push({ ns, table, result: 'no-deltas' })
+                  }
+                } catch (err) {
+                  const errorMsg = err instanceof Error ? err.message : String(err)
+                  console.error(`[COMPACT-CDC] Error compacting ${ns}/${table}:`, errorMsg)
+                  results.push({ ns, table, result: `error: ${errorMsg}` })
+                }
+              }
+            }
+
+            console.log(
+              `[COMPACT-CDC] Completed: ${totalCompacted} compacted, ${totalSkipped} skipped`
+            )
+          } catch (err) {
+            console.error('[COMPACT-CDC] Error during CDC compaction:', err)
+          }
+
+          // ================================================================
+          // Task 3: Event Stream Compaction (daily at 1:30 UTC only)
+          // Compacts hourly Parquet files from EventWriterDO into daily files.
+          // Only runs at 1:30 UTC to avoid compacting files still being written.
+          // ================================================================
+          const currentHour = new Date().getUTCHours()
+          if (currentHour === 1) {
             try {
-              const compactionResult = await compactCollection(
-                env.EVENTS_BUCKET,
-                ns,
-                table,
-                { deleteDeltas: true }
+              console.log('[COMPACT-EVENTS] Starting event stream compaction...')
+
+              const result = await compactEventStream(env.EVENTS_BUCKET, {
+                prefixes: ['events', 'webhooks', 'tail'],
+                daysBack: 7,
+              })
+
+              console.log(
+                `[COMPACT-EVENTS] Completed in ${result.durationMs}ms: ` +
+                `${result.days.length} days processed, ` +
+                `${result.totalSourceFiles} source files -> ${result.totalOutputFiles} output files, ` +
+                `${result.totalRecords} total records`
               )
 
-              if (compactionResult.success && compactionResult.deltasProcessed > 0) {
-                totalCompacted++
-                results.push({
-                  ns,
-                  table,
-                  result: 'compacted',
-                  recordCount: compactionResult.recordCount,
-                  deltasProcessed: compactionResult.deltasProcessed,
-                })
-                console.log(
-                  `[COMPACT-CDC] Compacted ${ns}/${table}: ${compactionResult.deltasProcessed} deltas -> ${compactionResult.recordCount} records`
-                )
-              } else {
-                totalSkipped++
-                results.push({ ns, table, result: 'no-deltas' })
+              if (result.errors && result.errors.length > 0) {
+                console.warn('[COMPACT-EVENTS] Errors:', result.errors)
               }
             } catch (err) {
-              const errorMsg = err instanceof Error ? err.message : String(err)
-              console.error(`[COMPACT-CDC] Error compacting ${ns}/${table}:`, errorMsg)
-              results.push({ ns, table, result: `error: ${errorMsg}` })
+              console.error('[COMPACT-EVENTS] Error during event stream compaction:', err)
             }
           }
-        }
 
-        console.log(
-          `[COMPACT-CDC] Completed: ${totalCompacted} compacted, ${totalSkipped} skipped`
-        )
-      } catch (err) {
-        console.error('[COMPACT-CDC] Error during CDC compaction:', err)
+          const durationMs = Date.now() - startTime
+          console.log(`[SCHEDULED] All tasks completed in ${durationMs}ms`)
+        },
+        { timeoutMs: 10 * 60 * 1000 } // 10 minute lock timeout
+      )
+
+      if (lockResult.skipped) {
+        console.log('[SCHEDULED] Skipped - another worker is running scheduled tasks')
       }
-
-      // ================================================================
-      // Task 3: Event Stream Compaction (daily at 1:30 UTC only)
-      // Compacts hourly Parquet files from EventWriterDO into daily files.
-      // Only runs at 1:30 UTC to avoid compacting files still being written.
-      // ================================================================
-      const currentHour = new Date().getUTCHours()
-      if (currentHour === 1) {
-        try {
-          console.log('[COMPACT-EVENTS] Starting event stream compaction...')
-
-          const result = await compactEventStream(env.EVENTS_BUCKET, {
-            prefixes: ['events', 'webhooks', 'tail'],
-            daysBack: 7,
-          })
-
-          console.log(
-            `[COMPACT-EVENTS] Completed in ${result.durationMs}ms: ` +
-            `${result.days.length} days processed, ` +
-            `${result.totalSourceFiles} source files -> ${result.totalOutputFiles} output files, ` +
-            `${result.totalRecords} total records`
-          )
-
-          if (result.errors && result.errors.length > 0) {
-            console.warn('[COMPACT-EVENTS] Errors:', result.errors)
-          }
-        } catch (err) {
-          console.error('[COMPACT-EVENTS] Error during event stream compaction:', err)
-        }
-      }
-
-      const durationMs = Date.now() - startTime
-      console.log(`[SCHEDULED] All tasks completed in ${durationMs}ms`)
     })())
   },
 
   /**
    * Queue consumer handler - processes EventBatch messages for CDC/subscription fanout.
    *
+   * MUTUAL EXCLUSION: This queue consumer ONLY processes events when USE_QUEUE_FANOUT=true.
+   * The ingest handler will only send to the queue when queue fanout is enabled,
+   * ensuring events are processed by either queue OR direct fanout, never both.
+   *
    * This provides an alternative to direct DO calls in the ingest flow, enabling:
    * - Better scalability through queue-based buffering
-   * - Automatic retries on failure
+   * - Automatic retries on failure (up to MAX_RETRIES)
+   * - Dead letter logging for permanently failed messages
    * - Decoupled processing from the ingest response path
+   * - Event-level idempotency using event IDs
    *
    * Queue message format: EventBatch (same as ingest payload)
    */
   async queue(batch: MessageBatch<EventBatch>, env: Env): Promise<void> {
     const startTime = Date.now()
-    console.log(`[QUEUE] Processing batch of ${batch.messages.length} messages`)
+    const MAX_RETRIES = 5
+
+    console.log(`[QUEUE] Processing batch of ${batch.messages.length} messages (QUEUE fanout mode)`)
 
     let totalEvents = 0
     let cdcEventsProcessed = 0
+    let cdcEventsSkipped = 0
     let subscriptionFanouts = 0
+    let subscriptionSkipped = 0
+    let deadLettered = 0
 
     for (const message of batch.messages) {
+      const attempts = message.attempts ?? 1
+
       try {
         const eventBatch = message.body
 
@@ -378,15 +452,46 @@ export default {
           }
 
           // Send each group to the appropriate CDCProcessorDO instance
+          // Use event ID for deduplication to prevent double-processing on retries
           for (const [key, events] of cdcByKey) {
             try {
-              const processorId = env.CDC_PROCESSOR.idFromName(key)
-              const processor = env.CDC_PROCESSOR.get(processorId)
-              await processor.process(events)
-              cdcEventsProcessed += events.length
+              // Filter out already-processed events using dedup markers
+              const eventsToProcess: CDCEvent[] = []
+              for (const event of events) {
+                const eventId = (event as { id?: string }).id
+                if (eventId) {
+                  const dedupKey = `dedup/cdc/${eventId}`
+                  const existing = await env.EVENTS_BUCKET.head(dedupKey)
+                  if (existing) {
+                    cdcEventsSkipped++
+                    continue // Skip already processed event
+                  }
+                }
+                eventsToProcess.push(event)
+              }
+
+              if (eventsToProcess.length > 0) {
+                const processorId = env.CDC_PROCESSOR.idFromName(key)
+                const processor = env.CDC_PROCESSOR.get(processorId)
+                await processor.process(eventsToProcess)
+                cdcEventsProcessed += eventsToProcess.length
+
+                // Write dedup markers for processed events
+                for (const event of eventsToProcess) {
+                  const eventId = (event as { id?: string }).id
+                  if (eventId) {
+                    const dedupKey = `dedup/cdc/${eventId}`
+                    await env.EVENTS_BUCKET.put(dedupKey, '', {
+                      customMetadata: { processedAt: new Date().toISOString() },
+                    })
+                  }
+                }
+              }
+
+              console.log(`[QUEUE] CDC processed ${eventsToProcess.length} events for ${key} (skipped ${events.length - eventsToProcess.length} duplicates)`)
             } catch (err) {
               console.error(`[QUEUE] CDC processor error for ${key}:`, err)
-              // Don't ack the message yet - will retry
+              // Don't ack the message yet - will retry or dead letter
               throw err
             }
           }
@@ -405,23 +510,45 @@ export default {
           }
 
           // Fan out each group to its corresponding shard
+          // Use event ID for idempotency to prevent duplicate delivery on retries
           for (const [shardKey, events] of eventsByShard) {
+            let shardSkipped = 0
             try {
               const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
               const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
 
               for (const event of events) {
+                // Use existing event id for idempotency if available
+                const eventId = (event as { id?: string }).id || ulid()
+
+                // Check dedup marker for subscription delivery
+                const dedupKey = `dedup/sub/${eventId}`
+                const existing = await env.EVENTS_BUCKET.head(dedupKey)
+                if (existing) {
+                  subscriptionSkipped++
+                  shardSkipped++
+                  continue // Skip already delivered event
+                }
+
                 await subscriptionDO.fanout({
-                  id: ulid(),
+                  id: eventId,
                   type: event.type,
                   ts: event.ts,
                   payload: event,
                 })
+
+                // Write dedup marker after successful delivery
+                await env.EVENTS_BUCKET.put(dedupKey, '', {
+                  customMetadata: { deliveredAt: new Date().toISOString() },
+                })
+
                 subscriptionFanouts++
               }
+
+              console.log(`[QUEUE] Subscription fanout: ${events.length - shardSkipped} events to shard ${shardKey} (skipped ${shardSkipped} duplicates)`)
             } catch (err) {
               console.error(`[QUEUE] Subscription shard error for shard ${shardKey}:`, err)
-              // Don't ack the message yet - will retry
+              // Don't ack the message yet - will retry or dead letter
               throw err
             }
           }
@@ -430,15 +557,53 @@ export default {
         // Successfully processed this message
         message.ack()
       } catch (err) {
-        console.error(`[QUEUE] Error processing message:`, err)
-        // Message will be retried automatically by the queue
-        message.retry()
+        const errorMsg = err instanceof Error ? err.message : String(err)
+
+        // Check if we've exceeded max retries
+        if (attempts >= MAX_RETRIES) {
+          // Permanent failure - log to dead letter and ack to prevent further retries
+          console.error(
+            `[QUEUE] Dead letter: message failed after ${attempts} attempts. Error: ${errorMsg}`,
+            { messageId: message.id, body: message.body }
+          )
+
+          // Write to R2 dead letter storage for later inspection/reprocessing
+          try {
+            const deadLetterKey = `dead-letter/queue/${new Date().toISOString().slice(0, 10)}/${message.id || ulid()}.json`
+            await env.EVENTS_BUCKET.put(
+              deadLetterKey,
+              JSON.stringify({
+                messageId: message.id,
+                attempts,
+                error: errorMsg,
+                body: message.body,
+                timestamp: new Date().toISOString(),
+              }),
+              { httpMetadata: { contentType: 'application/json' } }
+            )
+            console.log(`[QUEUE] Dead letter written to ${deadLetterKey}`)
+          } catch (dlErr) {
+            console.error(`[QUEUE] Failed to write dead letter:`, dlErr)
+          }
+
+          deadLettered++
+          message.ack() // Ack to prevent further retries
+        } else {
+          // Transient failure - retry
+          console.warn(
+            `[QUEUE] Retrying message (attempt ${attempts}/${MAX_RETRIES}). Error: ${errorMsg}`
+          )
+          message.retry()
+        }
       }
     }
 
     const durationMs = Date.now() - startTime
     console.log(
-      `[QUEUE] Completed in ${durationMs}ms: ${totalEvents} events, ${cdcEventsProcessed} CDC, ${subscriptionFanouts} fanouts`
+      `[QUEUE] Completed in ${durationMs}ms: ${totalEvents} events, ` +
+      `CDC: ${cdcEventsProcessed} processed/${cdcEventsSkipped} skipped, ` +
+      `Subscriptions: ${subscriptionFanouts} delivered/${subscriptionSkipped} skipped` +
+      (deadLettered > 0 ? `, ${deadLettered} dead-lettered` : '')
     )
   },
 }

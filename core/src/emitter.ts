@@ -3,6 +3,7 @@
  */
 
 import type { DurableEvent, EmitInput, EventEmitterOptions, CollectionChangeEvent, EventBatch } from './types.js'
+import { EventBufferFullError, CircuitBreakerOpenError } from './types.js'
 
 /**
  * Extended Request interface with Cloudflare properties
@@ -15,6 +16,17 @@ const DEFAULT_ENDPOINT = 'https://events.workers.do/ingest'
 const RETRY_KEY = '_events:retry'
 const RETRY_COUNT_KEY = '_events:retryCount'
 const BATCH_KEY = '_events:batch'
+const CIRCUIT_BREAKER_KEY = '_events:circuitBreaker'
+
+/** Circuit breaker state stored in DO storage */
+interface CircuitBreakerState {
+  /** Number of consecutive failures */
+  consecutiveFailures: number
+  /** Timestamp when circuit breaker opened (ISO string) */
+  openedAt?: string
+  /** Whether circuit breaker is currently open */
+  isOpen: boolean
+}
 
 /**
  * Lightweight event emitter for Durable Objects
@@ -48,6 +60,10 @@ export class EventEmitter {
   private flushTimeout?: ReturnType<typeof setTimeout>
   private identity: DurableEvent['do']
   private options: Required<Omit<EventEmitterOptions, 'r2Bucket' | 'apiKey'>> & { r2Bucket?: R2Bucket; apiKey?: string }
+  /** Cached circuit breaker state for fast checks */
+  private circuitBreakerCache: CircuitBreakerState | null = null
+  /** Total events dropped due to buffer overflow */
+  private droppedEventCount = 0
 
   constructor(
     private ctx: DurableObjectState,
@@ -62,6 +78,9 @@ export class EventEmitter {
       trackPrevious: options.trackPrevious ?? false,
       r2Bucket: options.r2Bucket,
       apiKey: options.apiKey,
+      maxRetryQueueSize: options.maxRetryQueueSize ?? 10000,
+      maxConsecutiveFailures: options.maxConsecutiveFailures ?? 10,
+      circuitBreakerResetMs: options.circuitBreakerResetMs ?? 300000, // 5 minutes
     }
 
     // Identity will be enriched on first request
@@ -90,8 +109,21 @@ export class EventEmitter {
 
   /**
    * Emit an event (batched, non-blocking)
+   *
+   * @throws {CircuitBreakerOpenError} When circuit breaker is open due to repeated failures
    */
   emit(event: EmitInput): void {
+    // Check circuit breaker before accepting events
+    if (this.isCircuitBreakerOpen()) {
+      const state = this.circuitBreakerCache!
+      const resetAt = new Date(new Date(state.openedAt!).getTime() + this.options.circuitBreakerResetMs)
+      throw new CircuitBreakerOpenError(
+        `Circuit breaker is open after ${state.consecutiveFailures} consecutive failures. Will reset at ${resetAt.toISOString()}`,
+        state.consecutiveFailures,
+        resetAt
+      )
+    }
+
     // Safe cast: EmitInput is already constrained to valid event shapes,
     // adding ts + do completes it to a DurableEvent. TypeScript can't verify
     // union reconstitution through spread, so the cast is necessary but safe.
@@ -110,6 +142,27 @@ export class EventEmitter {
       // Schedule flush
       this.flushTimeout = setTimeout(() => this.flush(), this.options.flushIntervalMs)
     }
+  }
+
+  /**
+   * Check if circuit breaker is currently open
+   */
+  private isCircuitBreakerOpen(): boolean {
+    if (!this.circuitBreakerCache || !this.circuitBreakerCache.isOpen) {
+      return false
+    }
+
+    // Check if enough time has passed to attempt reset (half-open state)
+    if (this.circuitBreakerCache.openedAt) {
+      const openedAt = new Date(this.circuitBreakerCache.openedAt).getTime()
+      const elapsed = Date.now() - openedAt
+      if (elapsed >= this.options.circuitBreakerResetMs) {
+        // Allow a retry attempt (half-open state)
+        return false
+      }
+    }
+
+    return true
   }
 
   /**
@@ -193,6 +246,9 @@ export class EventEmitter {
         throw new Error(`Event flush failed: ${response.status}`)
       }
 
+      // Record success for circuit breaker
+      await this.recordSuccess()
+
       // Also stream to R2 if configured (for lakehouse)
       if (this.options.r2Bucket) {
         await this.streamToR2(events)
@@ -219,15 +275,39 @@ export class EventEmitter {
 
   /**
    * Schedule retry via alarm
+   *
+   * @throws {EventBufferFullError} When buffer is full and events are dropped
    */
   private async scheduleRetry(events: DurableEvent[]): Promise<void> {
+    // Update circuit breaker state on failure
+    await this.recordFailure()
+
+    // Check if circuit breaker should open
+    const cbState = await this.getCircuitBreakerState()
+    if (this.options.maxConsecutiveFailures > 0 && cbState.consecutiveFailures >= this.options.maxConsecutiveFailures) {
+      // Open circuit breaker
+      cbState.isOpen = true
+      cbState.openedAt = new Date().toISOString()
+      await this.ctx.storage.put(CIRCUIT_BREAKER_KEY, cbState)
+      this.circuitBreakerCache = cbState
+      console.warn(`[events] Circuit breaker opened after ${cbState.consecutiveFailures} consecutive failures`)
+    }
+
     // Get existing retry queue
     const existing = await this.ctx.storage.get<DurableEvent[]>(RETRY_KEY) ?? []
     const combined = [...existing, ...events]
 
     // Cap retry queue to prevent unbounded growth
-    const maxRetry = 10000
-    const toRetry = combined.slice(-maxRetry)
+    const maxRetry = this.options.maxRetryQueueSize
+    let droppedCount = 0
+    let toRetry = combined
+
+    if (combined.length > maxRetry) {
+      droppedCount = combined.length - maxRetry
+      toRetry = combined.slice(-maxRetry)
+      this.droppedEventCount += droppedCount
+      console.warn(`[events] Retry buffer full: dropped ${droppedCount} oldest events (total dropped: ${this.droppedEventCount})`)
+    }
 
     await this.ctx.storage.put(RETRY_KEY, toRetry)
 
@@ -239,6 +319,51 @@ export class EventEmitter {
       await this.ctx.storage.put(RETRY_COUNT_KEY, retryCount + 1)
       await this.ctx.storage.setAlarm(Date.now() + delay)
     }
+
+    // Throw error to signal backpressure if events were dropped
+    if (droppedCount > 0) {
+      throw new EventBufferFullError(
+        `Event buffer full: ${droppedCount} events dropped. Consider reducing event volume or increasing maxRetryQueueSize.`,
+        droppedCount
+      )
+    }
+  }
+
+  /**
+   * Record a failure for circuit breaker tracking
+   */
+  private async recordFailure(): Promise<void> {
+    const state = await this.getCircuitBreakerState()
+    state.consecutiveFailures++
+    await this.ctx.storage.put(CIRCUIT_BREAKER_KEY, state)
+    this.circuitBreakerCache = state
+  }
+
+  /**
+   * Record a success and potentially close circuit breaker
+   */
+  private async recordSuccess(): Promise<void> {
+    const state = await this.getCircuitBreakerState()
+    if (state.consecutiveFailures > 0 || state.isOpen) {
+      state.consecutiveFailures = 0
+      state.isOpen = false
+      state.openedAt = undefined
+      await this.ctx.storage.put(CIRCUIT_BREAKER_KEY, state)
+      this.circuitBreakerCache = state
+      console.log('[events] Circuit breaker closed after successful delivery')
+    }
+  }
+
+  /**
+   * Get circuit breaker state from storage or cache
+   */
+  private async getCircuitBreakerState(): Promise<CircuitBreakerState> {
+    if (this.circuitBreakerCache) {
+      return this.circuitBreakerCache
+    }
+    const stored = await this.ctx.storage.get<CircuitBreakerState>(CIRCUIT_BREAKER_KEY)
+    this.circuitBreakerCache = stored ?? { consecutiveFailures: 0, isOpen: false }
+    return this.circuitBreakerCache
   }
 
   /**
@@ -246,6 +371,9 @@ export class EventEmitter {
    * Call this from your DO's alarm() method
    */
   async handleAlarm(): Promise<void> {
+    // Load circuit breaker state
+    await this.getCircuitBreakerState()
+
     const events = await this.ctx.storage.get<DurableEvent[]>(RETRY_KEY)
     if (!events || events.length === 0) return
 
@@ -267,11 +395,31 @@ export class EventEmitter {
         await this.ctx.storage.delete(RETRY_KEY)
         await this.ctx.storage.delete(RETRY_COUNT_KEY)
 
+        // Record success and potentially close circuit breaker
+        await this.recordSuccess()
+
         // Stream to R2 on successful retry
         if (this.options.r2Bucket) {
           await this.streamToR2(events)
         }
       } else {
+        // Record failure for circuit breaker
+        await this.recordFailure()
+
+        // Check if circuit breaker should open
+        const cbState = await this.getCircuitBreakerState()
+        if (this.options.maxConsecutiveFailures > 0 && cbState.consecutiveFailures >= this.options.maxConsecutiveFailures) {
+          cbState.isOpen = true
+          cbState.openedAt = new Date().toISOString()
+          await this.ctx.storage.put(CIRCUIT_BREAKER_KEY, cbState)
+          this.circuitBreakerCache = cbState
+          console.warn(`[events] Circuit breaker opened after ${cbState.consecutiveFailures} consecutive failures during retry`)
+
+          // Schedule alarm far in the future for circuit breaker reset
+          await this.ctx.storage.setAlarm(Date.now() + this.options.circuitBreakerResetMs)
+          return
+        }
+
         // Retry again later with exponential backoff
         const retryCount = await this.ctx.storage.get<number>(RETRY_COUNT_KEY) ?? 0
         const delay = this.getRetryDelay(retryCount)
@@ -279,6 +427,23 @@ export class EventEmitter {
         await this.ctx.storage.setAlarm(Date.now() + delay)
       }
     } catch {
+      // Record failure for circuit breaker
+      await this.recordFailure()
+
+      // Check if circuit breaker should open
+      const cbState = await this.getCircuitBreakerState()
+      if (this.options.maxConsecutiveFailures > 0 && cbState.consecutiveFailures >= this.options.maxConsecutiveFailures) {
+        cbState.isOpen = true
+        cbState.openedAt = new Date().toISOString()
+        await this.ctx.storage.put(CIRCUIT_BREAKER_KEY, cbState)
+        this.circuitBreakerCache = cbState
+        console.warn(`[events] Circuit breaker opened after ${cbState.consecutiveFailures} consecutive failures during retry`)
+
+        // Schedule alarm far in the future for circuit breaker reset
+        await this.ctx.storage.setAlarm(Date.now() + this.options.circuitBreakerResetMs)
+        return
+      }
+
       // Retry again later with exponential backoff
       const retryCount = await this.ctx.storage.get<number>(RETRY_COUNT_KEY) ?? 0
       const delay = this.getRetryDelay(retryCount)
@@ -353,5 +518,89 @@ export class EventEmitter {
    */
   get doIdentity(): DurableEvent['do'] {
     return { ...this.identity }
+  }
+
+  /**
+   * Get the total count of dropped events due to buffer overflow
+   */
+  get droppedEvents(): number {
+    return this.droppedEventCount
+  }
+
+  /**
+   * Check if circuit breaker is currently open (read from cache, may not be current)
+   * For accurate state, use getCircuitBreakerInfo()
+   */
+  get circuitBreakerOpen(): boolean {
+    return this.isCircuitBreakerOpen()
+  }
+
+  /**
+   * Get detailed circuit breaker information
+   */
+  async getCircuitBreakerInfo(): Promise<{
+    isOpen: boolean
+    consecutiveFailures: number
+    openedAt?: Date
+    resetAt?: Date
+  }> {
+    const state = await this.getCircuitBreakerState()
+    const result: {
+      isOpen: boolean
+      consecutiveFailures: number
+      openedAt?: Date
+      resetAt?: Date
+    } = {
+      isOpen: state.isOpen,
+      consecutiveFailures: state.consecutiveFailures,
+    }
+
+    if (state.openedAt) {
+      result.openedAt = new Date(state.openedAt)
+      result.resetAt = new Date(new Date(state.openedAt).getTime() + this.options.circuitBreakerResetMs)
+    }
+
+    return result
+  }
+
+  /**
+   * Manually reset the circuit breaker
+   * Use this to force retry after fixing the underlying issue
+   */
+  async resetCircuitBreaker(): Promise<void> {
+    const newState: CircuitBreakerState = {
+      consecutiveFailures: 0,
+      isOpen: false,
+      openedAt: undefined,
+    }
+    await this.ctx.storage.put(CIRCUIT_BREAKER_KEY, newState)
+    await this.ctx.storage.delete(RETRY_COUNT_KEY)
+    this.circuitBreakerCache = newState
+    console.log('[events] Circuit breaker manually reset')
+
+    // Trigger retry if there are pending events
+    const events = await this.ctx.storage.get<DurableEvent[]>(RETRY_KEY)
+    if (events && events.length > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 1000) // Retry in 1 second
+    }
+  }
+
+  /**
+   * Get retry queue statistics
+   */
+  async getRetryQueueStats(): Promise<{
+    queueSize: number
+    maxSize: number
+    droppedTotal: number
+    retryCount: number
+  }> {
+    const events = await this.ctx.storage.get<DurableEvent[]>(RETRY_KEY) ?? []
+    const retryCount = await this.ctx.storage.get<number>(RETRY_COUNT_KEY) ?? 0
+    return {
+      queueSize: events.length,
+      maxSize: this.options.maxRetryQueueSize,
+      droppedTotal: this.droppedEventCount,
+      retryCount,
+    }
   }
 }

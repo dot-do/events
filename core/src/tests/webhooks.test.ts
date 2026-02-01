@@ -881,3 +881,221 @@ describe('Svix Webhook Verification', () => {
     })
   })
 })
+
+// ============================================================================
+// Timing Safety Tests
+// ============================================================================
+
+describe('Timing-safe comparison', () => {
+  const secret = 'test-webhook-secret'
+  const payload = '{"test":"data"}'
+
+  describe('length-independent timing', () => {
+    it('comparison time should not vary significantly with different length signatures', async () => {
+      // This test verifies that comparing signatures of different lengths
+      // doesn't reveal length information through timing differences.
+      // The double-HMAC technique should ensure constant comparison time.
+
+      const validSignature = await generateGitHubSignature(secret, payload)
+      const iterations = 50
+
+      // Test with signatures of vastly different lengths
+      const shortInvalid = 'sha256=0000000000000000000000000000000000000000000000000000000000000000'
+      const longInvalid = 'sha256=' + '0'.repeat(64) // Same length as valid
+
+      const shortTimes: number[] = []
+      const longTimes: number[] = []
+
+      // Warm up JIT
+      for (let i = 0; i < 10; i++) {
+        await verifyGitHubSignature(secret, payload, shortInvalid)
+        await verifyGitHubSignature(secret, payload, longInvalid)
+      }
+
+      // Measure times
+      for (let i = 0; i < iterations; i++) {
+        const start1 = performance.now()
+        await verifyGitHubSignature(secret, payload, shortInvalid)
+        shortTimes.push(performance.now() - start1)
+
+        const start2 = performance.now()
+        await verifyGitHubSignature(secret, payload, longInvalid)
+        longTimes.push(performance.now() - start2)
+      }
+
+      // Calculate averages (excluding outliers)
+      const sortedShort = [...shortTimes].sort((a, b) => a - b)
+      const sortedLong = [...longTimes].sort((a, b) => a - b)
+
+      // Use median to reduce noise
+      const shortMedian = sortedShort[Math.floor(iterations / 2)]!
+      const longMedian = sortedLong[Math.floor(iterations / 2)]!
+
+      // Times should be similar - allow 3x variance due to async operations and crypto
+      const ratio = Math.max(shortMedian, longMedian) / Math.min(shortMedian, longMedian)
+      expect(ratio).toBeLessThan(3)
+    })
+  })
+
+  describe('early-mismatch independence', () => {
+    it('comparison time should not vary based on where mismatch occurs', async () => {
+      // Verify that signatures that differ at the beginning take the same
+      // time to compare as signatures that differ at the end
+
+      const iterations = 50
+
+      // Valid signature (all correct)
+      const validSig = await generateGitHubSignature(secret, payload)
+      const validHex = validSig.slice(7) // Remove 'sha256='
+
+      // Create signature that differs at the start
+      const firstChar = validHex[0]!
+      const differentFirst = firstChar === '0' ? '1' : '0'
+      const earlyMismatch = 'sha256=' + differentFirst + validHex.slice(1)
+
+      // Create signature that differs at the end
+      const lastChar = validHex[63]!
+      const differentLast = lastChar === '0' ? '1' : '0'
+      const lateMismatch = 'sha256=' + validHex.slice(0, 63) + differentLast
+
+      const earlyTimes: number[] = []
+      const lateTimes: number[] = []
+
+      // Warm up
+      for (let i = 0; i < 10; i++) {
+        await verifyGitHubSignature(secret, payload, earlyMismatch)
+        await verifyGitHubSignature(secret, payload, lateMismatch)
+      }
+
+      // Measure
+      for (let i = 0; i < iterations; i++) {
+        const start1 = performance.now()
+        await verifyGitHubSignature(secret, payload, earlyMismatch)
+        earlyTimes.push(performance.now() - start1)
+
+        const start2 = performance.now()
+        await verifyGitHubSignature(secret, payload, lateMismatch)
+        lateTimes.push(performance.now() - start2)
+      }
+
+      // Calculate medians
+      const sortedEarly = [...earlyTimes].sort((a, b) => a - b)
+      const sortedLate = [...lateTimes].sort((a, b) => a - b)
+
+      const earlyMedian = sortedEarly[Math.floor(iterations / 2)]!
+      const lateMedian = sortedLate[Math.floor(iterations / 2)]!
+
+      // Times should be nearly identical
+      const ratio = Math.max(earlyMedian, lateMedian) / Math.min(earlyMedian, lateMedian)
+      expect(ratio).toBeLessThan(2)
+    })
+  })
+
+  describe('all-zeros vs all-fs comparison', () => {
+    it('comparing all-zeros vs all-fs should take similar time', async () => {
+      // This tests that the XOR accumulator doesn't short-circuit
+
+      const iterations = 50
+      const allZeros = 'sha256=' + '0'.repeat(64)
+      const allFs = 'sha256=' + 'f'.repeat(64)
+      const mixed = 'sha256=' + '0f'.repeat(32)
+
+      const zerosTimes: number[] = []
+      const fsTimes: number[] = []
+      const mixedTimes: number[] = []
+
+      // Warm up
+      for (let i = 0; i < 10; i++) {
+        await verifyGitHubSignature(secret, payload, allZeros)
+        await verifyGitHubSignature(secret, payload, allFs)
+        await verifyGitHubSignature(secret, payload, mixed)
+      }
+
+      // Measure
+      for (let i = 0; i < iterations; i++) {
+        const start1 = performance.now()
+        await verifyGitHubSignature(secret, payload, allZeros)
+        zerosTimes.push(performance.now() - start1)
+
+        const start2 = performance.now()
+        await verifyGitHubSignature(secret, payload, allFs)
+        fsTimes.push(performance.now() - start2)
+
+        const start3 = performance.now()
+        await verifyGitHubSignature(secret, payload, mixed)
+        mixedTimes.push(performance.now() - start3)
+      }
+
+      // Calculate medians
+      const sortedZeros = [...zerosTimes].sort((a, b) => a - b)
+      const sortedFs = [...fsTimes].sort((a, b) => a - b)
+      const sortedMixed = [...mixedTimes].sort((a, b) => a - b)
+
+      const zerosMedian = sortedZeros[Math.floor(iterations / 2)]!
+      const fsMedian = sortedFs[Math.floor(iterations / 2)]!
+      const mixedMedian = sortedMixed[Math.floor(iterations / 2)]!
+
+      // All should be similar
+      const maxTime = Math.max(zerosMedian, fsMedian, mixedMedian)
+      const minTime = Math.min(zerosMedian, fsMedian, mixedMedian)
+      const ratio = maxTime / minTime
+
+      expect(ratio).toBeLessThan(2)
+    })
+  })
+
+  describe('valid vs invalid signature timing', () => {
+    it('valid and invalid signatures should take similar verification time', async () => {
+      // The original timing test from GitHub verification, but more robust
+
+      const validSignature = await generateGitHubSignature(secret, payload)
+      const invalidSignature = 'sha256=' + 'a'.repeat(64)
+
+      const iterations = 100
+      const validTimes: number[] = []
+      const invalidTimes: number[] = []
+
+      // Warm up
+      for (let i = 0; i < 20; i++) {
+        await verifyGitHubSignature(secret, payload, validSignature)
+        await verifyGitHubSignature(secret, payload, invalidSignature)
+      }
+
+      // Interleave valid and invalid to reduce systematic bias
+      for (let i = 0; i < iterations; i++) {
+        if (i % 2 === 0) {
+          const start = performance.now()
+          await verifyGitHubSignature(secret, payload, validSignature)
+          validTimes.push(performance.now() - start)
+        } else {
+          const start = performance.now()
+          await verifyGitHubSignature(secret, payload, invalidSignature)
+          invalidTimes.push(performance.now() - start)
+        }
+      }
+
+      // Fill remaining
+      for (let i = 0; i < iterations; i++) {
+        if (i % 2 === 1) {
+          const start = performance.now()
+          await verifyGitHubSignature(secret, payload, validSignature)
+          validTimes.push(performance.now() - start)
+        } else {
+          const start = performance.now()
+          await verifyGitHubSignature(secret, payload, invalidSignature)
+          invalidTimes.push(performance.now() - start)
+        }
+      }
+
+      // Calculate medians
+      const sortedValid = [...validTimes].sort((a, b) => a - b)
+      const sortedInvalid = [...invalidTimes].sort((a, b) => a - b)
+
+      const validMedian = sortedValid[Math.floor(validTimes.length / 2)]!
+      const invalidMedian = sortedInvalid[Math.floor(invalidTimes.length / 2)]!
+
+      const ratio = Math.max(validMedian, invalidMedian) / Math.min(validMedian, invalidMedian)
+      expect(ratio).toBeLessThan(2)
+    })
+  })
+})

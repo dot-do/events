@@ -45,8 +45,20 @@ export function validateEventSize(event: unknown): boolean {
 // ============================================================================
 
 export async function handleIngest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  // Optional auth
-  if (env.AUTH_TOKEN) {
+  // Authentication check
+  if (!env.AUTH_TOKEN) {
+    // AUTH_TOKEN not configured - check if unauthenticated access is explicitly allowed
+    if (env.ALLOW_UNAUTHENTICATED_INGEST !== 'true') {
+      console.warn('[ingest] AUTH_TOKEN is not configured. Set AUTH_TOKEN secret or set ALLOW_UNAUTHENTICATED_INGEST=true to allow open access.')
+      return Response.json(
+        { error: 'Server misconfiguration: authentication not configured' },
+        { status: 500, headers: corsHeaders() }
+      )
+    }
+    // Unauthenticated access explicitly allowed - log warning and proceed
+    console.warn('[ingest] Processing unauthenticated request (ALLOW_UNAUTHENTICATED_INGEST=true)')
+  } else {
+    // AUTH_TOKEN is configured - require valid Bearer token
     const auth = request.headers.get('Authorization')
     if (auth !== `Bearer ${env.AUTH_TOKEN}`) {
       return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders() })
@@ -121,13 +133,19 @@ export async function handleIngest(request: Request, env: Env, ctx: ExecutionCon
   const validatedBatch = batch as EventBatch
 
   // Convert DurableEvents to EventRecord format for the unified Parquet writer
-  const records: EventRecord[] = validatedBatch.events.map(event => ({
+  const records: EventRecord[] = validatedBatch.events.map((event: DurableEvent) => ({
     ts: event.ts,
     type: event.type,
     source: 'ingest',
     // Store the full event as payload in the VARIANT column
     payload: event,
   }))
+
+  // Determine fanout mode ONCE at the start - this ensures mutual exclusion
+  // If USE_QUEUE_FANOUT=true AND queue is bound: ONLY use queue for CDC/subscription fanout
+  // Otherwise: ONLY use direct DO calls for CDC/subscription fanout
+  const useQueueFanout = env.USE_QUEUE_FANOUT === 'true' && !!env.EVENTS_QUEUE
+  console.log(`[ingest] Fanout mode: ${useQueueFanout ? 'QUEUE' : 'DIRECT'} (USE_QUEUE_FANOUT=${env.USE_QUEUE_FANOUT}, queue=${!!env.EVENTS_QUEUE})`)
 
   // Send to EventWriterDO for batched Parquet writes (in background for fast response)
   ctx.waitUntil((async () => {
@@ -158,29 +176,24 @@ export async function handleIngest(request: Request, env: Env, ctx: ExecutionCon
       })
     }
 
-    // Check if queue-based fanout is enabled
-    const useQueueFanout = env.USE_QUEUE_FANOUT === 'true' && env.EVENTS_QUEUE
-
+    // MUTUAL EXCLUSION: Only send to queue if queue fanout is enabled
+    // The queue consumer will handle CDC/subscription processing
     if (useQueueFanout) {
-      // Queue-based fanout: send to queue and let the consumer handle CDC/subscription
-      // This provides better scalability and decoupled processing
       await env.EVENTS_QUEUE!.send(validatedBatch)
-      console.log(`[ingest] Sent ${validatedBatch.events.length} events to queue for fanout`)
-    } else if (env.EVENTS_QUEUE) {
-      // Queue is bound but fanout is disabled - send to queue for real-time consumers only
-      // (CDC/subscription will be handled directly below)
-      await env.EVENTS_QUEUE.send(validatedBatch)
+      console.log(`[ingest] Sent ${validatedBatch.events.length} events to queue for CDC/subscription fanout`)
     }
+    // NOTE: We do NOT send to queue when useQueueFanout=false, even if queue is bound.
+    // This prevents duplicate processing - direct fanout handles CDC/subscription below.
   })())
 
-  // Fan out CDC events to CDCProcessorDO and all events to SubscriptionDO (non-blocking)
-  // Skip this if queue-based fanout is enabled (queue consumer will handle it)
-  const useQueueFanout = env.USE_QUEUE_FANOUT === 'true' && env.EVENTS_QUEUE
+  // MUTUAL EXCLUSION: Only do direct fanout if queue fanout is NOT enabled
+  // This ensures CDC and subscription events are processed exactly once
   if (!useQueueFanout) {
     ctx.waitUntil((async () => {
+      console.log(`[ingest] Starting DIRECT fanout for ${validatedBatch.events.length} events`)
       try {
         // Collect CDC events (type starts with 'collection.')
-        const cdcEvents = validatedBatch.events.filter(e => e.type.startsWith('collection.'))
+        const cdcEvents = validatedBatch.events.filter((e: DurableEvent) => e.type.startsWith('collection.'))
 
         if (cdcEvents.length > 0 && env.CDC_PROCESSOR) {
           // Group CDC events by namespace/collection for routing to the correct DO instance
@@ -201,6 +214,7 @@ export async function handleIngest(request: Request, env: Env, ctx: ExecutionCon
               const processorId = env.CDC_PROCESSOR.idFromName(key)
               const processor = env.CDC_PROCESSOR.get(processorId)
               await processor.process(events)
+              console.log(`[ingest] DIRECT CDC processed ${events.length} events for ${key}`)
             } catch (err) {
               console.error(`[ingest] CDC processor error for ${key}:`, err)
             }
@@ -222,23 +236,27 @@ export async function handleIngest(request: Request, env: Env, ctx: ExecutionCon
           }
 
           // Fan out each group to its corresponding shard
+          // Use event.id if available for idempotency, otherwise generate ULID
           const shardPromises = Array.from(eventsByShard.entries()).map(async ([shardKey, events]) => {
             try {
               const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
               const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
-              const fanoutPromises = events.map(async (event) => {
+              const fanoutPromises = events.map(async (event: DurableEvent) => {
+                // Use existing event id for idempotency if available
+                const eventId = (event as { id?: string }).id || ulid()
                 try {
                   await subscriptionDO.fanout({
-                    id: ulid(),
+                    id: eventId,
                     type: event.type,
                     ts: event.ts,
                     payload: event,
                   })
                 } catch (err) {
-                  console.error(`[ingest] Subscription fanout error for event type ${event.type}:`, err)
+                  console.error(`[ingest] Subscription fanout error for event ${eventId} type ${event.type}:`, err)
                 }
               })
               await Promise.all(fanoutPromises)
+              console.log(`[ingest] DIRECT subscription fanout: ${events.length} events to shard ${shardKey}`)
             } catch (err) {
               console.error(`[ingest] Subscription shard error for shard ${shardKey}:`, err)
             }

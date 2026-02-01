@@ -3,4 +3,4 @@
  */
 
 export type { Env } from './env'
-export type { AuthUser, AuthRequest } from 'oauth.do/rpc/itty'
+export type { AuthUser, AuthRequest } from 'oauth.do/itty'

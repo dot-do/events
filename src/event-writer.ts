@@ -164,6 +164,7 @@ export class EventBuffer {
   private lastFlushTime = Date.now()
   private flushPending = false
   private flushPromise: Promise<void> | null = null
+  private lastActivityTime = Date.now()
 
   constructor(
     private bucket: R2Bucket,
@@ -174,6 +175,27 @@ export class EventBuffer {
       maxBufferSize?: number
     } = {}
   ) {}
+
+  /**
+   * Update last activity timestamp (called on add/flush)
+   */
+  touch(): void {
+    this.lastActivityTime = Date.now()
+  }
+
+  /**
+   * Get time since last activity
+   */
+  getIdleTime(): number {
+    return Date.now() - this.lastActivityTime
+  }
+
+  /**
+   * Check if buffer is empty and can be cleaned up
+   */
+  isEmpty(): boolean {
+    return this.buffer.length === 0 && !this.flushPending
+  }
 
   get countThreshold() { return this.options.countThreshold ?? 50 }
   get timeThresholdMs() { return this.options.timeThresholdMs ?? 5000 }
@@ -186,6 +208,7 @@ export class EventBuffer {
   add(events: EventRecord | EventRecord[]): void {
     const toAdd = Array.isArray(events) ? events : [events]
     this.buffer.push(...toAdd)
+    this.touch()
   }
 
   /**
@@ -224,6 +247,7 @@ export class EventBuffer {
     this.buffer = []
     this.lastFlushTime = Date.now()
     this.flushPending = false
+    this.touch()
 
     return writeEvents(this.bucket, this.prefix, events)
   }
@@ -263,8 +287,46 @@ export class EventBuffer {
 // Module-level buffers for different event sources
 // ============================================================================
 
+// Cleanup configuration
+const BUFFER_IDLE_TIMEOUT_MS = 5 * 60 * 1000  // 5 minutes of inactivity
+const MAX_BUFFERS = 100  // Maximum number of buffers to keep
+
 // These are created lazily when needed
 const buffers = new Map<string, EventBuffer>()
+
+/**
+ * Clean up idle buffers to prevent memory leaks.
+ * Removes buffers that are empty and haven't been used in BUFFER_IDLE_TIMEOUT_MS.
+ * Also enforces MAX_BUFFERS limit by evicting oldest idle buffers.
+ */
+function cleanupIdleBuffers(): void {
+  const now = Date.now()
+  const toRemove: string[] = []
+
+  // Find idle buffers that can be cleaned up
+  for (const [key, buffer] of buffers) {
+    if (buffer.isEmpty() && buffer.getIdleTime() > BUFFER_IDLE_TIMEOUT_MS) {
+      toRemove.push(key)
+    }
+  }
+
+  // Remove idle buffers
+  for (const key of toRemove) {
+    buffers.delete(key)
+  }
+
+  // If still over limit, remove oldest idle empty buffers
+  if (buffers.size > MAX_BUFFERS) {
+    const sortedByIdle = [...buffers.entries()]
+      .filter(([, buf]) => buf.isEmpty())
+      .sort((a, b) => b[1].getIdleTime() - a[1].getIdleTime())
+
+    for (const [key] of sortedByIdle) {
+      if (buffers.size <= MAX_BUFFERS) break
+      buffers.delete(key)
+    }
+  }
+}
 
 export function getEventBuffer(
   bucket: R2Bucket,
@@ -275,11 +337,42 @@ export function getEventBuffer(
     maxBufferSize?: number
   }
 ): EventBuffer {
+  // Clean up idle buffers before potentially creating a new one
+  cleanupIdleBuffers()
+
   const key = prefix
   let buffer = buffers.get(key)
   if (!buffer) {
     buffer = new EventBuffer(bucket, prefix, options)
     buffers.set(key, buffer)
   }
+  buffer.touch()
   return buffer
+}
+
+/**
+ * Get the current number of buffers (for monitoring/debugging)
+ */
+export function getBufferCount(): number {
+  return buffers.size
+}
+
+/**
+ * Force cleanup of all idle buffers (for testing or manual cleanup)
+ */
+export function forceCleanupBuffers(): number {
+  const initialCount = buffers.size
+  const toRemove: string[] = []
+
+  for (const [key, buffer] of buffers) {
+    if (buffer.isEmpty()) {
+      toRemove.push(key)
+    }
+  }
+
+  for (const key of toRemove) {
+    buffers.delete(key)
+  }
+
+  return initialCount - buffers.size
 }

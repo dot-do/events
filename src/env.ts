@@ -14,7 +14,7 @@ import type { RateLimiterDO } from './middleware/rate-limiter-do'
 import type { WebhookEnv } from './webhook-handler'
 import type { EventBatch } from '@dotdo/events'
 import type { AuthBinding } from 'oauth.do/rpc'
-import type { AuthRequest } from 'oauth.do/rpc/itty'
+import type { AuthRequest } from 'oauth.do/itty'
 
 export type { WebhookEnv, AuthRequest }
 
@@ -31,6 +31,8 @@ export interface Env extends WebhookEnv {
   /** When true and EVENTS_QUEUE is bound, use queue for CDC/subscription fanout instead of direct DO calls */
   USE_QUEUE_FANOUT?: string
   AUTH_TOKEN?: string
+  /** When true, allows unauthenticated access to /ingest endpoint. Only use for development/testing. */
+  ALLOW_UNAUTHENTICATED_INGEST?: string
   AUTH: AuthBinding
   OAUTH: Fetcher
   ENVIRONMENT: string

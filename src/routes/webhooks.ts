@@ -11,8 +11,31 @@ import { handleWebhook, type NormalizedWebhookEvent } from '../webhook-handler'
 import { ingestWithOverflow } from '../event-writer-do'
 import type { EventRecord } from '../event-writer'
 import { corsHeaders } from '../utils'
+import { checkRateLimit, type RateLimitEnv } from '../middleware/rate-limit'
+
+/** More lenient rate limits for server-to-server webhook traffic */
+const WEBHOOK_RATE_LIMIT_REQUESTS_PER_MINUTE = 10000
+const WEBHOOK_RATE_LIMIT_EVENTS_PER_MINUTE = 100000
 
 const WEBHOOK_PROVIDERS = ['github', 'stripe', 'workos', 'slack', 'linear', 'svix']
+
+/**
+ * Check rate limit for webhook requests with lenient server-to-server limits.
+ * Applied BEFORE signature verification to prevent DoS attacks.
+ */
+async function checkWebhookRateLimit(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  // Create a modified env with webhook-specific rate limits
+  const webhookEnv: RateLimitEnv = {
+    RATE_LIMITER: env.RATE_LIMITER,
+    RATE_LIMIT_REQUESTS_PER_MINUTE: String(WEBHOOK_RATE_LIMIT_REQUESTS_PER_MINUTE),
+    RATE_LIMIT_EVENTS_PER_MINUTE: String(WEBHOOK_RATE_LIMIT_EVENTS_PER_MINUTE),
+  }
+  // Webhooks are single events, so eventCount is always 1
+  return checkRateLimit(request, webhookEnv, 1)
+}
 
 /**
  * Send a verified webhook event to EventWriterDO for batched Parquet writes.
@@ -62,6 +85,13 @@ export async function handleWebhooks(
         { status: 400, headers: corsHeaders() }
       )
     }
+
+    // Apply rate limiting BEFORE signature verification to prevent DoS
+    const rateLimitResponse = await checkWebhookRateLimit(request, env)
+    if (rateLimitResponse) {
+      return rateLimitResponse
+    }
+
     const response = await handleWebhook(request, env, provider)
 
     // Send webhook events to EventWriterDO for batched Parquet writes
@@ -78,6 +108,12 @@ export async function handleWebhooks(
   if (isWebhooksDomain && request.method === 'POST') {
     const provider = url.pathname.slice(1).split('/')[0] // Get first path segment
     if (provider && WEBHOOK_PROVIDERS.includes(provider)) {
+      // Apply rate limiting BEFORE signature verification to prevent DoS
+      const rateLimitResponse = await checkWebhookRateLimit(request, env)
+      if (rateLimitResponse) {
+        return rateLimitResponse
+      }
+
       const response = await handleWebhook(request, env, provider)
 
       // Send webhook events to EventWriterDO for batched Parquet writes

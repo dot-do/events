@@ -7,6 +7,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from '../emitter.js'
 import type { DurableEvent } from '../types.js'
+import { EventBufferFullError, CircuitBreakerOpenError } from '../types.js'
 import { createMockCtx, createMockR2Bucket, createMockRequest } from './mocks.js'
 
 // ============================================================================
@@ -548,7 +549,7 @@ describe('EventEmitter', () => {
   })
 
   describe('retry queue cap', () => {
-    it('should cap retry queue at 10000 events', async () => {
+    it('should cap retry queue at 10000 events and throw EventBufferFullError', async () => {
       // Pre-populate with 9999 events
       const existingEvents: DurableEvent[] = Array.from({ length: 9999 }, (_, i) => ({
         type: `old.event.${i}`,
@@ -565,13 +566,202 @@ describe('EventEmitter', () => {
       for (let i = 0; i < 5; i++) {
         emitter.emit({ type: `new.event.${i}` })
       }
-      await emitter.flush()
+
+      // flush() should throw EventBufferFullError when events are dropped
+      await expect(emitter.flush()).rejects.toThrow(EventBufferFullError)
 
       // Should have stored max 10000 events (truncating old ones)
       const putCalls = mockCtx.storage.put.mock.calls
       const retryCall = putCalls.find((call: unknown[]) => call[0] === '_events:retry')
       expect(retryCall).toBeDefined()
       expect((retryCall?.[1] as DurableEvent[]).length).toBe(10000)
+    })
+
+    it('should use configurable maxRetryQueueSize', async () => {
+      const customMax = 100
+      const existingEvents: DurableEvent[] = Array.from({ length: 95 }, (_, i) => ({
+        type: `old.event.${i}`,
+        ts: '2024-01-01T00:00:00Z',
+        do: { id: 'test' },
+      }))
+      mockCtx.storage._storage.set('_events:retry', existingEvents)
+
+      mockFetch.mockRejectedValueOnce(new Error('Network error'))
+
+      const emitter = new EventEmitter(mockCtx, mockEnv, { maxRetryQueueSize: customMax })
+
+      for (let i = 0; i < 10; i++) {
+        emitter.emit({ type: `new.event.${i}` })
+      }
+
+      await expect(emitter.flush()).rejects.toThrow(EventBufferFullError)
+
+      const putCalls = mockCtx.storage.put.mock.calls
+      const retryCall = putCalls.find((call: unknown[]) => call[0] === '_events:retry')
+      expect(retryCall).toBeDefined()
+      expect((retryCall?.[1] as DurableEvent[]).length).toBe(customMax)
+    })
+
+    it('should track dropped events count', async () => {
+      const existingEvents: DurableEvent[] = Array.from({ length: 100 }, (_, i) => ({
+        type: `old.event.${i}`,
+        ts: '2024-01-01T00:00:00Z',
+        do: { id: 'test' },
+      }))
+      mockCtx.storage._storage.set('_events:retry', existingEvents)
+
+      mockFetch.mockRejectedValueOnce(new Error('Network error'))
+
+      const emitter = new EventEmitter(mockCtx, mockEnv, { maxRetryQueueSize: 100 })
+      expect(emitter.droppedEvents).toBe(0)
+
+      for (let i = 0; i < 10; i++) {
+        emitter.emit({ type: `new.event.${i}` })
+      }
+
+      try {
+        await emitter.flush()
+      } catch (e) {
+        expect(e).toBeInstanceOf(EventBufferFullError)
+        expect((e as EventBufferFullError).droppedCount).toBe(10)
+      }
+
+      expect(emitter.droppedEvents).toBe(10)
+    })
+  })
+
+  describe('circuit breaker', () => {
+    it('should open circuit breaker after maxConsecutiveFailures', async () => {
+      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 3 })
+
+      // Fail 3 times
+      for (let i = 0; i < 3; i++) {
+        mockFetch.mockRejectedValueOnce(new Error('Network error'))
+        emitter.emit({ type: `test.event.${i}` })
+        await emitter.flush()
+      }
+
+      // Circuit breaker should now be open
+      expect(() => emitter.emit({ type: 'blocked.event' })).toThrow(CircuitBreakerOpenError)
+    })
+
+    it('should close circuit breaker on success', async () => {
+      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 3 })
+
+      // Fail 2 times (not enough to open)
+      for (let i = 0; i < 2; i++) {
+        mockFetch.mockRejectedValueOnce(new Error('Network error'))
+        emitter.emit({ type: `test.event.${i}` })
+        await emitter.flush()
+      }
+
+      // Now succeed
+      mockFetch.mockResolvedValueOnce(new Response('OK', { status: 200 }))
+      emitter.emit({ type: 'success.event' })
+      await emitter.flush()
+
+      // Should be able to emit again
+      expect(() => emitter.emit({ type: 'next.event' })).not.toThrow()
+    })
+
+    it('should respect circuitBreakerResetMs for half-open state', async () => {
+      const resetMs = 5000
+      const emitter = new EventEmitter(mockCtx, mockEnv, {
+        maxConsecutiveFailures: 2,
+        circuitBreakerResetMs: resetMs,
+      })
+
+      // Fail twice to open circuit
+      for (let i = 0; i < 2; i++) {
+        mockFetch.mockRejectedValueOnce(new Error('Network error'))
+        emitter.emit({ type: `test.event.${i}` })
+        await emitter.flush()
+      }
+
+      // Should be open
+      expect(() => emitter.emit({ type: 'blocked.event' })).toThrow(CircuitBreakerOpenError)
+
+      // Advance time past reset period
+      await vi.advanceTimersByTimeAsync(resetMs + 100)
+
+      // Should allow retry (half-open state)
+      expect(() => emitter.emit({ type: 'retry.event' })).not.toThrow()
+    })
+
+    it('should be disabled when maxConsecutiveFailures is 0', async () => {
+      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 0 })
+
+      // Fail many times
+      for (let i = 0; i < 20; i++) {
+        mockFetch.mockRejectedValueOnce(new Error('Network error'))
+        emitter.emit({ type: `test.event.${i}` })
+        await emitter.flush()
+      }
+
+      // Should still allow emit
+      expect(() => emitter.emit({ type: 'still.working' })).not.toThrow()
+    })
+
+    it('should allow manual reset of circuit breaker', async () => {
+      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 2 })
+
+      // Fail twice to open circuit
+      for (let i = 0; i < 2; i++) {
+        mockFetch.mockRejectedValueOnce(new Error('Network error'))
+        emitter.emit({ type: `test.event.${i}` })
+        await emitter.flush()
+      }
+
+      // Should be open
+      expect(() => emitter.emit({ type: 'blocked.event' })).toThrow(CircuitBreakerOpenError)
+
+      // Manually reset
+      await emitter.resetCircuitBreaker()
+
+      // Should allow emit
+      expect(() => emitter.emit({ type: 'unblocked.event' })).not.toThrow()
+    })
+
+    it('should provide circuit breaker info', async () => {
+      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 2 })
+
+      let info = await emitter.getCircuitBreakerInfo()
+      expect(info.isOpen).toBe(false)
+      expect(info.consecutiveFailures).toBe(0)
+
+      // Fail twice to open circuit
+      for (let i = 0; i < 2; i++) {
+        mockFetch.mockRejectedValueOnce(new Error('Network error'))
+        emitter.emit({ type: `test.event.${i}` })
+        await emitter.flush()
+      }
+
+      info = await emitter.getCircuitBreakerInfo()
+      expect(info.isOpen).toBe(true)
+      expect(info.consecutiveFailures).toBe(2)
+      expect(info.openedAt).toBeInstanceOf(Date)
+      expect(info.resetAt).toBeInstanceOf(Date)
+    })
+  })
+
+  describe('retry queue stats', () => {
+    it('should provide retry queue statistics', async () => {
+      const emitter = new EventEmitter(mockCtx, mockEnv, { maxRetryQueueSize: 1000 })
+
+      let stats = await emitter.getRetryQueueStats()
+      expect(stats.queueSize).toBe(0)
+      expect(stats.maxSize).toBe(1000)
+      expect(stats.droppedTotal).toBe(0)
+      expect(stats.retryCount).toBe(0)
+
+      // Fail an event
+      mockFetch.mockRejectedValueOnce(new Error('Network error'))
+      emitter.emit({ type: 'test.event' })
+      await emitter.flush()
+
+      stats = await emitter.getRetryQueueStats()
+      expect(stats.queueSize).toBe(1)
+      expect(stats.retryCount).toBe(1)
     })
   })
 

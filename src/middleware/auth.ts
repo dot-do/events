@@ -8,7 +8,7 @@
  */
 
 import type { AuthBinding } from 'oauth.do/rpc'
-import type { AuthUser, AuthRequest } from 'oauth.do/rpc/itty'
+import type { AuthUser, AuthRequest } from 'oauth.do/itty'
 import { corsHeaders, authCorsHeaders } from '../utils'
 
 export type { AuthUser, AuthRequest }
@@ -79,7 +79,7 @@ export async function requireOAuth(
     return Response.json(
       {
         error: 'Admin access required',
-        user: result.user,
+        authenticated: true,
         message: 'You are logged in but do not have admin privileges',
       },
       { status: 403 },

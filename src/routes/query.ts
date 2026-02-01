@@ -24,6 +24,29 @@ const MAX_EVENT_TYPES = 100
 const MAX_STRING_PARAM_LENGTH = 256
 
 /**
+ * Regex whitelist for path patterns - only allows safe characters:
+ * alphanumeric, slashes, asterisks, dashes, underscores, and dots.
+ * Also rejects SQL comment syntax (--) to prevent injection.
+ */
+const SAFE_PATH_PATTERN = /^[a-zA-Z0-9\/_*.-]+$/
+
+/**
+ * Validate that a path pattern contains only safe characters.
+ * Prevents SQL injection via path pattern interpolation.
+ */
+function validatePathPattern(pattern: string): boolean {
+  // First check character whitelist
+  if (!SAFE_PATH_PATTERN.test(pattern)) {
+    return false
+  }
+  // Reject SQL comment syntax (double dashes)
+  if (pattern.includes('--')) {
+    return false
+  }
+  return true
+}
+
+/**
  * Escape single quotes in SQL strings to prevent SQL injection
  */
 function escapeSql(value: string): string {
@@ -140,6 +163,15 @@ export async function handleQuery(request: Request, env: Env): Promise<Response>
   if (query.dateRange) {
     conditions.push(`ts >= '${escapeSql(query.dateRange.start)}'`)
     conditions.push(`ts <= '${escapeSql(query.dateRange.end)}'`)
+  }
+
+  // Validate pathPattern to prevent SQL injection
+  // Even though pathPattern is built from Date methods, validate as defense-in-depth
+  if (!validatePathPattern(pathPattern)) {
+    return Response.json(
+      { error: 'Invalid path pattern generated' },
+      { status: 500, headers: authCorsHeaders(request, env) }
+    )
   }
 
   // Primary query uses Parquet; fall back to JSONL for historical data

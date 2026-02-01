@@ -33,8 +33,8 @@ export interface VerificationResult {
 /**
  * Encodes a string to Uint8Array using UTF-8
  */
-function encodeString(str: string): Uint8Array {
-  return new TextEncoder().encode(str)
+function encodeString(str: string): Uint8Array<ArrayBuffer> {
+  return new TextEncoder().encode(str) as Uint8Array<ArrayBuffer>
 }
 
 /**
@@ -61,31 +61,36 @@ async function hmacSha256(secret: string, message: string): Promise<string> {
 }
 
 /**
- * Timing-safe string comparison using Web Crypto API
+ * Timing-safe string comparison using HMAC verification
  *
  * Compares two strings in constant time to prevent timing attacks.
- * Falls back to a manual constant-time comparison if subtle.timingSafeEqual is unavailable.
+ * Uses crypto.subtle.verify which provides native timing-safe comparison.
+ *
+ * The technique works by:
+ * 1. Converting both strings to Uint8Array
+ * 2. Using crypto.subtle.verify to compare the HMAC of one string against the other
+ *
+ * This ensures:
+ * - No length information leaks (comparison happens on fixed-size HMAC output)
+ * - Comparison time is constant regardless of where strings differ
+ * - Uses native crypto API for timing safety
  */
 async function timingSafeEqual(a: string, b: string): Promise<boolean> {
-  // If lengths differ, still compare to maintain constant time
-  // We'll pad the shorter one to match lengths
-  const maxLength = Math.max(a.length, b.length)
-  const aPadded = a.padEnd(maxLength, '\0')
-  const bPadded = b.padEnd(maxLength, '\0')
+  const aBytes = encodeString(a)
+  const bBytes = encodeString(b)
 
-  const aBytes = encodeString(aPadded)
-  const bBytes = encodeString(bPadded)
+  // Generate a random key for this comparison
+  const randomKey = crypto.getRandomValues(new Uint8Array(32)) as Uint8Array<ArrayBuffer>
 
-  // XOR all bytes and accumulate - constant time operation
-  let result = 0
-  for (let i = 0; i < aBytes.length; i++) {
-    result |= (aBytes[i] ?? 0) ^ (bBytes[i] ?? 0)
-  }
+  // Import key for HMAC with both sign and verify capabilities
+  const key = await crypto.subtle.importKey('raw', randomKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
 
-  // Also check original lengths match
-  result |= a.length ^ b.length
+  // Sign string 'a' to get its HMAC
+  const aHmac = await crypto.subtle.sign('HMAC', key, aBytes)
 
-  return result === 0
+  // Use crypto.subtle.verify to compare - this is natively timing-safe
+  // It computes HMAC(key, b) and compares against aHmac in constant time
+  return crypto.subtle.verify('HMAC', key, aHmac, bBytes)
 }
 
 /**

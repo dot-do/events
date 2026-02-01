@@ -60,6 +60,9 @@
     // Rate limiting defaults (configurable via wrangler secret or vars override)
     "RATE_LIMIT_REQUESTS_PER_MINUTE": "1000",
     "RATE_LIMIT_EVENTS_PER_MINUTE": "100000"
+    // Authentication: Set AUTH_TOKEN secret via `wrangler secret put AUTH_TOKEN`
+    // To allow unauthenticated access (NOT recommended for production):
+    // "ALLOW_UNAUTHENTICATED_INGEST": "true"
   },
 
   // Scheduled triggers for automated compaction
@@ -80,7 +83,9 @@
       "name": "events-do-dev",
       "routes": [],
       "vars": {
-        "ENVIRONMENT": "development"
+        "ENVIRONMENT": "development",
+        // Allow unauthenticated ingest in development (set AUTH_TOKEN for production)
+        "ALLOW_UNAUTHENTICATED_INGEST": "true"
       }
     }
   }

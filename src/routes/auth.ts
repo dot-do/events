@@ -4,7 +4,7 @@
 
 import type { Env, AuthRequest } from '../env'
 import { corsHeaders, authCorsHeaders } from '../utils'
-import { optionalAuth } from 'oauth.do/rpc/itty'
+import { optionalAuth } from 'oauth.do/itty'
 
 // ============================================================================
 // Open Redirect Prevention
