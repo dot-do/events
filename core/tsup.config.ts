@@ -7,7 +7,6 @@ export default defineConfig({
   clean: true,
   sourcemap: true,
   treeshake: true,
-  minify: true,
-  external: ['@cloudflare/workers-types'],
+  external: ['@cloudflare/workers-types', 'cloudflare:workers'],
   target: 'es2022',
 })

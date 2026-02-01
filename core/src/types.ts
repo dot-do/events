@@ -66,13 +66,74 @@ export interface ClientEvent extends BaseEvent {
   sessionId?: string
 }
 
+/** Custom event with user-defined type */
+export interface CustomEvent extends BaseEvent {
+  type: `custom.${string}`
+  [key: string]: unknown
+}
+
+/** Union of all event types (discriminated by 'type' field) */
 export type DurableEvent =
   | RpcCallEvent
   | CollectionChangeEvent
   | LifecycleEvent
   | WebSocketEvent
   | ClientEvent
-  | BaseEvent
+  | CustomEvent
+
+/** Fields that are auto-filled by the EventEmitter */
+type AutoFilledFields = 'ts' | 'do'
+
+/** Input type for emit() - each event type without the auto-filled fields */
+export type EmitInput =
+  | Omit<RpcCallEvent, AutoFilledFields>
+  | Omit<CollectionChangeEvent, AutoFilledFields>
+  | Omit<LifecycleEvent, AutoFilledFields>
+  | Omit<WebSocketEvent, AutoFilledFields>
+  | Omit<ClientEvent, AutoFilledFields>
+  | (Omit<CustomEvent, AutoFilledFields> & { type: `custom.${string}`; [key: string]: unknown })
+
+/**
+ * Type guard for RpcCallEvent
+ */
+export function isRpcCallEvent(event: DurableEvent): event is RpcCallEvent {
+  return event.type === 'rpc.call'
+}
+
+/**
+ * Type guard for CollectionChangeEvent
+ */
+export function isCollectionChangeEvent(event: DurableEvent): event is CollectionChangeEvent {
+  return event.type === 'collection.insert' || event.type === 'collection.update' || event.type === 'collection.delete'
+}
+
+/**
+ * Type guard for LifecycleEvent
+ */
+export function isLifecycleEvent(event: DurableEvent): event is LifecycleEvent {
+  return event.type === 'do.create' || event.type === 'do.alarm' || event.type === 'do.hibernate' || event.type === 'do.evict'
+}
+
+/**
+ * Type guard for WebSocketEvent
+ */
+export function isWebSocketEvent(event: DurableEvent): event is WebSocketEvent {
+  return event.type === 'ws.connect' || event.type === 'ws.message' || event.type === 'ws.close' || event.type === 'ws.error'
+}
+
+/**
+ * Type guard for ClientEvent
+ */
+export function isClientEvent(event: DurableEvent): event is ClientEvent {
+  return event.type === 'page' || event.type === 'track' || event.type === 'identify'
+}
+
+/**
+ * Type guard for CustomEvent
+ */
+export function isCustomEvent(event: DurableEvent): event is CustomEvent {
+  return event.type.startsWith('custom.')
+}
 
 /** Batch of events for ingestion */
 export interface EventBatch {

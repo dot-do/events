@@ -2,10 +2,18 @@
  * EventEmitter - Batched event emission for Durable Objects
  */
 
-import type { DurableEvent, EventEmitterOptions, CollectionChangeEvent, EventBatch } from './types.js'
+import type { DurableEvent, EmitInput, EventEmitterOptions, CollectionChangeEvent, EventBatch } from './types.js'
 
-const DEFAULT_ENDPOINT = 'https://events.do/ingest'
+/**
+ * Extended Request interface with Cloudflare properties
+ */
+interface CfRequest extends Request {
+  cf?: IncomingRequestCfProperties
+}
+
+const DEFAULT_ENDPOINT = 'https://events.workers.do/ingest'
 const RETRY_KEY = '_events:retry'
+const RETRY_COUNT_KEY = '_events:retryCount'
 const BATCH_KEY = '_events:batch'
 
 /**
@@ -71,7 +79,7 @@ export class EventEmitter {
    * Call this in fetch() to capture DO context
    */
   enrichFromRequest(request: Request): void {
-    const cf = (request as any).cf as IncomingRequestCfProperties | undefined
+    const cf = (request as CfRequest).cf
     this.identity = {
       ...this.identity,
       colo: cf?.colo,
@@ -83,8 +91,11 @@ export class EventEmitter {
   /**
    * Emit an event (batched, non-blocking)
    */
-  emit(event: { type: string; [key: string]: unknown }): void {
-    const fullEvent: DurableEvent = {
+  emit(event: EmitInput): void {
+    // Safe cast: EmitInput is already constrained to valid event shapes,
+    // adding ts + do completes it to a DurableEvent. TypeScript can't verify
+    // union reconstitution through spread, so the cast is necessary but safe.
+    const fullEvent = {
       ...event,
       ts: new Date().toISOString(),
       do: this.identity,
@@ -114,14 +125,28 @@ export class EventEmitter {
   ): void {
     if (!this.options.cdc) return
 
-    // Capture SQLite bookmark for PITR
+    // Capture SQLite bookmark for PITR (async, but we emit without waiting)
+    // The bookmark is optional - if we can't get it, we still emit the event
+    this.getBookmarkAndEmit(type, collection, docId, doc, prev)
+  }
+
+  /**
+   * Internal helper to get bookmark and emit CDC event
+   */
+  private async getBookmarkAndEmit(
+    type: 'insert' | 'update' | 'delete',
+    collection: string,
+    docId: string,
+    doc?: Record<string, unknown>,
+    prev?: Record<string, unknown>
+  ): Promise<void> {
     let bookmark: string | undefined
     try {
       // getCurrentBookmark() returns the current SQLite replication bookmark
       // This can be used to restore the DO to this exact point in time
-      bookmark = (this.ctx.storage as any).getCurrentBookmark?.()
-    } catch {
-      // Bookmark not available (may be pre-SQLite or not supported)
+      bookmark = await this.ctx.storage.getCurrentBookmark()
+    } catch (error) {
+      console.warn('[events] Failed to get SQLite bookmark:', error instanceof Error ? error.message : error)
     }
 
     this.emit({
@@ -182,6 +207,17 @@ export class EventEmitter {
   }
 
   /**
+   * Calculate retry delay with exponential backoff and jitter
+   */
+  private getRetryDelay(retryCount: number): number {
+    const baseDelay = 1000
+    const maxDelay = 60000
+    const exponentialDelay = Math.min(baseDelay * Math.pow(2, retryCount), maxDelay)
+    const jitter = Math.random() * 1000
+    return exponentialDelay + jitter
+  }
+
+  /**
    * Schedule retry via alarm
    */
   private async scheduleRetry(events: DurableEvent[]): Promise<void> {
@@ -195,11 +231,13 @@ export class EventEmitter {
 
     await this.ctx.storage.put(RETRY_KEY, toRetry)
 
-    // Schedule alarm for retry (exponential backoff handled in alarm handler)
+    // Schedule alarm for retry with exponential backoff
     const currentAlarm = await this.ctx.storage.getAlarm()
     if (!currentAlarm) {
-      // Retry in 30 seconds
-      await this.ctx.storage.setAlarm(Date.now() + 30_000)
+      const retryCount = await this.ctx.storage.get<number>(RETRY_COUNT_KEY) ?? 0
+      const delay = this.getRetryDelay(retryCount)
+      await this.ctx.storage.put(RETRY_COUNT_KEY, retryCount + 1)
+      await this.ctx.storage.setAlarm(Date.now() + delay)
     }
   }
 
@@ -227,18 +265,25 @@ export class EventEmitter {
 
       if (response.ok) {
         await this.ctx.storage.delete(RETRY_KEY)
+        await this.ctx.storage.delete(RETRY_COUNT_KEY)
 
         // Stream to R2 on successful retry
         if (this.options.r2Bucket) {
           await this.streamToR2(events)
         }
       } else {
-        // Retry again later (exponential backoff)
-        await this.ctx.storage.setAlarm(Date.now() + 60_000)
+        // Retry again later with exponential backoff
+        const retryCount = await this.ctx.storage.get<number>(RETRY_COUNT_KEY) ?? 0
+        const delay = this.getRetryDelay(retryCount)
+        await this.ctx.storage.put(RETRY_COUNT_KEY, retryCount + 1)
+        await this.ctx.storage.setAlarm(Date.now() + delay)
       }
     } catch {
-      // Retry again later
-      await this.ctx.storage.setAlarm(Date.now() + 60_000)
+      // Retry again later with exponential backoff
+      const retryCount = await this.ctx.storage.get<number>(RETRY_COUNT_KEY) ?? 0
+      const delay = this.getRetryDelay(retryCount)
+      await this.ctx.storage.put(RETRY_COUNT_KEY, retryCount + 1)
+      await this.ctx.storage.setAlarm(Date.now() + delay)
     }
   }
 
@@ -252,8 +297,8 @@ export class EventEmitter {
         this.batch = stored
         await this.ctx.storage.delete(BATCH_KEY)
       }
-    } catch {
-      // Ignore restore errors
+    } catch (error) {
+      console.warn('[events] Failed to restore batch:', error instanceof Error ? error.message : error)
     }
   }
 

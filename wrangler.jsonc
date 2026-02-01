@@ -1,0 +1,81 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "events-do",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "b6641681fe423910342b9ffa1364c76d",
+
+  // Enable workers.dev subdomain
+  "workers_dev": true,
+
+  // Routes
+  "routes": [
+    { "pattern": "webhooks.do/*", "zone_name": "webhooks.do" },
+    { "pattern": "events.do/*", "zone_name": "events.do" }
+  ],
+
+  // R2 buckets
+  "r2_buckets": [
+    { "binding": "EVENTS_BUCKET", "bucket_name": "events" },
+    { "binding": "PIPELINE_BUCKET", "bucket_name": "platform-events" },
+    { "binding": "BENCHMARK_BUCKET", "bucket_name": "events-parquet-test" }
+  ],
+
+  // Service bindings
+  "services": [
+    { "binding": "AUTH", "service": "auth", "entrypoint": "AuthRPC" },
+    { "binding": "OAUTH", "service": "oauth" }
+  ],
+
+  // Durable Objects
+  "durable_objects": {
+    "bindings": [
+      { "name": "CATALOG", "class_name": "CatalogDO" },
+      { "name": "SUBSCRIPTIONS", "class_name": "SubscriptionDO" },
+      { "name": "CDC_PROCESSOR", "class_name": "CDCProcessorDO" },
+      { "name": "EVENT_WRITER", "class_name": "EventWriterDO" }
+    ]
+  },
+
+  // Migrations for DO
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["CatalogDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["SubscriptionDO"] },
+    { "tag": "v3", "new_sqlite_classes": ["CDCProcessorDO"] },
+    { "tag": "v4", "new_classes": ["EventWriterDO"] }
+  ],
+
+  // Optional: Queue for real-time streaming
+  // "queues": {
+  //   "producers": [{ "binding": "EVENTS_QUEUE", "queue": "events" }]
+  // },
+
+  "vars": {
+    "ENVIRONMENT": "production",
+    "ALLOWED_ORIGINS": ""
+  },
+
+  // Scheduled triggers for automated compaction
+  "triggers": {
+    "crons": [
+      "30 * * * *"
+    ]
+  },
+
+  // Tail worker for event streaming
+  "tail_consumers": [
+    { "service": "tail" }
+  ],
+
+  // Development environment
+  "env": {
+    "dev": {
+      "name": "events-do-dev",
+      "routes": [],
+      "vars": {
+        "ENVIRONMENT": "development"
+      }
+    }
+  }
+}

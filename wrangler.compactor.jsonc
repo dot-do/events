@@ -1,0 +1,33 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "events-compactor",
+  "main": "src/compactor-worker.ts",
+  "compatibility_date": "2026-01-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "b6641681fe423910342b9ffa1364c76d",
+
+  // Scheduled triggers - runs every hour at :05
+  // This gives 5 minutes buffer after the hour ends for any remaining writes
+  "triggers": {
+    "crons": ["5 * * * *"]
+  },
+
+  // R2 bucket for events
+  "r2_buckets": [
+    { "binding": "EVENTS_BUCKET", "bucket_name": "events" }
+  ],
+
+  "vars": {
+    "ENVIRONMENT": "production"
+  },
+
+  // Development environment
+  "env": {
+    "dev": {
+      "name": "events-compactor-dev",
+      "vars": {
+        "ENVIRONMENT": "development"
+      }
+    }
+  }
+}

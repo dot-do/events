@@ -2,6 +2,29 @@
  * Lakehouse Query Helpers for DuckDB
  */
 
+/** Maximum allowed string length for query parameters to prevent DoS */
+const MAX_STRING_LENGTH = 1000
+
+/**
+ * Escape single quotes in SQL strings to prevent SQL injection
+ */
+function escapeSql(value: string): string {
+  if (value.length > MAX_STRING_LENGTH) {
+    throw new Error(`Input exceeds maximum length of ${MAX_STRING_LENGTH} characters`)
+  }
+  return value.replace(/'/g, "''")
+}
+
+/**
+ * Validate and escape a string value for SQL
+ */
+function validateAndEscape(value: string, fieldName: string): string {
+  if (typeof value !== 'string') {
+    throw new Error(`${fieldName} must be a string`)
+  }
+  return escapeSql(value)
+}
+
 export interface QueryOptions {
   /** R2 bucket name */
   bucket: string
@@ -71,23 +94,23 @@ export function buildQuery(options: QueryOptions): string {
   const conditions: string[] = []
 
   if (doId) {
-    conditions.push(`"do".id = '${doId}'`)
+    conditions.push(`"do".id = '${validateAndEscape(doId, 'doId')}'`)
   }
 
   if (doClass) {
-    conditions.push(`"do".class = '${doClass}'`)
+    conditions.push(`"do".class = '${validateAndEscape(doClass, 'doClass')}'`)
   }
 
   if (colo) {
-    conditions.push(`"do".colo = '${colo}'`)
+    conditions.push(`"do".colo = '${validateAndEscape(colo, 'colo')}'`)
   }
 
   if (eventTypes && eventTypes.length > 0) {
-    conditions.push(`type IN (${eventTypes.map(t => `'${t}'`).join(', ')})`)
+    conditions.push(`type IN (${eventTypes.map(t => `'${validateAndEscape(t, 'eventType')}'`).join(', ')})`)
   }
 
   if (collection) {
-    conditions.push(`collection = '${collection}'`)
+    conditions.push(`collection = '${validateAndEscape(collection, 'collection')}'`)
   }
 
   if (dateRange) {
@@ -105,7 +128,7 @@ export function buildQuery(options: QueryOptions): string {
   query += `\nORDER BY ${orderBy ?? 'ts DESC'}`
 
   if (limit) {
-    query += `\nLIMIT ${limit}`
+    query += `\nLIMIT ${Math.floor(limit)}`
   }
 
   return query
@@ -130,7 +153,7 @@ export function buildHistoryQuery(options: {
 
   return base.replace(
     'WHERE',
-    `WHERE docId = '${options.docId}'\n  AND`
+    `WHERE docId = '${validateAndEscape(options.docId, 'docId')}'\n  AND`
   )
 }
 
@@ -146,11 +169,11 @@ export function buildLatencyQuery(options: {
   const conditions: string[] = [`type = 'rpc.call'`]
 
   if (options.doClass) {
-    conditions.push(`"do".class = '${options.doClass}'`)
+    conditions.push(`"do".class = '${validateAndEscape(options.doClass, 'doClass')}'`)
   }
 
   if (options.method) {
-    conditions.push(`method = '${options.method}'`)
+    conditions.push(`method = '${validateAndEscape(options.method, 'method')}'`)
   }
 
   let pathPattern = `r2://${options.bucket}/events/`
@@ -185,12 +208,12 @@ export function buildPITRRangeQuery(options: {
   collection?: string
 }): string {
   const conditions = [
-    `bookmark > '${options.startBookmark}'`,
-    `bookmark <= '${options.endBookmark}'`,
+    `bookmark > '${validateAndEscape(options.startBookmark, 'startBookmark')}'`,
+    `bookmark <= '${validateAndEscape(options.endBookmark, 'endBookmark')}'`,
   ]
 
   if (options.collection) {
-    conditions.push(`collection = '${options.collection}'`)
+    conditions.push(`collection = '${validateAndEscape(options.collection, 'collection')}'`)
   }
 
   return `SELECT *

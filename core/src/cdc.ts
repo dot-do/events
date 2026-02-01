@@ -61,9 +61,9 @@ export class CDCCollection<T extends Record<string, unknown>> {
     this.collection.put(id, doc)
 
     if (prev) {
-      this.emitter.emitChange('update', this.name, id, doc as Record<string, unknown>, prev as Record<string, unknown>)
+      this.emitter.emitChange('update', this.name, id, doc, prev)
     } else {
-      this.emitter.emitChange('insert', this.name, id, doc as Record<string, unknown>)
+      this.emitter.emitChange('insert', this.name, id, doc)
     }
   }
 
@@ -75,7 +75,7 @@ export class CDCCollection<T extends Record<string, unknown>> {
     const deleted = this.collection.delete(id)
 
     if (deleted && prev) {
-      this.emitter.emitChange('delete', this.name, id, undefined, prev as Record<string, unknown>)
+      this.emitter.emitChange('delete', this.name, id, undefined, prev)
     }
 
     return deleted

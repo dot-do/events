@@ -8,55 +8,247 @@
  *
  * Endpoints:
  * - POST /ingest - Receive batched events
+ * - POST /webhooks?provider=xxx - Receive and verify webhooks (github, stripe, workos, slack, linear, svix)
  * - GET /health - Health check
  * - POST /query - Generate DuckDB query
  * - GET /recent - List recent events (debug)
+ * - GET /pipeline - Check pipeline bucket for Parquet files
+ * - GET /catalog/* - Catalog API
+ * - /subscriptions/* - Subscription management API
  */
 
-import type { DurableEvent, EventBatch } from '@dotdo/events'
+import type { Env, AuthRequest } from './env'
 
-interface Env {
-  EVENTS_BUCKET: R2Bucket
-  EVENTS_QUEUE?: Queue<EventBatch>
-  AUTH_TOKEN?: string
-  ENVIRONMENT: string
-}
+// Import DOs from local source (not package) for proper bundling
+import { CatalogDO } from '../core/src/catalog'
+import { SubscriptionDO } from '../core/src/subscription'
+import { CDCProcessorDO } from '../core/src/cdc-processor'
+import { EventWriterDO } from './event-writer-do'
+import { compactCollection } from '../core/src/cdc-compaction'
+import { handleSubscriptionRoutes } from './subscription-routes'
+import { corsHeaders, getAllowedOrigin } from './utils'
+
+// Route handlers
+import { handleHealth, handlePipelineCheck, handleBenchmark } from './routes/health'
+import { handleAuth } from './routes/auth'
+import { handleIngest } from './routes/ingest'
+import { handleWebhooks } from './routes/webhooks'
+import { handleEventsQuery, handleRecent } from './routes/events'
+import { handleQuery } from './routes/query'
+import { handleCatalog } from './routes/catalog'
+
+// Re-export DOs for wrangler
+export { CatalogDO, SubscriptionDO, CDCProcessorDO, EventWriterDO }
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const startTime = performance.now()
     const url = new URL(request.url)
 
-    // CORS for client-side analytics
+    // CORS preflight - use restricted origins for authenticated routes
     if (request.method === 'OPTIONS') {
       return handleCORS()
     }
 
+    // Detect domain for service name
+    const isWebhooksDomain = url.hostname === 'webhooks.do' || url.hostname.endsWith('.webhooks.do')
+
     // Health check
-    if (url.pathname === '/health' || url.pathname === '/') {
-      return Response.json({
-        status: 'ok',
-        service: 'events.do',
-        ts: new Date().toISOString(),
-        env: env.ENVIRONMENT,
-      })
-    }
+    const healthResponse = handleHealth(request, env, url, isWebhooksDomain, startTime)
+    if (healthResponse) return healthResponse
+
+    // Auth routes (/login, /callback, /logout, /me)
+    const authResponse = await handleAuth(request, env, url)
+    if (authResponse) return authResponse
 
     // Ingest endpoint
     if ((url.pathname === '/ingest' || url.pathname === '/e') && request.method === 'POST') {
-      return handleIngest(request, env, ctx)
+      const response = await handleIngest(request, env, ctx)
+      const cpuTime = performance.now() - startTime
+      console.log(`[CPU:${cpuTime.toFixed(2)}ms] POST /ingest`)
+      return response
     }
 
-    // Query builder endpoint
-    if (url.pathname === '/query' && request.method === 'POST') {
-      return handleQuery(request, env)
-    }
+    // Webhook endpoints
+    const webhookResponse = await handleWebhooks(request, env, ctx, url, isWebhooksDomain, startTime)
+    if (webhookResponse) return webhookResponse
 
-    // Recent events (debug)
-    if (url.pathname === '/recent' && request.method === 'GET') {
-      return handleRecent(request, env)
+    // ================================================================
+    // Protected routes - require admin auth
+    // ================================================================
+    const protectedRoutes = ['/query', '/recent', '/events', '/pipeline', '/catalog', '/subscriptions', '/benchmark']
+    if (protectedRoutes.some(r => url.pathname === r || url.pathname.startsWith(r + '/'))) {
+      // Authenticate using AUTH RPC binding directly
+      const auth = request.headers.get('Authorization')
+      const cookie = request.headers.get('Cookie')
+      const result = await env.AUTH.authenticate(auth, cookie)
+
+      if (!result.ok) {
+        const accept = request.headers.get('Accept') || ''
+        if (accept.includes('text/html')) {
+          const loginUrl = `${url.origin}/login?redirect_uri=${encodeURIComponent(url.pathname + url.search)}`
+          return Response.redirect(loginUrl, 302)
+        }
+        return Response.json({ error: result.error || 'Authentication required' }, { status: result.status || 401 })
+      }
+
+      if (!result.user?.roles?.includes('admin')) {
+        return Response.json({
+          error: 'Admin access required',
+          user: result.user,
+          message: 'You are logged in but do not have admin privileges'
+        }, { status: 403 })
+      }
+
+      // Attach user to request for downstream handlers
+      const authReq = request as AuthRequest
+      authReq.auth = { user: result.user, isAuth: true }
+
+      const user = authReq.auth?.user?.email || 'unknown'
+
+      // Query builder endpoint
+      if (url.pathname === '/query' && request.method === 'POST') {
+        const response = await handleQuery(request, env)
+        const cpuTime = performance.now() - startTime
+        console.log(`[CPU:${cpuTime.toFixed(2)}ms] POST /query (${user})`)
+        return response
+      }
+
+      // Recent events
+      if (url.pathname === '/recent' && request.method === 'GET') {
+        const response = await handleRecent(request, env)
+        const cpuTime = performance.now() - startTime
+        console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /recent (${user})`)
+        return response
+      }
+
+      // Events query (parquet)
+      if (url.pathname === '/events' && request.method === 'GET') {
+        const response = await handleEventsQuery(request, env)
+        const cpuTime = performance.now() - startTime
+        console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /events (${user})`)
+        return response
+      }
+
+      // Pipeline bucket check
+      if (url.pathname === '/pipeline' && request.method === 'GET') {
+        const response = await handlePipelineCheck(request, env)
+        const cpuTime = performance.now() - startTime
+        console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /pipeline (${user})`)
+        return response
+      }
+
+      // Catalog API
+      if (url.pathname.startsWith('/catalog')) {
+        const response = await handleCatalog(request, env, url)
+        const cpuTime = performance.now() - startTime
+        console.log(`[CPU:${cpuTime.toFixed(2)}ms] ${request.method} ${url.pathname} (${user})`)
+        return response
+      }
+
+      // Subscription API
+      if (url.pathname.startsWith('/subscriptions')) {
+        const response = await handleSubscriptionRoutes(request, env, url)
+        const cpuTime = performance.now() - startTime
+        console.log(`[CPU:${cpuTime.toFixed(2)}ms] ${request.method} ${url.pathname} (${user})`)
+        if (response) return response
+      }
+
+      // Benchmark results
+      if (url.pathname === '/benchmark' && request.method === 'GET') {
+        const response = await handleBenchmark(request, env)
+        const cpuTime = performance.now() - startTime
+        console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /benchmark (${user})`)
+        return response
+      }
     }
 
     return new Response('Not found', { status: 404 })
+  },
+
+  /**
+   * Scheduled handler - runs CDC compaction for collections with pending deltas.
+   *
+   * Cron: every hour at :30 (30 * * * *)
+   *
+   * 1. Lists namespaces and tables from CatalogDO
+   * 2. For each collection, checks for pending delta files in R2
+   * 3. Runs compactCollection() for collections with pending deltas
+   * 4. Logs results
+   */
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const startTime = Date.now()
+    console.log(`[COMPACT-CDC] Scheduled compaction triggered at ${new Date().toISOString()}, cron: ${event.cron}`)
+
+    ctx.waitUntil((async () => {
+      try {
+        // 1. Get catalog to list namespaces and tables
+        const catalogId = env.CATALOG.idFromName('events-catalog')
+        const catalog = env.CATALOG.get(catalogId)
+
+        const namespaces = await catalog.listNamespaces()
+        console.log(`[COMPACT-CDC] Found ${namespaces.length} namespaces: ${namespaces.join(', ')}`)
+
+        let totalCompacted = 0
+        let totalSkipped = 0
+        const results: { ns: string; table: string; result: string; recordCount?: number; deltasProcessed?: number }[] = []
+
+        // 2. For each namespace, list tables and check for pending deltas
+        for (const ns of namespaces) {
+          const tables = await catalog.listTables(ns)
+
+          for (const table of tables) {
+            const deltasPrefix = `cdc/${ns}/${table}/deltas/`
+
+            // Check if there are any pending delta files
+            const deltasList = await env.EVENTS_BUCKET.list({ prefix: deltasPrefix, limit: 1 })
+
+            if (deltasList.objects.length === 0) {
+              totalSkipped++
+              continue
+            }
+
+            // 3. Run compaction for this collection
+            try {
+              const compactionResult = await compactCollection(
+                env.EVENTS_BUCKET,
+                ns,
+                table,
+                { deleteDeltas: true }
+              )
+
+              if (compactionResult.success && compactionResult.deltasProcessed > 0) {
+                totalCompacted++
+                results.push({
+                  ns,
+                  table,
+                  result: 'compacted',
+                  recordCount: compactionResult.recordCount,
+                  deltasProcessed: compactionResult.deltasProcessed,
+                })
+                console.log(
+                  `[COMPACT-CDC] Compacted ${ns}/${table}: ${compactionResult.deltasProcessed} deltas -> ${compactionResult.recordCount} records`
+                )
+              } else {
+                totalSkipped++
+                results.push({ ns, table, result: 'no-deltas' })
+              }
+            } catch (err) {
+              const errorMsg = err instanceof Error ? err.message : String(err)
+              console.error(`[COMPACT-CDC] Error compacting ${ns}/${table}:`, errorMsg)
+              results.push({ ns, table, result: `error: ${errorMsg}` })
+            }
+          }
+        }
+
+        const durationMs = Date.now() - startTime
+        console.log(
+          `[COMPACT-CDC] Completed in ${durationMs}ms: ${totalCompacted} compacted, ${totalSkipped} skipped`
+        )
+      } catch (err) {
+        console.error('[COMPACT-CDC] Fatal error in scheduled compaction:', err)
+      }
+    })())
   },
 }
 
@@ -64,232 +256,19 @@ export default {
 // CORS
 // ============================================================================
 
-function handleCORS(): Response {
+function handleCORS(request?: Request, env?: { ALLOWED_ORIGINS?: string }, authenticated = false): Response {
+  const requestOrigin = request?.headers.get('Origin') ?? null
+  const origin = authenticated
+    ? (getAllowedOrigin(requestOrigin, env) ?? 'null')
+    : '*'
+
   return new Response(null, {
     headers: {
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
       'Access-Control-Max-Age': '86400',
+      ...(authenticated && origin !== '*' ? { 'Vary': 'Origin' } : {}),
     },
   })
-}
-
-function corsHeaders(): HeadersInit {
-  return {
-    'Access-Control-Allow-Origin': '*',
-  }
-}
-
-// ============================================================================
-// Ingest Handler
-// ============================================================================
-
-async function handleIngest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  // Optional auth
-  if (env.AUTH_TOKEN) {
-    const auth = request.headers.get('Authorization')
-    if (auth !== `Bearer ${env.AUTH_TOKEN}`) {
-      return Response.json({ error: 'Unauthorized' }, { status: 401, headers: corsHeaders() })
-    }
-  }
-
-  let batch: EventBatch
-  try {
-    batch = await request.json()
-  } catch {
-    return Response.json({ error: 'Invalid JSON' }, { status: 400, headers: corsHeaders() })
-  }
-
-  if (!batch.events || !Array.isArray(batch.events)) {
-    return Response.json({ error: 'Missing events array' }, { status: 400, headers: corsHeaders() })
-  }
-
-  // Group events by hour bucket for efficient R2 organization
-  const buckets = groupByTimeBucket(batch.events)
-
-  // Write to R2 (in background for fast response)
-  ctx.waitUntil((async () => {
-    const writes = Object.entries(buckets).map(async ([bucket, events]) => {
-      const key = `events/${bucket}/${crypto.randomUUID()}.jsonl`
-      const body = events.map(e => JSON.stringify(e)).join('\n')
-
-      await env.EVENTS_BUCKET.put(key, body, {
-        httpMetadata: { contentType: 'application/x-ndjson' },
-        customMetadata: {
-          eventCount: String(events.length),
-          firstTs: events[0].ts,
-          lastTs: events[events.length - 1].ts,
-        },
-      })
-    })
-
-    await Promise.all(writes)
-
-    // Optionally send to Queue for real-time consumers
-    if (env.EVENTS_QUEUE) {
-      await env.EVENTS_QUEUE.send(batch)
-    }
-  })())
-
-  return Response.json({
-    ok: true,
-    received: batch.events.length,
-  }, { headers: corsHeaders() })
-}
-
-/**
- * Group events by time bucket (YYYY/MM/DD/HH)
- */
-function groupByTimeBucket(events: DurableEvent[]): Record<string, DurableEvent[]> {
-  const buckets: Record<string, DurableEvent[]> = {}
-
-  for (const event of events) {
-    const date = new Date(event.ts)
-    const bucket = [
-      date.getUTCFullYear(),
-      String(date.getUTCMonth() + 1).padStart(2, '0'),
-      String(date.getUTCDate()).padStart(2, '0'),
-      String(date.getUTCHours()).padStart(2, '0'),
-    ].join('/')
-
-    if (!buckets[bucket]) {
-      buckets[bucket] = []
-    }
-    buckets[bucket].push(event)
-  }
-
-  return buckets
-}
-
-// ============================================================================
-// Query Builder
-// ============================================================================
-
-interface QueryRequest {
-  dateRange?: { start: string; end: string }
-  doId?: string
-  doClass?: string
-  eventTypes?: string[]
-  collection?: string
-  colo?: string
-  limit?: number
-}
-
-async function handleQuery(request: Request, env: Env): Promise<Response> {
-  const query: QueryRequest = await request.json()
-
-  const conditions: string[] = []
-  let pathPattern = 'events/'
-
-  // Optimize path based on date range
-  if (query.dateRange) {
-    const start = new Date(query.dateRange.start)
-    const end = new Date(query.dateRange.end)
-
-    if (start.getFullYear() === end.getFullYear()) {
-      pathPattern += `${start.getFullYear()}/`
-      if (start.getMonth() === end.getMonth()) {
-        pathPattern += `${String(start.getMonth() + 1).padStart(2, '0')}/`
-        if (start.getDate() === end.getDate()) {
-          pathPattern += `${String(start.getDate()).padStart(2, '0')}/`
-        } else {
-          pathPattern += '*/'
-        }
-      } else {
-        pathPattern += '*/'
-      }
-    } else {
-      pathPattern += '*/'
-    }
-  } else {
-    pathPattern += '**/'
-  }
-  pathPattern += '*.jsonl'
-
-  // Build conditions
-  if (query.doId) {
-    conditions.push(`"do".id = '${query.doId}'`)
-  }
-  if (query.doClass) {
-    conditions.push(`"do".class = '${query.doClass}'`)
-  }
-  if (query.colo) {
-    conditions.push(`"do".colo = '${query.colo}'`)
-  }
-  if (query.eventTypes?.length) {
-    conditions.push(`type IN (${query.eventTypes.map(t => `'${t}'`).join(', ')})`)
-  }
-  if (query.collection) {
-    conditions.push(`collection = '${query.collection}'`)
-  }
-  if (query.dateRange) {
-    conditions.push(`ts >= '${query.dateRange.start}'`)
-    conditions.push(`ts <= '${query.dateRange.end}'`)
-  }
-
-  let sql = `SELECT *
-FROM read_json_auto('${pathPattern}',
-  filename=true,
-  hive_partitioning=false
-)`
-
-  if (conditions.length > 0) {
-    sql += `\nWHERE ${conditions.join('\n  AND ')}`
-  }
-
-  sql += `\nORDER BY ts DESC`
-
-  if (query.limit) {
-    sql += `\nLIMIT ${query.limit}`
-  }
-
-  return Response.json({ sql }, { headers: corsHeaders() })
-}
-
-// ============================================================================
-// Recent Events (Debug)
-// ============================================================================
-
-async function handleRecent(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url)
-  const limit = parseInt(url.searchParams.get('limit') ?? '100')
-
-  // List recent files from current hour
-  const now = new Date()
-  const hourPath = [
-    now.getUTCFullYear(),
-    String(now.getUTCMonth() + 1).padStart(2, '0'),
-    String(now.getUTCDate()).padStart(2, '0'),
-    String(now.getUTCHours()).padStart(2, '0'),
-  ].join('/')
-
-  const listed = await env.EVENTS_BUCKET.list({
-    prefix: `events/${hourPath}/`,
-    limit: 10,
-  })
-
-  const events: DurableEvent[] = []
-
-  for (const obj of listed.objects) {
-    const data = await env.EVENTS_BUCKET.get(obj.key)
-    if (data) {
-      const text = await data.text()
-      const lines = text.split('\n').filter(Boolean)
-      for (const line of lines) {
-        try {
-          events.push(JSON.parse(line))
-        } catch {
-          // Skip malformed
-        }
-      }
-    }
-    if (events.length >= limit) break
-  }
-
-  return Response.json({
-    events: events.slice(0, limit),
-    count: events.length,
-    bucket: hourPath,
-  }, { headers: corsHeaders() })
 }

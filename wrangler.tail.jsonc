@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tail",
+  "main": "src/tail-worker.ts",
+  "compatibility_date": "2026-01-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "b6641681fe423910342b9ffa1364c76d",
+
+  // NOTE: This worker has NO tail_consumers - prevents infinite loops
+  // The events.do worker IS tailed, but this worker is NOT
+
+  // R2 bucket for events
+  "r2_buckets": [
+    { "binding": "EVENTS_BUCKET", "bucket_name": "events" }
+  ],
+
+  // Shared EventWriterDO - same DO used by events.do worker
+  "durable_objects": {
+    "bindings": [
+      { "name": "EVENT_WRITER", "class_name": "EventWriterDO", "script_name": "events-do" }
+    ]
+  },
+
+  // TAIL_AUTH_SECRET must be set via `wrangler secret put TAIL_AUTH_SECRET` or in .dev.vars
+  "vars": {
+    "ENVIRONMENT": "production"
+  }
+}

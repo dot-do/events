@@ -9,6 +9,8 @@ dist/
 # Wrangler
 .wrangler/
 .dev.vars
+.env
+
 
 # IDE
 .idea/
@@ -26,3 +28,17 @@ npm-debug.log*
 
 # Test
 coverage/
+
+# Development artifacts
+direct-test/
+test-wiktionary/
+events/
+benchmarks/
+
+# Development notes
+ARCHITECTURE-EXPLORATION.md
+PIPELINE-DEBUG.md
+PIPELINE-MIGRATION.md
+BDD-IMPLEMENTATION.md
+IMPLEMENTATION-PLAN.md
+ARCHITECTURE.md

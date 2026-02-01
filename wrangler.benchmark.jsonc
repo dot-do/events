@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "parquet-benchmark",
+  "main": "src/benchmark-worker.ts",
+  "compatibility_date": "2026-01-25",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "b6641681fe423910342b9ffa1364c76d",
+
+  // R2 buckets
+  "r2_buckets": [
+    { "binding": "BENCHMARK_BUCKET", "bucket_name": "events-parquet-test" },
+    { "binding": "PIPELINE_BUCKET", "bucket_name": "platform-events" }
+  ],
+
+  "vars": {
+    "ENVIRONMENT": "production"
+  }
+}
