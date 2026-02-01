@@ -313,7 +313,7 @@ export async function handleSubscriptionRoutes(
     // GET /subscriptions/status/:id - try all shards
     const statusMatch = path.match(/^\/status\/([A-Z0-9]+)$/)
     if (statusMatch && request.method === 'GET') {
-      const subscriptionId = statusMatch[1]
+      const subscriptionId = statusMatch[1]!
 
       for (const { stub } of getAllSubscriptionStubs(env)) {
         const result = await stub.getSubscriptionStatus(subscriptionId)
@@ -331,7 +331,7 @@ export async function handleSubscriptionRoutes(
     // GET /subscriptions/deliveries/:id/logs - try all shards
     const logsMatch = path.match(/^\/deliveries\/([A-Z0-9]+)\/logs$/)
     if (logsMatch && request.method === 'GET') {
-      const deliveryId = logsMatch[1]
+      const deliveryId = logsMatch[1]!
 
       for (const { stub } of getAllSubscriptionStubs(env)) {
         const result = await stub.getDeliveryLogs(deliveryId)
@@ -346,7 +346,7 @@ export async function handleSubscriptionRoutes(
     // GET /subscriptions/:id/dead-letters - try all shards
     const deadLettersMatch = path.match(/^\/([A-Z0-9]+)\/dead-letters$/)
     if (deadLettersMatch && request.method === 'GET') {
-      const subscriptionId = deadLettersMatch[1]
+      const subscriptionId = deadLettersMatch[1]!
       const limit = url.searchParams.get('limit')
 
       for (const { stub } of getAllSubscriptionStubs(env)) {
@@ -363,7 +363,7 @@ export async function handleSubscriptionRoutes(
     // POST /subscriptions/:id/dead-letters/:deadLetterId/retry - try all shards
     const retryMatch = path.match(/^\/([A-Z0-9]+)\/dead-letters\/([A-Z0-9]+)\/retry$/)
     if (retryMatch && request.method === 'POST') {
-      const deadLetterId = retryMatch[2]
+      const deadLetterId = retryMatch[2]!
 
       for (const { stub } of getAllSubscriptionStubs(env)) {
         const result = await stub.retryDeadLetter(deadLetterId)
@@ -378,7 +378,7 @@ export async function handleSubscriptionRoutes(
     // GET /subscriptions/:id - try all shards
     const getMatch = path.match(/^\/([A-Z0-9]+)$/)
     if (getMatch && request.method === 'GET') {
-      const subscriptionId = getMatch[1]
+      const subscriptionId = getMatch[1]!
 
       for (const { stub } of getAllSubscriptionStubs(env)) {
         const result = await stub.getSubscription(subscriptionId)
@@ -396,7 +396,7 @@ export async function handleSubscriptionRoutes(
     // PUT /subscriptions/:id - try all shards
     const updateMatch = path.match(/^\/([A-Z0-9]+)$/)
     if (updateMatch && request.method === 'PUT') {
-      const subscriptionId = updateMatch[1]
+      const subscriptionId = updateMatch[1]!
       let body: unknown
       try {
         body = await request.json()
@@ -435,7 +435,7 @@ export async function handleSubscriptionRoutes(
     // DELETE /subscriptions/:id - try all shards
     const deleteMatch = path.match(/^\/([A-Z0-9]+)$/)
     if (deleteMatch && request.method === 'DELETE') {
-      const subscriptionId = deleteMatch[1]
+      const subscriptionId = deleteMatch[1]!
 
       for (const { stub } of getAllSubscriptionStubs(env)) {
         const sub = await stub.getSubscription(subscriptionId)

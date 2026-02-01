@@ -5,6 +5,44 @@
 /** Maximum allowed string length for query parameters to prevent DoS */
 const MAX_STRING_LENGTH = 1000
 
+/** Valid columns that can be used in orderBy clause */
+export type OrderByColumn = 'ts' | 'type' | 'id' | 'do_id' | 'collection' | 'colo'
+
+/** Valid sort directions */
+export type OrderDirection = 'ASC' | 'DESC'
+
+/** Valid orderBy values - column name optionally followed by direction */
+export type OrderBy = OrderByColumn | `${OrderByColumn} ${OrderDirection}`
+
+/** Set of valid orderBy column names for runtime validation */
+const VALID_ORDER_COLUMNS: Set<string> = new Set(['ts', 'type', 'id', 'do_id', 'collection', 'colo'])
+
+/** Set of valid orderBy directions for runtime validation */
+const VALID_ORDER_DIRECTIONS: Set<string> = new Set(['ASC', 'DESC'])
+
+/**
+ * Validate an orderBy value at runtime
+ * @throws Error if the orderBy value is invalid
+ */
+function validateOrderBy(orderBy: string): void {
+  const parts = orderBy.split(' ')
+  if (parts.length < 1 || parts.length > 2) {
+    throw new Error(`Invalid orderBy format: "${orderBy}". Expected "column" or "column direction"`)
+  }
+
+  const column = parts[0] as string
+  if (!VALID_ORDER_COLUMNS.has(column)) {
+    throw new Error(`Invalid orderBy column: "${column}". Valid columns: ${Array.from(VALID_ORDER_COLUMNS).join(', ')}`)
+  }
+
+  if (parts.length === 2) {
+    const direction = parts[1] as string
+    if (!VALID_ORDER_DIRECTIONS.has(direction)) {
+      throw new Error(`Invalid orderBy direction: "${direction}". Valid directions: ASC, DESC`)
+    }
+  }
+}
+
 /**
  * Escape single quotes in SQL strings to prevent SQL injection
  */
@@ -43,7 +81,7 @@ export interface QueryOptions {
   /** Limit results */
   limit?: number
   /** Order by (default: ts DESC) */
-  orderBy?: string
+  orderBy?: OrderBy
 }
 
 /**
@@ -125,7 +163,10 @@ export function buildQuery(options: QueryOptions): string {
     query += `\nWHERE ${conditions.join('\n  AND ')}`
   }
 
-  query += `\nORDER BY ${orderBy ?? 'ts DESC'}`
+  // Validate orderBy at runtime to prevent SQL injection
+  const orderByValue = orderBy ?? 'ts DESC'
+  validateOrderBy(orderByValue)
+  query += `\nORDER BY ${orderByValue}`
 
   if (limit) {
     query += `\nLIMIT ${Math.floor(limit)}`

@@ -18,13 +18,18 @@
  */
 
 import type { Env, AuthRequest } from './env'
+import type { EventBatch, DurableEvent } from '@dotdo/events'
+import type { CDCEvent } from '../core/src/cdc-processor'
+import { ulid } from '../core/src/ulid'
 
 // Import DOs from local source (not package) for proper bundling
 import { CatalogDO } from '../core/src/catalog'
 import { SubscriptionDO } from '../core/src/subscription'
 import { CDCProcessorDO } from '../core/src/cdc-processor'
 import { EventWriterDO } from './event-writer-do'
+import { RateLimiterDO } from './middleware/rate-limiter-do'
 import { compactCollection } from '../core/src/cdc-compaction'
+import { compactEventStream } from '../core/src/event-compaction'
 import { handleSubscriptionRoutes } from './subscription-routes'
 import { corsHeaders, getAllowedOrigin } from './utils'
 
@@ -38,7 +43,7 @@ import { handleQuery } from './routes/query'
 import { handleCatalog } from './routes/catalog'
 
 // Re-export DOs for wrangler
-export { CatalogDO, SubscriptionDO, CDCProcessorDO, EventWriterDO }
+export { CatalogDO, SubscriptionDO, CDCProcessorDO, EventWriterDO, RateLimiterDO }
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -167,22 +172,65 @@ export default {
   },
 
   /**
-   * Scheduled handler - runs CDC compaction for collections with pending deltas.
+   * Scheduled handler - runs CDC compaction, event compaction, and dedup marker cleanup.
    *
    * Cron: every hour at :30 (30 * * * *)
    *
-   * 1. Lists namespaces and tables from CatalogDO
-   * 2. For each collection, checks for pending delta files in R2
-   * 3. Runs compactCollection() for collections with pending deltas
-   * 4. Logs results
+   * Tasks:
+   * 1. Dedup Cleanup: Deletes dedup markers older than 24 hours (hourly)
+   * 2. CDC Compaction: Compacts delta files for collections with pending deltas (hourly)
+   * 3. Event Stream Compaction: Compacts hourly Parquet files into daily files (daily at 1:30 UTC)
    */
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const startTime = Date.now()
-    console.log(`[COMPACT-CDC] Scheduled compaction triggered at ${new Date().toISOString()}, cron: ${event.cron}`)
+    console.log(`[SCHEDULED] Triggered at ${new Date().toISOString()}, cron: ${event.cron}`)
 
     ctx.waitUntil((async () => {
+      // ================================================================
+      // Task 1: Dedup marker cleanup (delete markers older than 24 hours)
+      // ================================================================
       try {
-        // 1. Get catalog to list namespaces and tables
+        const DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
+        const now = Date.now()
+        let dedupDeleted = 0
+        let dedupChecked = 0
+        let cursor: string | undefined
+
+        console.log('[DEDUP-CLEANUP] Starting dedup marker cleanup...')
+
+        // Paginate through all dedup markers
+        do {
+          const list = await env.EVENTS_BUCKET.list({
+            prefix: 'dedup/',
+            limit: 1000,
+            cursor,
+          })
+
+          for (const obj of list.objects) {
+            dedupChecked++
+            // Check if marker is older than TTL based on uploaded timestamp
+            const uploadedAt = obj.uploaded.getTime()
+            if (now - uploadedAt > DEDUP_TTL_MS) {
+              await env.EVENTS_BUCKET.delete(obj.key)
+              dedupDeleted++
+            }
+          }
+
+          cursor = list.truncated ? list.cursor : undefined
+        } while (cursor)
+
+        console.log(`[DEDUP-CLEANUP] Completed: checked ${dedupChecked}, deleted ${dedupDeleted} expired markers`)
+      } catch (err) {
+        console.error('[DEDUP-CLEANUP] Error during dedup cleanup:', err)
+      }
+
+      // ================================================================
+      // Task 2: CDC Compaction
+      // ================================================================
+      try {
+        console.log('[COMPACT-CDC] Starting CDC compaction...')
+
+        // Get catalog to list namespaces and tables
         const catalogId = env.CATALOG.idFromName('events-catalog')
         const catalog = env.CATALOG.get(catalogId)
 
@@ -241,14 +289,157 @@ export default {
           }
         }
 
-        const durationMs = Date.now() - startTime
         console.log(
-          `[COMPACT-CDC] Completed in ${durationMs}ms: ${totalCompacted} compacted, ${totalSkipped} skipped`
+          `[COMPACT-CDC] Completed: ${totalCompacted} compacted, ${totalSkipped} skipped`
         )
       } catch (err) {
-        console.error('[COMPACT-CDC] Fatal error in scheduled compaction:', err)
+        console.error('[COMPACT-CDC] Error during CDC compaction:', err)
       }
+
+      // ================================================================
+      // Task 3: Event Stream Compaction (daily at 1:30 UTC only)
+      // Compacts hourly Parquet files from EventWriterDO into daily files.
+      // Only runs at 1:30 UTC to avoid compacting files still being written.
+      // ================================================================
+      const currentHour = new Date().getUTCHours()
+      if (currentHour === 1) {
+        try {
+          console.log('[COMPACT-EVENTS] Starting event stream compaction...')
+
+          const result = await compactEventStream(env.EVENTS_BUCKET, {
+            prefixes: ['events', 'webhooks', 'tail'],
+            daysBack: 7,
+          })
+
+          console.log(
+            `[COMPACT-EVENTS] Completed in ${result.durationMs}ms: ` +
+            `${result.days.length} days processed, ` +
+            `${result.totalSourceFiles} source files -> ${result.totalOutputFiles} output files, ` +
+            `${result.totalRecords} total records`
+          )
+
+          if (result.errors && result.errors.length > 0) {
+            console.warn('[COMPACT-EVENTS] Errors:', result.errors)
+          }
+        } catch (err) {
+          console.error('[COMPACT-EVENTS] Error during event stream compaction:', err)
+        }
+      }
+
+      const durationMs = Date.now() - startTime
+      console.log(`[SCHEDULED] All tasks completed in ${durationMs}ms`)
     })())
+  },
+
+  /**
+   * Queue consumer handler - processes EventBatch messages for CDC/subscription fanout.
+   *
+   * This provides an alternative to direct DO calls in the ingest flow, enabling:
+   * - Better scalability through queue-based buffering
+   * - Automatic retries on failure
+   * - Decoupled processing from the ingest response path
+   *
+   * Queue message format: EventBatch (same as ingest payload)
+   */
+  async queue(batch: MessageBatch<EventBatch>, env: Env): Promise<void> {
+    const startTime = Date.now()
+    console.log(`[QUEUE] Processing batch of ${batch.messages.length} messages`)
+
+    let totalEvents = 0
+    let cdcEventsProcessed = 0
+    let subscriptionFanouts = 0
+
+    for (const message of batch.messages) {
+      try {
+        const eventBatch = message.body
+
+        if (!eventBatch?.events || !Array.isArray(eventBatch.events)) {
+          console.warn(`[QUEUE] Invalid message format, missing events array`)
+          message.ack()
+          continue
+        }
+
+        totalEvents += eventBatch.events.length
+
+        // Process CDC events (type starts with 'collection.')
+        const cdcEvents = eventBatch.events.filter((e: DurableEvent) => e.type.startsWith('collection.'))
+
+        if (cdcEvents.length > 0 && env.CDC_PROCESSOR) {
+          // Group CDC events by namespace/collection for routing to the correct DO instance
+          const cdcByKey = new Map<string, CDCEvent[]>()
+          for (const event of cdcEvents) {
+            const cdcEvent = event as unknown as CDCEvent
+            const ns = cdcEvent.do?.class || cdcEvent.do?.name || 'default'
+            const collection = cdcEvent.collection || 'default'
+            const key = `${ns}/${collection}`
+            const existing = cdcByKey.get(key) ?? []
+            existing.push(cdcEvent)
+            cdcByKey.set(key, existing)
+          }
+
+          // Send each group to the appropriate CDCProcessorDO instance
+          for (const [key, events] of cdcByKey) {
+            try {
+              const processorId = env.CDC_PROCESSOR.idFromName(key)
+              const processor = env.CDC_PROCESSOR.get(processorId)
+              await processor.process(events)
+              cdcEventsProcessed += events.length
+            } catch (err) {
+              console.error(`[QUEUE] CDC processor error for ${key}:`, err)
+              // Don't ack the message yet - will retry
+              throw err
+            }
+          }
+        }
+
+        // Fan out all events to subscription matching and delivery
+        if (env.SUBSCRIPTIONS) {
+          // Group events by shard key (first segment before '.', or 'default')
+          const eventsByShard = new Map<string, DurableEvent[]>()
+          for (const event of eventBatch.events) {
+            const dotIndex = event.type.indexOf('.')
+            const shardKey = dotIndex > 0 ? event.type.slice(0, dotIndex) : 'default'
+            const existing = eventsByShard.get(shardKey) ?? []
+            existing.push(event)
+            eventsByShard.set(shardKey, existing)
+          }
+
+          // Fan out each group to its corresponding shard
+          for (const [shardKey, events] of eventsByShard) {
+            try {
+              const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
+              const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
+
+              for (const event of events) {
+                await subscriptionDO.fanout({
+                  id: ulid(),
+                  type: event.type,
+                  ts: event.ts,
+                  payload: event,
+                })
+                subscriptionFanouts++
+              }
+            } catch (err) {
+              console.error(`[QUEUE] Subscription shard error for shard ${shardKey}:`, err)
+              // Don't ack the message yet - will retry
+              throw err
+            }
+          }
+        }
+
+        // Successfully processed this message
+        message.ack()
+      } catch (err) {
+        console.error(`[QUEUE] Error processing message:`, err)
+        // Message will be retried automatically by the queue
+        message.retry()
+      }
+    }
+
+    const durationMs = Date.now() - startTime
+    console.log(
+      `[QUEUE] Completed in ${durationMs}ms: ${totalEvents} events, ${cdcEventsProcessed} CDC, ${subscriptionFanouts} fanouts`
+    )
   },
 }
 

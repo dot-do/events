@@ -69,7 +69,8 @@ export interface ClientEvent extends BaseEvent {
 /** Custom event with user-defined type */
 export interface CustomEvent extends BaseEvent {
   type: `custom.${string}`
-  [key: string]: unknown
+  /** Custom event data */
+  data?: Record<string, unknown>
 }
 
 /** Union of all event types (discriminated by 'type' field) */
@@ -91,7 +92,7 @@ export type EmitInput =
   | Omit<LifecycleEvent, AutoFilledFields>
   | Omit<WebSocketEvent, AutoFilledFields>
   | Omit<ClientEvent, AutoFilledFields>
-  | (Omit<CustomEvent, AutoFilledFields> & { type: `custom.${string}`; [key: string]: unknown })
+  | Omit<CustomEvent, AutoFilledFields>
 
 /**
  * Type guard for RpcCallEvent

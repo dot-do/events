@@ -34,7 +34,8 @@
       { "name": "CATALOG", "class_name": "CatalogDO" },
       { "name": "SUBSCRIPTIONS", "class_name": "SubscriptionDO" },
       { "name": "CDC_PROCESSOR", "class_name": "CDCProcessorDO" },
-      { "name": "EVENT_WRITER", "class_name": "EventWriterDO" }
+      { "name": "EVENT_WRITER", "class_name": "EventWriterDO" },
+      { "name": "RATE_LIMITER", "class_name": "RateLimiterDO" }
     ]
   },
 
@@ -43,17 +44,22 @@
     { "tag": "v1", "new_sqlite_classes": ["CatalogDO"] },
     { "tag": "v2", "new_sqlite_classes": ["SubscriptionDO"] },
     { "tag": "v3", "new_sqlite_classes": ["CDCProcessorDO"] },
-    { "tag": "v4", "new_classes": ["EventWriterDO"] }
+    { "tag": "v4", "new_classes": ["EventWriterDO"] },
+    { "tag": "v5", "new_sqlite_classes": ["RateLimiterDO"] }
   ],
 
-  // Optional: Queue for real-time streaming
-  // "queues": {
-  //   "producers": [{ "binding": "EVENTS_QUEUE", "queue": "events" }]
-  // },
+  // Queue for CDC/subscription fanout
+  "queues": {
+    "producers": [{ "binding": "EVENTS_QUEUE", "queue": "events" }],
+    "consumers": [{ "queue": "events", "max_batch_size": 100, "max_batch_timeout": 5, "max_retries": 3 }]
+  },
 
   "vars": {
     "ENVIRONMENT": "production",
-    "ALLOWED_ORIGINS": ""
+    "ALLOWED_ORIGINS": "",
+    // Rate limiting defaults (configurable via wrangler secret or vars override)
+    "RATE_LIMIT_REQUESTS_PER_MINUTE": "1000",
+    "RATE_LIMIT_EVENTS_PER_MINUTE": "100000"
   },
 
   // Scheduled triggers for automated compaction

@@ -9,7 +9,7 @@
  * - CPU time and wall clock time
  */
 
-import { parquetWriteBuffer } from 'hyparquet-writer'
+import { parquetWriteBuffer } from '@dotdo/hyparquet-writer'
 import { parquetRead } from 'hyparquet'
 import type { Compressors } from 'hyparquet'
 import { compressors as hyparquetCompressors } from 'hyparquet-compressors'
@@ -22,13 +22,13 @@ function lz4RawDecompress(input: Uint8Array, outputLength: number): Uint8Array {
   const output = new Uint8Array(outputLength)
   let len = 0 // output position
   for (let i = 0; i < input.length;) {
-    const token = input[i++]
+    const token = input[i++]!
 
     let literals = token >> 4
     if (literals) {
       // literal length extension
       let byte = literals + 240
-      while (byte === 255) literals += byte = input[i++]
+      while (byte === 255) literals += byte = input[i++]!
       // copy literals
       output.set(input.subarray(i, i + literals), len)
       len += literals
@@ -36,7 +36,7 @@ function lz4RawDecompress(input: Uint8Array, outputLength: number): Uint8Array {
       if (i >= input.length) return output
     }
 
-    const offset = input[i++] | input[i++] << 8
+    const offset = (input[i++] ?? 0) | ((input[i++] ?? 0) << 8)
     if (!offset || offset > len) {
       throw new Error(`lz4 offset out of range ${offset}`)
     }
@@ -44,12 +44,12 @@ function lz4RawDecompress(input: Uint8Array, outputLength: number): Uint8Array {
     // match length - FIX: use (token & 0xf), not matchLength which includes +4
     let matchLength = (token & 0xf) + 4 // minmatch 4
     let byte = (token & 0xf) + 240 // FIX: check nibble, not matchLength
-    while (byte === 255) matchLength += byte = input[i++]
+    while (byte === 255) matchLength += byte = input[i++]!
 
     // copy match byte by byte (handles overlapping)
     let pos = len - offset
     const end = len + matchLength
-    while (len < end) output[len++] = output[pos++]
+    while (len < end) output[len++] = output[pos++]!
   }
   return output
 }
@@ -186,7 +186,7 @@ export default {
       // Read it back
       let sum = 0
       for (let i = 0; i < arr.length; i++) {
-        sum += arr[i]
+        sum += arr[i]!
       }
 
       await env.BENCHMARK_BUCKET.head('__timing_test__')
@@ -226,7 +226,7 @@ export default {
         let firstDiff: { index: number; expected: number; got: number } | undefined
         for (let i = 0; i < testData.length; i++) {
           if (testData[i] !== decompressed[i]) {
-            firstDiff = { index: i, expected: testData[i], got: decompressed[i] }
+            firstDiff = { index: i, expected: testData[i]!, got: decompressed[i]! }
             break
           }
         }
@@ -319,7 +319,7 @@ export default {
         const totalMs = totalEnd - totalStart
         console.log(`[ITER] End: ${totalEnd}, total: ${totalMs}ms`)
         const avgWriteMs = totalMs / iterations
-        const lastResult = results[results.length - 1]
+        const lastResult = results[results.length - 1]!
 
         return Response.json({
           ...lastResult,

@@ -1,0 +1,23 @@
+{
+  "name": "events-do-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e:prod": "vitest run -c vitest.real.config.ts",
+    "test:webhooks": "vitest run -c vitest.real.config.ts webhooks-e2e.test.ts",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@dotdo/events": "file:../core"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.10.15",
+    "@cloudflare/workers-types": "^4.20250121.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8",
+    "wrangler": "^4.0.0"
+  }
+}

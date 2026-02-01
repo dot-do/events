@@ -7,7 +7,20 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import { writeDeltaFile } from './cdc-delta.js'
-import type { DeltaRecord } from './cdc-delta.js'
+import type { CDCEvent, DeltaRecord } from './cdc-delta.js'
+import {
+  getString,
+  getNumber,
+  getBoolean,
+  getOptionalString,
+  getOptionalNumber,
+  getJson,
+  getOptionalJson,
+  type SqlRow,
+} from './sql-mapper.js'
+
+// Re-export CDCEvent for backwards compatibility
+export type { CDCEvent } from './cdc-delta.js'
 
 // ============================================================================
 // Types
@@ -18,24 +31,6 @@ import type { DeltaRecord } from './cdc-delta.js'
  */
 export interface Env {
   EVENTS_BUCKET: R2Bucket
-}
-
-/**
- * CDC event for processing
- */
-export interface CDCEvent {
-  type: 'collection.insert' | 'collection.update' | 'collection.delete'
-  ts: string
-  collection: string
-  docId: string
-  doc?: Record<string, unknown>
-  prev?: Record<string, unknown>
-  bookmark?: string
-  do: {
-    id: string
-    name?: string
-    class?: string
-  }
 }
 
 /**
@@ -63,9 +58,9 @@ export interface DeltaRef {
 }
 
 /**
- * Collection manifest with schema and delta references
+ * Collection manifest with schema and delta references (processor-specific)
  */
-export interface CollectionManifest {
+export interface ProcessorManifest {
   collection: string
   schema?: Record<string, string>
   deltaSequence: number
@@ -239,14 +234,14 @@ export class CDCProcessorDO extends DurableObject<Env> {
       docId,
     )]
     if (rows.length === 0) return null
-    const row = rows[0] as Record<string, unknown>
+    const row = rows[0] as SqlRow
     return {
-      docId: row.doc_id as string,
-      doc: JSON.parse(row.data as string),
-      version: row.version as number,
-      lastUpdated: row.updated_at as string,
-      bookmark: (row.bookmark as string) ?? undefined,
-      deleted: (row.deleted as number) === 1,
+      docId: getString(row, 'doc_id'),
+      doc: getJson<Record<string, unknown>>(row, 'data'),
+      version: getNumber(row, 'version'),
+      lastUpdated: getString(row, 'updated_at'),
+      bookmark: getOptionalString(row, 'bookmark') ?? undefined,
+      deleted: getBoolean(row, 'deleted'),
     }
   }
 
@@ -282,13 +277,13 @@ export class CDCProcessorDO extends DurableObject<Env> {
       `SELECT doc_id, data, version, updated_at, bookmark, deleted FROM cdc_state WHERE collection = ?`,
       collection,
     )]
-    return rows.map((row: Record<string, unknown>) => ({
-      docId: row.doc_id as string,
-      doc: JSON.parse(row.data as string),
-      version: row.version as number,
-      lastUpdated: row.updated_at as string,
-      bookmark: (row.bookmark as string) ?? undefined,
-      deleted: (row.deleted as number) === 1,
+    return rows.map((row) => ({
+      docId: getString(row as SqlRow, 'doc_id'),
+      doc: getJson<Record<string, unknown>>(row as SqlRow, 'data'),
+      version: getNumber(row as SqlRow, 'version'),
+      lastUpdated: getString(row as SqlRow, 'updated_at'),
+      bookmark: getOptionalString(row as SqlRow, 'bookmark') ?? undefined,
+      deleted: getBoolean(row as SqlRow, 'deleted'),
     }))
   }
 
@@ -430,15 +425,15 @@ export class CDCProcessorDO extends DurableObject<Env> {
       collection,
     )]
     if (rows.length === 0) return null
-    const row = rows[0] as Record<string, unknown>
+    const row = rows[0] as SqlRow
     return {
-      collection: row.collection as string,
-      schema: row.schema ? JSON.parse(row.schema as string) : null,
-      deltaSequence: row.delta_sequence as number,
-      deltas: JSON.parse(row.deltas as string),
-      lastFlushAt: (row.last_flush_at as string) ?? null,
-      lastSnapshotAt: (row.last_snapshot_at as string) ?? null,
-      stats: JSON.parse(row.stats as string),
+      collection: getString(row, 'collection'),
+      schema: getOptionalJson<Record<string, string>>(row, 'schema'),
+      deltaSequence: getNumber(row, 'delta_sequence'),
+      deltas: getJson<DeltaRef[]>(row, 'deltas'),
+      lastFlushAt: getOptionalString(row, 'last_flush_at'),
+      lastSnapshotAt: getOptionalString(row, 'last_snapshot_at'),
+      stats: getJson<InternalManifest['stats']>(row, 'stats'),
     }
   }
 
@@ -464,7 +459,7 @@ export class CDCProcessorDO extends DurableObject<Env> {
    */
   private getPendingDeltaCount(): number {
     const rows = [...this.ctx.storage.sql.exec(`SELECT COUNT(*) as cnt FROM pending_deltas`)]
-    return (rows[0] as Record<string, unknown>).cnt as number
+    return getNumber(rows[0] as SqlRow, 'cnt')
   }
 
   /**
@@ -474,15 +469,15 @@ export class CDCProcessorDO extends DurableObject<Env> {
     const rows = [...this.ctx.storage.sql.exec(
       `SELECT id, collection, doc_id, op, data, prev, ts, bookmark FROM pending_deltas ORDER BY id`,
     )]
-    return rows.map((row: Record<string, unknown>) => ({
-      id: row.id as number,
-      collection: row.collection as string,
-      docId: row.doc_id as string,
-      op: row.op as 'insert' | 'update' | 'delete',
-      data: row.data ? JSON.parse(row.data as string) : null,
-      prev: row.prev ? JSON.parse(row.prev as string) : null,
-      ts: row.ts as string,
-      bookmark: (row.bookmark as string) ?? null,
+    return rows.map((row) => ({
+      id: getNumber(row as SqlRow, 'id'),
+      collection: getString(row as SqlRow, 'collection'),
+      docId: getString(row as SqlRow, 'doc_id'),
+      op: getString(row as SqlRow, 'op') as 'insert' | 'update' | 'delete',
+      data: getOptionalJson<Record<string, unknown>>(row as SqlRow, 'data'),
+      prev: getOptionalJson<Record<string, unknown>>(row as SqlRow, 'prev'),
+      ts: getString(row as SqlRow, 'ts'),
+      bookmark: getOptionalString(row as SqlRow, 'bookmark'),
     }))
   }
 
@@ -596,8 +591,8 @@ export class CDCProcessorDO extends DurableObject<Env> {
       path: deltaPath,
       createdAt: new Date().toISOString(),
       eventCount: deltas.length,
-      minTs: timestamps[0],
-      maxTs: timestamps[timestamps.length - 1],
+      minTs: timestamps[0] ?? '',
+      maxTs: timestamps[timestamps.length - 1] ?? '',
     }
     manifest.deltas.push(newDeltaRef)
     manifest.deltaSequence = newSequence
@@ -616,7 +611,7 @@ export class CDCProcessorDO extends DurableObject<Env> {
       `SELECT COUNT(*) as cnt FROM cdc_state WHERE collection = ? AND deleted = 0`,
       collection,
     )]
-    manifest.stats.totalDocs = (countRows[0] as Record<string, unknown>).cnt as number
+    manifest.stats.totalDocs = getNumber(countRows[0] as SqlRow, 'cnt')
 
     // Infer schema from first document with data
     for (const delta of deltas) {
@@ -662,7 +657,7 @@ export class CDCProcessorDO extends DurableObject<Env> {
       `SELECT COUNT(*) as cnt FROM pending_deltas WHERE collection = ?`,
       collection,
     )]
-    const pendingCount = (countRows[0] as Record<string, unknown>).cnt as number
+    const pendingCount = getNumber(countRows[0] as SqlRow, 'cnt')
 
     // Get last event timestamp from pending deltas or documents
     let lastEventTs: string | null = null
@@ -670,12 +665,12 @@ export class CDCProcessorDO extends DurableObject<Env> {
       `SELECT MAX(ts) as max_ts FROM pending_deltas WHERE collection = ?`,
       collection,
     )]
-    const maxPendingTs = (tsRows[0] as Record<string, unknown>).max_ts as string | null
+    const maxPendingTs = getOptionalString(tsRows[0] as SqlRow, 'max_ts')
     if (maxPendingTs) {
       lastEventTs = maxPendingTs
     } else if (documents.length > 0) {
       const timestamps = documents.map((d) => d.lastUpdated).sort()
-      lastEventTs = timestamps[timestamps.length - 1]
+      lastEventTs = timestamps[timestamps.length - 1] ?? null
     }
 
     return {
@@ -689,7 +684,7 @@ export class CDCProcessorDO extends DurableObject<Env> {
   /**
    * Get the manifest for a collection
    */
-  async getManifest(collection: string): Promise<CollectionManifest | null> {
+  async getManifest(collection: string): Promise<ProcessorManifest | null> {
     this.ensureInitialized()
 
     const manifest = this.loadManifest(collection)

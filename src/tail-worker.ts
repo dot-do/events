@@ -159,7 +159,7 @@ export default {
       let durationMs: number | undefined
       if (trace.eventTimestamp && trace.logs.length > 0) {
         const lastLog = trace.logs[trace.logs.length - 1]
-        if (lastLog.timestamp) {
+        if (lastLog?.timestamp) {
           durationMs = lastLog.timestamp - trace.eventTimestamp
         }
       }

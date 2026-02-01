@@ -51,9 +51,11 @@ function bufferToHex(buffer: ArrayBuffer): string {
  * Computes HMAC-SHA256 of the given message with the secret
  */
 async function hmacSha256(secret: string, message: string): Promise<string> {
-  const key = await crypto.subtle.importKey('raw', encodeString(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const secretBytes = encodeString(secret)
+  const messageBytes = encodeString(message)
+  const key = await crypto.subtle.importKey('raw', secretBytes.buffer as ArrayBuffer, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
 
-  const signature = await crypto.subtle.sign('HMAC', key, encodeString(message))
+  const signature = await crypto.subtle.sign('HMAC', key, messageBytes.buffer as ArrayBuffer)
 
   return bufferToHex(signature)
 }
@@ -77,7 +79,7 @@ async function timingSafeEqual(a: string, b: string): Promise<boolean> {
   // XOR all bytes and accumulate - constant time operation
   let result = 0
   for (let i = 0; i < aBytes.length; i++) {
-    result |= aBytes[i] ^ bBytes[i]
+    result |= (aBytes[i] ?? 0) ^ (bBytes[i] ?? 0)
   }
 
   // Also check original lengths match
@@ -184,7 +186,7 @@ function parseStripeHeader(header: string): { timestamp: number | null; signatur
 
   for (const part of parts) {
     const [key, value] = part.split('=')
-    if (key === 't') {
+    if (key === 't' && value !== undefined) {
       const parsed = parseInt(value, 10)
       timestamp = isNaN(parsed) ? null : parsed
     } else if (key === 'v1' && value) {
@@ -295,7 +297,7 @@ function parseWorkOSHeader(header: string): { timestamp: number | null; signatur
 
   for (const part of parts) {
     const [key, value] = part.split('=')
-    if (key === 'timestamp') {
+    if (key === 'timestamp' && value !== undefined) {
       const parsed = parseInt(value, 10)
       timestamp = isNaN(parsed) ? null : parsed
     } else if (key === 'signature' && value) {
@@ -644,16 +646,17 @@ export async function verifySvixSignature(
 
   // Compute expected signature: HMAC-SHA256("{msg_id}.{timestamp}.{body}")
   const signedPayload = `${messageId}.${timestamp}.${payload}`
+  const signedPayloadBytes = encodeString(signedPayload)
 
-  const key = await crypto.subtle.importKey('raw', secretBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const key = await crypto.subtle.importKey('raw', secretBytes.buffer as ArrayBuffer, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
 
-  const expectedSigBuffer = await crypto.subtle.sign('HMAC', key, encodeString(signedPayload))
+  const expectedSigBuffer = await crypto.subtle.sign('HMAC', key, signedPayloadBytes.buffer as ArrayBuffer)
 
   // Convert to base64 for comparison
   const expectedSigBytes = new Uint8Array(expectedSigBuffer)
   let binary = ''
   for (let i = 0; i < expectedSigBytes.length; i++) {
-    binary += String.fromCharCode(expectedSigBytes[i])
+    binary += String.fromCharCode(expectedSigBytes[i]!)
   }
   const expectedSigBase64 = btoa(binary)
 
@@ -693,14 +696,15 @@ export async function generateSvixSignature(
 
   // Compute signature
   const signedPayload = `${messageId}.${timestamp}.${payload}`
-  const key = await crypto.subtle.importKey('raw', secretBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
-  const sigBuffer = await crypto.subtle.sign('HMAC', key, encodeString(signedPayload))
+  const signedPayloadBytes = encodeString(signedPayload)
+  const key = await crypto.subtle.importKey('raw', secretBytes.buffer as ArrayBuffer, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const sigBuffer = await crypto.subtle.sign('HMAC', key, signedPayloadBytes.buffer as ArrayBuffer)
 
   // Convert to base64
   const sigBytes = new Uint8Array(sigBuffer)
   let binary = ''
   for (let i = 0; i < sigBytes.length; i++) {
-    binary += String.fromCharCode(sigBytes[i])
+    binary += String.fromCharCode(sigBytes[i]!)
   }
   const sigBase64 = btoa(binary)
 

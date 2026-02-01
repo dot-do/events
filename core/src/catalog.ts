@@ -12,6 +12,15 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
+import {
+  getString,
+  getNumber,
+  getOptionalString,
+  getOptionalNumber,
+  getJson,
+  getOptionalJson,
+  type SqlRow,
+} from './sql-mapper.js'
 
 // Env type - users should extend this for their specific bindings
 // eslint-disable-next-line @typescript-eslint/no-empty-interface
@@ -25,6 +34,36 @@ export interface TableSchema {
   schemaId: number
   fields: SchemaField[]
   createdAt: string
+}
+
+/** Represents a change to a single field in a schema */
+export interface FieldChange {
+  field: string
+  changeType: 'added' | 'removed' | 'modified'
+  oldType?: SchemaField['type']
+  newType?: SchemaField['type']
+  oldNullable?: boolean
+  newNullable?: boolean
+}
+
+/** Represents a schema change event */
+export interface SchemaChange {
+  changeId: string
+  fromVersion: number
+  toVersion: number
+  changes: FieldChange[]
+  timestamp: string
+  /** Optional: what triggered this change (e.g., snapshot commit, manual evolution) */
+  trigger?: 'snapshot' | 'manual' | 'auto-detect'
+}
+
+/** Represents a version of a schema with its history */
+export interface SchemaVersion {
+  version: number
+  fields: SchemaField[]
+  createdAt: string
+  /** The change that created this version (null for initial version) */
+  change?: SchemaChange
 }
 
 export interface SchemaField {
@@ -164,10 +203,24 @@ export class CatalogDO extends DurableObject<Env> {
         FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
       );
 
+      CREATE TABLE IF NOT EXISTS schema_history (
+        id TEXT PRIMARY KEY,
+        table_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        fields TEXT NOT NULL,
+        from_version INTEGER,
+        changes TEXT,
+        trigger TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (table_id) REFERENCES tables(id),
+        UNIQUE(table_id, version)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_tables_namespace ON tables(namespace);
       CREATE INDEX IF NOT EXISTS idx_snapshots_table ON snapshots(table_id);
       CREATE INDEX IF NOT EXISTS idx_files_table ON data_files(table_id);
       CREATE INDEX IF NOT EXISTS idx_files_snapshot ON data_files(snapshot_id);
+      CREATE INDEX IF NOT EXISTS idx_schema_history_table ON schema_history(table_id);
     `)
   }
 
@@ -185,7 +238,7 @@ export class CatalogDO extends DurableObject<Env> {
 
   async listNamespaces(): Promise<string[]> {
     const rows = this.sql.exec(`SELECT name FROM namespaces ORDER BY name`).toArray()
-    return rows.map((r) => r.name as string)
+    return rows.map((r) => getString(r as SqlRow, 'name'))
   }
 
   async dropNamespace(name: string): Promise<void> {
@@ -194,7 +247,7 @@ export class CatalogDO extends DurableObject<Env> {
       `SELECT COUNT(*) as count FROM tables WHERE namespace = ?`,
       name
     ).one()
-    if ((tables?.count as number) > 0) {
+    if (tables && getNumber(tables as SqlRow, 'count') > 0) {
       throw new Error(`Namespace ${name} is not empty`)
     }
     this.sql.exec(`DELETE FROM namespaces WHERE name = ?`, name)
@@ -253,7 +306,7 @@ export class CatalogDO extends DurableObject<Env> {
       namespace,
       name
     ).one()
-    return row ? JSON.parse(row.metadata as string) : null
+    return row ? getJson<TableMetadata>(row as SqlRow, 'metadata') : null
   }
 
   async listTables(namespace: string): Promise<string[]> {
@@ -261,7 +314,7 @@ export class CatalogDO extends DurableObject<Env> {
       `SELECT name FROM tables WHERE namespace = ? ORDER BY name`,
       namespace
     ).toArray()
-    return rows.map((r) => r.name as string)
+    return rows.map((r) => getString(r as SqlRow, 'name'))
   }
 
   async dropTable(namespace: string, name: string): Promise<void> {
@@ -285,12 +338,19 @@ export class CatalogDO extends DurableObject<Env> {
     options: {
       operation?: 'append' | 'overwrite'
       cdcBookmark?: string
+      /** Skip schema evolution check (default: false) */
+      skipSchemaEvolution?: boolean
     } = {}
   ): Promise<Snapshot> {
     const table = await this.loadTable(namespace, tableName)
     if (!table) throw new Error(`Table ${namespace}.${tableName} not found`)
 
-    const { operation = 'append', cdcBookmark } = options
+    const { operation = 'append', cdcBookmark, skipSchemaEvolution = false } = options
+
+    // Check for schema evolution if files have column stats
+    if (!skipSchemaEvolution) {
+      await this.checkSchemaEvolution(namespace, tableName, files)
+    }
 
     const snapshotId = crypto.randomUUID()
     const timestampMs = Date.now()
@@ -309,12 +369,12 @@ export class CatalogDO extends DurableObject<Env> {
         addedRecords,
         deletedRecords: 0,
         totalRecords: addedRecords + (table.snapshots.length > 0
-          ? table.snapshots[table.snapshots.length - 1].summary.totalRecords
+          ? (table.snapshots[table.snapshots.length - 1]?.summary.totalRecords ?? 0)
           : 0),
         addedFiles: files.length,
         deletedFiles: 0,
         totalFiles: files.length + (table.snapshots.length > 0
-          ? table.snapshots[table.snapshots.length - 1].summary.totalFiles
+          ? (table.snapshots[table.snapshots.length - 1]?.summary.totalFiles ?? 0)
           : 0),
       },
       cdcBookmark,
@@ -387,13 +447,13 @@ export class CatalogDO extends DurableObject<Env> {
     if (!row) return null
 
     return {
-      snapshotId: row.id as string,
-      parentSnapshotId: row.parent_id as string | undefined,
-      timestampMs: row.timestamp_ms as number,
-      operation: row.operation as Snapshot['operation'],
-      manifestList: JSON.parse(row.manifest_list as string),
-      summary: JSON.parse(row.summary as string),
-      cdcBookmark: row.cdc_bookmark as string | undefined,
+      snapshotId: getString(row as SqlRow, 'id'),
+      parentSnapshotId: getOptionalString(row as SqlRow, 'parent_id') ?? undefined,
+      timestampMs: getNumber(row as SqlRow, 'timestamp_ms'),
+      operation: getString(row as SqlRow, 'operation') as Snapshot['operation'],
+      manifestList: getJson<string[]>(row as SqlRow, 'manifest_list'),
+      summary: getJson<Snapshot['summary']>(row as SqlRow, 'summary'),
+      cdcBookmark: getOptionalString(row as SqlRow, 'cdc_bookmark') ?? undefined,
     }
   }
 
@@ -416,13 +476,13 @@ export class CatalogDO extends DurableObject<Env> {
     if (!row) return null
 
     return {
-      snapshotId: row.id as string,
-      parentSnapshotId: row.parent_id as string | undefined,
-      timestampMs: row.timestamp_ms as number,
-      operation: row.operation as Snapshot['operation'],
-      manifestList: JSON.parse(row.manifest_list as string),
-      summary: JSON.parse(row.summary as string),
-      cdcBookmark: row.cdc_bookmark as string | undefined,
+      snapshotId: getString(row as SqlRow, 'id'),
+      parentSnapshotId: getOptionalString(row as SqlRow, 'parent_id') ?? undefined,
+      timestampMs: getNumber(row as SqlRow, 'timestamp_ms'),
+      operation: getString(row as SqlRow, 'operation') as Snapshot['operation'],
+      manifestList: getJson<string[]>(row as SqlRow, 'manifest_list'),
+      summary: getJson<Snapshot['summary']>(row as SqlRow, 'summary'),
+      cdcBookmark: getOptionalString(row as SqlRow, 'cdc_bookmark') ?? undefined,
     }
   }
 
@@ -448,13 +508,13 @@ export class CatalogDO extends DurableObject<Env> {
     ).toArray()
 
     return rows.map((r) => ({
-      path: r.path as string,
-      format: r.format as 'parquet' | 'jsonl',
-      recordCount: r.record_count as number,
-      fileSizeBytes: r.file_size_bytes as number,
-      columnStats: r.column_stats ? JSON.parse(r.column_stats as string) : undefined,
-      partitionValues: r.partition_values ? JSON.parse(r.partition_values as string) : undefined,
-      createdAt: r.created_at as string,
+      path: getString(r as SqlRow, 'path'),
+      format: getString(r as SqlRow, 'format') as 'parquet' | 'jsonl',
+      recordCount: getNumber(r as SqlRow, 'record_count'),
+      fileSizeBytes: getNumber(r as SqlRow, 'file_size_bytes'),
+      columnStats: getOptionalJson<Record<string, ColumnStats>>(r as SqlRow, 'column_stats') ?? undefined,
+      partitionValues: getOptionalJson<Record<string, string>>(r as SqlRow, 'partition_values') ?? undefined,
+      createdAt: getOptionalString(r as SqlRow, 'created_at') ?? new Date().toISOString(),
     }))
   }
 
@@ -495,7 +555,7 @@ export class CatalogDO extends DurableObject<Env> {
     if (files.length === 0) return ''
 
     const paths = files.map((f) => `'${f.path}'`).join(', ')
-    const format = files[0].format
+    const format = files[0]!.format
 
     let sql: string
     if (format === 'parquet') {
@@ -513,6 +573,274 @@ export class CatalogDO extends DurableObject<Env> {
     }
 
     return sql
+  }
+
+  // ---------------------------------------------------------------------------
+  // Schema Evolution
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Get the full schema history for a table
+   */
+  async getSchemaHistory(namespace: string, tableName: string): Promise<SchemaVersion[]> {
+    const table = await this.loadTable(namespace, tableName)
+    if (!table) return []
+
+    const rows = this.sql.exec(
+      `SELECT * FROM schema_history WHERE table_id = ? ORDER BY version ASC`,
+      table.tableId
+    ).toArray()
+
+    // If no history in schema_history table, fall back to table metadata
+    if (rows.length === 0) {
+      return table.schemas.map((s) => ({
+        version: s.schemaId,
+        fields: s.fields,
+        createdAt: s.createdAt,
+      }))
+    }
+
+    return rows.map((r) => {
+      const change = getOptionalJson<FieldChange[]>(r as SqlRow, 'changes')
+      return {
+        version: getNumber(r as SqlRow, 'version'),
+        fields: getJson<SchemaField[]>(r as SqlRow, 'fields'),
+        createdAt: getOptionalString(r as SqlRow, 'created_at') ?? new Date().toISOString(),
+        change: change ? {
+          changeId: getString(r as SqlRow, 'id'),
+          fromVersion: getOptionalNumber(r as SqlRow, 'from_version') ?? 0,
+          toVersion: getNumber(r as SqlRow, 'version'),
+          changes: change,
+          timestamp: getString(r as SqlRow, 'created_at'),
+          trigger: getOptionalString(r as SqlRow, 'trigger') as SchemaChange['trigger'],
+        } : undefined,
+      }
+    })
+  }
+
+  /**
+   * Detect differences between two schemas
+   */
+  private detectSchemaChanges(
+    oldFields: SchemaField[],
+    newFields: SchemaField[]
+  ): FieldChange[] {
+    const changes: FieldChange[] = []
+    const oldFieldMap = new Map(oldFields.map((f) => [f.name, f]))
+    const newFieldMap = new Map(newFields.map((f) => [f.name, f]))
+
+    // Check for added and modified fields
+    for (const newField of newFields) {
+      const oldField = oldFieldMap.get(newField.name)
+      if (!oldField) {
+        changes.push({
+          field: newField.name,
+          changeType: 'added',
+          newType: newField.type,
+          newNullable: newField.nullable,
+        })
+      } else if (oldField.type !== newField.type || oldField.nullable !== newField.nullable) {
+        changes.push({
+          field: newField.name,
+          changeType: 'modified',
+          oldType: oldField.type,
+          newType: newField.type,
+          oldNullable: oldField.nullable,
+          newNullable: newField.nullable,
+        })
+      }
+    }
+
+    // Check for removed fields
+    for (const oldField of oldFields) {
+      if (!newFieldMap.has(oldField.name)) {
+        changes.push({
+          field: oldField.name,
+          changeType: 'removed',
+          oldType: oldField.type,
+          oldNullable: oldField.nullable,
+        })
+      }
+    }
+
+    return changes
+  }
+
+  /**
+   * Evolve schema by adding new fields detected from data
+   * Returns the new schema version if changes were made, null otherwise
+   */
+  async evolveSchema(
+    namespace: string,
+    tableName: string,
+    detectedFields: SchemaField[],
+    trigger: SchemaChange['trigger'] = 'auto-detect'
+  ): Promise<SchemaVersion | null> {
+    const table = await this.loadTable(namespace, tableName)
+    if (!table) throw new Error(`Table ${namespace}.${tableName} not found`)
+
+    const currentSchema = table.schemas[table.currentSchemaId]
+    if (!currentSchema) throw new Error(`No current schema found for table ${namespace}.${tableName}`)
+
+    // Merge current fields with detected fields (detected fields can add new ones)
+    const currentFieldMap = new Map(currentSchema.fields.map((f) => [f.name, f]))
+    const mergedFields = [...currentSchema.fields]
+
+    for (const detected of detectedFields) {
+      if (!currentFieldMap.has(detected.name)) {
+        mergedFields.push({
+          ...detected,
+          nullable: true, // New fields should be nullable for backward compatibility
+        })
+      }
+    }
+
+    // Check if there are any changes
+    const changes = this.detectSchemaChanges(currentSchema.fields, mergedFields)
+    if (changes.length === 0) {
+      return null // No evolution needed
+    }
+
+    const now = new Date().toISOString()
+    const newVersion = table.currentSchemaId + 1
+    const changeId = crypto.randomUUID()
+
+    // Record the schema change in history
+    this.sql.exec(
+      `INSERT INTO schema_history (id, table_id, version, fields, from_version, changes, trigger)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      changeId,
+      table.tableId,
+      newVersion,
+      JSON.stringify(mergedFields),
+      table.currentSchemaId,
+      JSON.stringify(changes),
+      trigger
+    )
+
+    // Update table metadata
+    const newSchema: TableSchema = {
+      schemaId: newVersion,
+      fields: mergedFields,
+      createdAt: now,
+    }
+    table.schemas.push(newSchema)
+    table.currentSchemaId = newVersion
+    table.updatedAt = now
+
+    this.sql.exec(
+      `UPDATE tables SET metadata = ?, updated_at = ? WHERE id = ?`,
+      JSON.stringify(table),
+      table.updatedAt,
+      table.tableId
+    )
+
+    return {
+      version: newVersion,
+      fields: mergedFields,
+      createdAt: now,
+      change: {
+        changeId,
+        fromVersion: table.currentSchemaId - 1, // Previous version
+        toVersion: newVersion,
+        changes,
+        timestamp: now,
+        trigger,
+      },
+    }
+  }
+
+  /**
+   * Infer schema from column stats (useful during snapshot commit)
+   */
+  private inferFieldsFromColumnStats(columnStats: Record<string, ColumnStats>): SchemaField[] {
+    const fields: SchemaField[] = []
+    for (const [name, stats] of Object.entries(columnStats)) {
+      let type: SchemaField['type'] = 'json'
+
+      // Infer type from min/max values
+      if (stats.minValue !== undefined) {
+        if (typeof stats.minValue === 'number') {
+          type = Number.isInteger(stats.minValue) ? 'int64' : 'double'
+        } else if (typeof stats.minValue === 'string') {
+          // Check if it looks like a timestamp
+          if (/^\d{4}-\d{2}-\d{2}/.test(stats.minValue)) {
+            type = 'timestamp'
+          } else {
+            type = 'string'
+          }
+        }
+      }
+
+      fields.push({
+        name,
+        type,
+        nullable: (stats.nullCount ?? 0) > 0,
+      })
+    }
+    return fields
+  }
+
+  /**
+   * Check and evolve schema during snapshot commit if new fields are detected
+   */
+  async checkSchemaEvolution(
+    namespace: string,
+    tableName: string,
+    files: DataFile[]
+  ): Promise<SchemaVersion | null> {
+    // Collect all unique column names from file stats
+    const detectedFields: SchemaField[] = []
+    const seenFields = new Set<string>()
+
+    for (const file of files) {
+      if (file.columnStats) {
+        const inferred = this.inferFieldsFromColumnStats(file.columnStats)
+        for (const field of inferred) {
+          if (!seenFields.has(field.name)) {
+            seenFields.add(field.name)
+            detectedFields.push(field)
+          }
+        }
+      }
+    }
+
+    if (detectedFields.length === 0) {
+      return null
+    }
+
+    return this.evolveSchema(namespace, tableName, detectedFields, 'snapshot')
+  }
+
+  /**
+   * Record initial schema in history (call after createTable)
+   */
+  async recordInitialSchema(namespace: string, tableName: string): Promise<void> {
+    const table = await this.loadTable(namespace, tableName)
+    if (!table) return
+
+    const currentSchema = table.schemas[0]
+    if (!currentSchema) return
+
+    // Check if already recorded
+    const existing = this.sql.exec(
+      `SELECT id FROM schema_history WHERE table_id = ? AND version = 0`,
+      table.tableId
+    ).one()
+
+    if (existing) return
+
+    this.sql.exec(
+      `INSERT INTO schema_history (id, table_id, version, fields, from_version, changes, trigger)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      crypto.randomUUID(),
+      table.tableId,
+      0,
+      JSON.stringify(currentSchema.fields),
+      null,
+      null,
+      'manual'
+    )
   }
 }
 

@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readParquetRecords, mergeParquetRecords, writeCompactedParquet, listFilesForCompaction } from '../compaction.js'
-import { parquetWriteBuffer } from 'hyparquet-writer'
+import { parquetWriteBuffer } from '@dotdo/hyparquet-writer'
 
 /**
  * Creates a test Parquet buffer with the given records

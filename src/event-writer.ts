@@ -10,7 +10,7 @@
  * - VARIANT column for payload (efficient semi-structured storage)
  */
 
-import { parquetWriteBuffer, createVariantColumn } from 'hyparquet-writer'
+import { parquetWriteBuffer, createVariantColumn } from '@dotdo/hyparquet-writer'
 import { ulid } from '../core/src/ulid'
 
 export { ulid }

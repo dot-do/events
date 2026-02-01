@@ -21,7 +21,7 @@ import {
   type RetentionPolicy,
   type SnapshotManifest,
 } from '../cdc-snapshot.js'
-import { parquetWriteBuffer } from 'hyparquet-writer'
+import { parquetWriteBuffer } from '@dotdo/hyparquet-writer'
 
 // ============================================================================
 // Mock Factories

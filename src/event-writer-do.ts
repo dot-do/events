@@ -82,7 +82,7 @@ export class EventWriterDO extends DurableObject<Env> {
     // Extract shard ID from DO name (e.g., "events:shard-2" -> 2)
     const name = ctx.id.toString()
     const match = name.match(/:shard-(\d+)$/)
-    this.shardId = match ? parseInt(match[1], 10) : 0
+    this.shardId = match?.[1] ? parseInt(match[1], 10) : 0
 
     // Restore any persisted buffer from storage (survives DO eviction)
     ctx.blockConcurrencyWhile(async () => {

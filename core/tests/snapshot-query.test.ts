@@ -18,6 +18,7 @@ import {
   buildLatencyQuery,
   buildPITRRangeQuery,
   type QueryOptions,
+  type OrderBy,
 } from '../src/query'
 import { deleteSnapshot } from '../src/snapshot'
 
@@ -715,12 +716,39 @@ describe('buildQuery', () => {
   it('uses custom orderBy when provided', () => {
     const options: QueryOptions = {
       bucket: 'my-events',
-      orderBy: 'durationMs ASC',
+      orderBy: 'ts ASC',
     }
 
     const query = buildQuery(options)
 
-    expect(query).toContain('ORDER BY durationMs ASC')
+    expect(query).toContain('ORDER BY ts ASC')
+  })
+
+  it('rejects invalid orderBy column', () => {
+    expect(() => buildQuery({
+      bucket: 'my-events',
+      // @ts-expect-error Testing runtime validation of invalid column
+      orderBy: 'durationMs ASC',
+    })).toThrow('Invalid orderBy column: "durationMs"')
+  })
+
+  it('rejects invalid orderBy direction', () => {
+    expect(() => buildQuery({
+      bucket: 'my-events',
+      // @ts-expect-error Testing runtime validation of invalid direction
+      orderBy: 'ts ASCENDING',
+    })).toThrow('Invalid orderBy direction: "ASCENDING"')
+  })
+
+  it('accepts orderBy with column only (no direction)', () => {
+    const options: QueryOptions = {
+      bucket: 'my-events',
+      orderBy: 'type',
+    }
+
+    const query = buildQuery(options)
+
+    expect(query).toContain('ORDER BY type')
   })
 
   it('adds LIMIT clause when specified', () => {

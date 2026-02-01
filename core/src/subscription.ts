@@ -13,6 +13,14 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import { findMatchingSubscriptions } from './pattern-matcher.js'
+import {
+  getString,
+  getNumber,
+  getBoolean,
+  getOptionalString,
+  getOptionalNumber,
+  type SqlRow,
+} from './sql-mapper.js'
 import { ulid } from './ulid.js'
 
 // ============================================================================
@@ -515,8 +523,8 @@ export class SubscriptionDO extends DurableObject<Env> {
       return { retrying: false, deadLettered: false }
     }
 
-    const delivery = this.rowToDelivery(deliveryRow)
-    const maxRetries = deliveryRow.max_retries as number
+    const delivery = this.rowToDelivery(deliveryRow as SqlRow)
+    const maxRetries = getNumber(deliveryRow as SqlRow, 'max_retries')
     const newAttemptCount = delivery.attemptCount + 1
 
     // Log the failed attempt
@@ -622,15 +630,15 @@ export class SubscriptionDO extends DurableObject<Env> {
       subscriptionId
     ).one()
 
-    const totalDelivered = (deliveredRow?.count as number) || 0
-    const totalAttempts = (totalAttemptsRow?.total as number) || 0
+    const totalDelivered = pendingRow ? getNumber(deliveredRow as SqlRow, 'count') : 0
+    const totalAttempts = totalAttemptsRow ? getOptionalNumber(totalAttemptsRow as SqlRow, 'total') ?? 0 : 0
 
     return {
       subscription,
       stats: {
-        pendingDeliveries: (pendingRow?.count as number) || 0,
-        failedDeliveries: (failedRow?.count as number) || 0,
-        deadLetters: (deadRow?.count as number) || 0,
+        pendingDeliveries: pendingRow ? getNumber(pendingRow as SqlRow, 'count') : 0,
+        failedDeliveries: failedRow ? getNumber(failedRow as SqlRow, 'count') : 0,
+        deadLetters: deadRow ? getNumber(deadRow as SqlRow, 'count') : 0,
         successRate: totalAttempts > 0 ? totalDelivered / totalAttempts : 0,
         totalDelivered,
         totalAttempts,
@@ -652,14 +660,14 @@ export class SubscriptionDO extends DurableObject<Env> {
     ).toArray()
 
     return rows.map(row => ({
-      id: row.id as string,
-      deliveryId: row.delivery_id as string,
-      subscriptionId: row.subscription_id as string,
-      eventId: row.event_id as string,
-      eventPayload: row.event_payload as string,
-      reason: row.reason as string,
-      lastError: row.last_error as string | undefined,
-      createdAt: row.created_at as number,
+      id: getString(row as SqlRow, 'id'),
+      deliveryId: getString(row as SqlRow, 'delivery_id'),
+      subscriptionId: getString(row as SqlRow, 'subscription_id'),
+      eventId: getString(row as SqlRow, 'event_id'),
+      eventPayload: getString(row as SqlRow, 'event_payload'),
+      reason: getString(row as SqlRow, 'reason'),
+      lastError: getOptionalString(row as SqlRow, 'last_error') ?? undefined,
+      createdAt: getNumber(row as SqlRow, 'created_at'),
     }))
   }
 
@@ -688,10 +696,10 @@ export class SubscriptionDO extends DurableObject<Env> {
 
     // Create a new delivery
     const result = await this.createDelivery({
-      subscriptionId: row.subscription_id as string,
-      eventId: `${row.event_id}-retry-${Date.now()}`,
-      eventType: deliveryRow.event_type as string,
-      eventPayload: JSON.parse(row.event_payload as string),
+      subscriptionId: getString(row as SqlRow, 'subscription_id'),
+      eventId: `${getString(row as SqlRow, 'event_id')}-retry-${Date.now()}`,
+      eventType: getString(deliveryRow as SqlRow, 'event_type'),
+      eventPayload: JSON.parse(getString(row as SqlRow, 'event_payload')),
     })
 
     if (result.ok) {
@@ -715,15 +723,15 @@ export class SubscriptionDO extends DurableObject<Env> {
     ).toArray()
 
     return rows.map(row => ({
-      id: row.id as string,
-      deliveryId: row.delivery_id as string,
-      subscriptionId: row.subscription_id as string,
-      attemptNumber: row.attempt_number as number,
-      status: row.status as string,
-      durationMs: row.duration_ms as number | undefined,
-      errorMessage: row.error_message as string | undefined,
-      workerResponse: row.worker_response as string | undefined,
-      createdAt: row.created_at as number,
+      id: getString(row as SqlRow, 'id'),
+      deliveryId: getString(row as SqlRow, 'delivery_id'),
+      subscriptionId: getString(row as SqlRow, 'subscription_id'),
+      attemptNumber: getNumber(row as SqlRow, 'attempt_number'),
+      status: getString(row as SqlRow, 'status'),
+      durationMs: getOptionalNumber(row as SqlRow, 'duration_ms') ?? undefined,
+      errorMessage: getOptionalString(row as SqlRow, 'error_message') ?? undefined,
+      workerResponse: getOptionalString(row as SqlRow, 'worker_response') ?? undefined,
+      createdAt: getNumber(row as SqlRow, 'created_at'),
     }))
   }
 
@@ -813,38 +821,38 @@ export class SubscriptionDO extends DurableObject<Env> {
   /**
    * Convert database row to Subscription object
    */
-  private rowToSubscription(row: Record<string, unknown>): Subscription {
+  private rowToSubscription(row: SqlRow): Subscription {
     return {
-      id: row.id as string,
-      workerId: row.worker_id as string,
-      workerBinding: row.worker_binding as string | undefined,
-      pattern: row.pattern as string,
-      patternPrefix: row.pattern_prefix as string,
-      rpcMethod: row.rpc_method as string,
-      maxRetries: row.max_retries as number,
-      timeoutMs: row.timeout_ms as number,
-      active: row.active === 1,
-      createdAt: row.created_at as number,
-      updatedAt: row.updated_at as number,
+      id: getString(row, 'id'),
+      workerId: getString(row, 'worker_id'),
+      workerBinding: getOptionalString(row, 'worker_binding') ?? undefined,
+      pattern: getString(row, 'pattern'),
+      patternPrefix: getString(row, 'pattern_prefix'),
+      rpcMethod: getString(row, 'rpc_method'),
+      maxRetries: getNumber(row, 'max_retries'),
+      timeoutMs: getNumber(row, 'timeout_ms'),
+      active: getBoolean(row, 'active'),
+      createdAt: getNumber(row, 'created_at'),
+      updatedAt: getNumber(row, 'updated_at'),
     }
   }
 
   /**
    * Convert database row to Delivery object
    */
-  private rowToDelivery(row: Record<string, unknown>): Delivery {
+  private rowToDelivery(row: SqlRow): Delivery {
     return {
-      id: row.id as string,
-      subscriptionId: row.subscription_id as string,
-      eventId: row.event_id as string,
-      eventType: row.event_type as string,
-      eventPayload: row.event_payload as string,
-      status: row.status as 'pending' | 'delivered' | 'failed' | 'dead',
-      attemptCount: row.attempt_count as number,
-      nextAttemptAt: row.next_attempt_at as number | undefined,
-      lastError: row.last_error as string | undefined,
-      createdAt: row.created_at as number,
-      deliveredAt: row.delivered_at as number | undefined,
+      id: getString(row, 'id'),
+      subscriptionId: getString(row, 'subscription_id'),
+      eventId: getString(row, 'event_id'),
+      eventType: getString(row, 'event_type'),
+      eventPayload: getString(row, 'event_payload'),
+      status: getString(row, 'status') as 'pending' | 'delivered' | 'failed' | 'dead',
+      attemptCount: getNumber(row, 'attempt_count'),
+      nextAttemptAt: getOptionalNumber(row, 'next_attempt_at') ?? undefined,
+      lastError: getOptionalString(row, 'last_error') ?? undefined,
+      createdAt: getNumber(row, 'created_at'),
+      deliveredAt: getOptionalNumber(row, 'delivered_at') ?? undefined,
     }
   }
 
@@ -879,9 +887,9 @@ export class SubscriptionDO extends DurableObject<Env> {
       event.type,
       subscriptions.map(s => ({
         ...s,
-        id: s.id as string,
-        pattern: s.pattern as string,
-        patternPrefix: s.pattern_prefix as string,
+        id: getString(s as SqlRow, 'id'),
+        pattern: getString(s as SqlRow, 'pattern'),
+        patternPrefix: getString(s as SqlRow, 'pattern_prefix'),
       }))
     )
 
@@ -950,21 +958,21 @@ export class SubscriptionDO extends DurableObject<Env> {
     }
 
     const startTime = performance.now()
-    const attemptNumber = (delivery.attempt_count as number) + 1
+    const attemptNumber = getNumber(delivery as SqlRow, 'attempt_count') + 1
 
     try {
       let response: unknown
 
       // Try RPC via service binding first
-      const workerBinding = delivery.worker_binding as string | null
+      const workerBinding = getOptionalString(delivery as SqlRow, 'worker_binding')
       if (workerBinding && this.env[workerBinding]) {
         const worker = this.env[workerBinding] as { [method: string]: (payload: unknown) => Promise<unknown> }
-        const rpcMethod = delivery.rpc_method as string
+        const rpcMethod = getString(delivery as SqlRow, 'rpc_method')
 
         if (typeof worker[rpcMethod] === 'function') {
-          const timeoutMs = delivery.timeout_ms as number
+          const timeoutMs = getNumber(delivery as SqlRow, 'timeout_ms')
           response = await Promise.race([
-            worker[rpcMethod](JSON.parse(delivery.event_payload as string)),
+            worker[rpcMethod](JSON.parse(getString(delivery as SqlRow, 'event_payload'))),
             new Promise((_, reject) =>
               setTimeout(() => reject(new Error('RPC timeout')), timeoutMs)
             ),
@@ -974,16 +982,16 @@ export class SubscriptionDO extends DurableObject<Env> {
         }
       } else {
         // Fallback to HTTP
-        const workerId = delivery.worker_id as string
-        const rpcMethod = delivery.rpc_method as string
-        const timeoutMs = delivery.timeout_ms as number
+        const workerId = getString(delivery as SqlRow, 'worker_id')
+        const rpcMethod = getString(delivery as SqlRow, 'rpc_method')
+        const timeoutMs = getNumber(delivery as SqlRow, 'timeout_ms')
 
         const httpResponse = await fetch(
           `https://${workerId}.workers.dev/rpc/${rpcMethod}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: delivery.event_payload as string,
+            body: getString(delivery as SqlRow, 'event_payload'),
             signal: AbortSignal.timeout(timeoutMs),
           }
         )
@@ -1006,12 +1014,12 @@ export class SubscriptionDO extends DurableObject<Env> {
       )
 
       // Log success
-      this.logDeliveryAttempt(deliveryId, delivery.subscription_id as string, attemptNumber, 'success', durationMs, null, response)
+      this.logDeliveryAttempt(deliveryId, getString(delivery as SqlRow, 'subscription_id'), attemptNumber, 'success', durationMs, null, response)
 
     } catch (error) {
       const durationMs = Math.round(performance.now() - startTime)
       const errorMessage = error instanceof Error ? error.message : String(error)
-      const maxRetries = delivery.max_retries as number
+      const maxRetries = getNumber(delivery as SqlRow, 'max_retries')
 
       if (attemptNumber < maxRetries) {
         // Schedule retry with exponential backoff
@@ -1053,7 +1061,7 @@ export class SubscriptionDO extends DurableObject<Env> {
       }
 
       // Log failure
-      this.logDeliveryAttempt(deliveryId, delivery.subscription_id as string, attemptNumber, 'failed', durationMs, errorMessage, null)
+      this.logDeliveryAttempt(deliveryId, getString(delivery as SqlRow, 'subscription_id'), attemptNumber, 'failed', durationMs, errorMessage, null)
     }
   }
 
@@ -1086,7 +1094,7 @@ export class SubscriptionDO extends DurableObject<Env> {
 
     if (nextRetry?.next_time) {
       const currentAlarm = await this.ctx.storage.getAlarm()
-      const nextTime = nextRetry.next_time as number
+      const nextTime = getNumber(nextRetry as SqlRow, 'next_time')
 
       // Only set alarm if no alarm or new time is sooner
       if (!currentAlarm || nextTime < currentAlarm) {
@@ -1112,7 +1120,7 @@ export class SubscriptionDO extends DurableObject<Env> {
     ).toArray()
 
     for (const row of ready) {
-      await this.deliverOne(row.id as string)
+      await this.deliverOne(getString(row as SqlRow, 'id'))
     }
 
     // Schedule next alarm if more retries pending

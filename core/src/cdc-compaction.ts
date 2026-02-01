@@ -99,7 +99,7 @@ function extractSequenceNumber(path: string): number {
   // Match pattern: {seq}_{timestamp}.parquet (e.g., "001_2024-01-15T12-30.parquet")
   // or simpler: {seq}.parquet (e.g., "000001.parquet")
   const match = filename.match(/^(\d+)(?:_[^.]+)?\.parquet$/)
-  return match ? parseInt(match[1], 10) : 0
+  return match?.[1] ? parseInt(match[1], 10) : 0
 }
 
 /**

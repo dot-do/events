@@ -66,7 +66,7 @@ function validateWhereClause(where: string): { valid: boolean; reason?: string }
   const columnPattern = /\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=|!=|<>|<=?|>=?|LIKE|IN|IS|BETWEEN)\b/gi
   let match
   while ((match = columnPattern.exec(where)) !== null) {
-    const column = match[1].toLowerCase()
+    const column = match[1]!.toLowerCase()
     // Skip SQL keywords that might match the pattern
     if (['and', 'or', 'not', 'null', 'true', 'false'].includes(column)) {
       continue

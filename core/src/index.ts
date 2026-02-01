@@ -50,7 +50,12 @@ export {
 } from './cdc-delta.js'
 
 // CDC Compaction (delta → data.parquet)
-export type { CompactionDeltaRecord, CompactionOptions, CompactionResult, CollectionManifest } from './cdc-compaction.js'
+export type {
+  CompactionDeltaRecord,
+  CompactionOptions,
+  CompactionResult,
+  CollectionManifest as CompactionManifest,
+} from './cdc-compaction.js'
 export {
   compactCollection,
   applyDeltasToState,
@@ -58,7 +63,7 @@ export {
 } from './cdc-compaction.js'
 
 // CDC Processor (Durable Object)
-export type { ProcessorState, DocumentState } from './cdc-processor.js'
+export type { ProcessorState, DocumentState, ProcessorManifest, DeltaRef } from './cdc-processor.js'
 export { CDCProcessorDO } from './cdc-processor.js'
 
 // CDC Snapshots (PITR - Point-in-time recovery)
@@ -72,7 +77,7 @@ export {
 
 // === Query: DuckDB SQL Builders ===
 
-export type { QueryOptions } from './query.js'
+export type { QueryOptions, OrderByColumn, OrderDirection, OrderBy } from './query.js'
 export { buildQuery, buildHistoryQuery, buildLatencyQuery, buildPITRRangeQuery } from './query.js'
 
 // === Webhooks: Signature Verification ===
@@ -105,6 +110,10 @@ export type {
   Manifest,
   Snapshot,
   TableMetadata,
+  // Schema evolution types
+  FieldChange,
+  SchemaChange,
+  SchemaVersion,
 } from './catalog.js'
 export { CatalogDO } from './catalog.js'
 
@@ -136,6 +145,14 @@ export {
   listFilesForCompaction,
 } from './compaction.js'
 
+// Event stream compaction (hourly files → daily files)
+export type {
+  EventCompactionOptions,
+  DayCompactionResult,
+  EventCompactionResult,
+} from './event-compaction.js'
+export { compactEventStream } from './event-compaction.js'
+
 // === Snapshots: Legacy ===
 
 export type { SnapshotOptions, SnapshotResult } from './snapshot.js'
@@ -145,3 +162,23 @@ export { createSnapshot, restoreSnapshot, listSnapshots, deleteSnapshot } from '
 
 export { ulid } from './ulid.js'
 export { createAsyncBuffer } from './async-buffer.js'
+
+// === SQL Row Mapper ===
+
+export type { SqlRow } from './sql-mapper.js'
+export {
+  SqlTypeError,
+  getString,
+  getNumber,
+  getBoolean,
+  getOptionalString,
+  getOptionalNumber,
+  getOptionalBoolean,
+  getJson,
+  getOptionalJson,
+} from './sql-mapper.js'
+
+// === Browser SDK ===
+// Note: For browser usage, import from '@dotdo/events/browser' for the standalone bundle
+export type { BrowserConfig } from './browser.js'
+export { EventsSDK, init as initBrowser, page, track, identify, flush as flushBrowser } from './browser.js'

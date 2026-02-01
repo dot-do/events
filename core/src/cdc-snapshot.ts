@@ -118,7 +118,7 @@ function parseDailyDate(filename: string): Date | null {
   // Format: YYYY-MM-DD.parquet
   const match = filename.match(/^(\d{4})-(\d{2})-(\d{2})\.parquet$/)
   if (!match) return null
-  return new Date(Date.UTC(parseInt(match[1], 10), parseInt(match[2], 10) - 1, parseInt(match[3], 10)))
+  return new Date(Date.UTC(parseInt(match[1]!, 10), parseInt(match[2]!, 10) - 1, parseInt(match[3]!, 10)))
 }
 
 /**
@@ -129,8 +129,8 @@ function parseMonthlyDate(filename: string): Date | null {
   const match = filename.match(/^(\d{4})-(\d{2})\.parquet$/)
   if (!match) return null
   // Set to end of month for sorting purposes
-  const year = parseInt(match[1], 10)
-  const month = parseInt(match[2], 10)
+  const year = parseInt(match[1]!, 10)
+  const month = parseInt(match[2]!, 10)
   return new Date(Date.UTC(year, month - 1, 1))
 }
 
@@ -211,7 +211,7 @@ function computeChecksum(buffer: ArrayBuffer): string {
   const view = new Uint8Array(buffer)
   let hash = buffer.byteLength
   for (let i = 0; i < Math.min(100, view.length); i++) {
-    hash = ((hash << 5) - hash + view[i]) | 0
+    hash = ((hash << 5) - hash + (view[i] ?? 0)) | 0
   }
   return Math.abs(hash).toString(16)
 }
@@ -372,6 +372,9 @@ async function createMonthlySnapshot(
   // Sort by date and get the last one
   dailySnapshots.sort((a, b) => b.date.getTime() - a.date.getTime())
   const lastDaily = dailySnapshots[0]
+  if (!lastDaily) {
+    throw new Error('No daily snapshots found to convert to monthly')
+  }
 
   // Copy the last daily snapshot as the monthly snapshot
   const dailyObj = await bucket.get(lastDaily.key)

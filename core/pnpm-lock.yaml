@@ -8,12 +8,12 @@ importers:
 
   .:
     dependencies:
+      '@dotdo/hyparquet-writer':
+        specifier: github:dot-do/hyparquet-writer
+        version: hyparquet-writer@https://codeload.github.com/dot-do/hyparquet-writer/tar.gz/590a8ffc319a4d34d27b7c2d653c73c9c85eaffd
       hyparquet:
         specifier: ^1.24.1
         version: 1.24.1
-      hyparquet-writer:
-        specifier: ^0.12.0
-        version: 0.12.0
       picomatch:
         specifier: ^4.0.3
         version: 4.0.3
@@ -21,9 +21,6 @@ importers:
       '@cloudflare/workers-types':
         specifier: ^4.20250121.0
         version: 4.20260124.0
-      '@dotdo/types':
-        specifier: file:../../types
-        version: file:../../types(typescript@5.9.3)
       '@types/picomatch':
         specifier: ^4.0.2
         version: 4.0.2
@@ -41,15 +38,6 @@ packages:
 
   '@cloudflare/workers-types@4.20260124.0':
     resolution: {integrity: sha512-h6TJlew6AtGuEXFc+k5ifalk+tg3fkg0lla6XbMAb2AKKfJGwlFNTwW2xyT/Ha92KY631CIJ+Ace08DPdFohdA==}
-
-  '@dotdo/types@file:../../types':
-    resolution: {directory: ../../types, type: directory}
-    hasBin: true
-    peerDependencies:
-      typescript: '>=5.0.0'
-    peerDependenciesMeta:
-      typescript:
-        optional: true
 
   '@esbuild/aix-ppc64@0.21.5':
     resolution: {integrity: sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==}
@@ -613,8 +601,9 @@ packages:
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
 
-  hyparquet-writer@0.12.0:
-    resolution: {integrity: sha512-HpklbNdmtHgnUXJd10jo1v30oU8gmDhHaIra72wum8zrjVKj/AKOSiPrMtFph3X4ChxiRAUtMfeXnc4CcUM4Tw==}
+  hyparquet-writer@https://codeload.github.com/dot-do/hyparquet-writer/tar.gz/590a8ffc319a4d34d27b7c2d653c73c9c85eaffd:
+    resolution: {tarball: https://codeload.github.com/dot-do/hyparquet-writer/tar.gz/590a8ffc319a4d34d27b7c2d653c73c9c85eaffd}
+    version: 0.12.0
 
   hyparquet@1.24.1:
     resolution: {integrity: sha512-t8mZwSrV7BFhJ0HuXK2dARkPIGqTMfIYmNa2ZhbTIwH/OLFwfNQmXGz1TzCSuX+Nu46KVgmHplc14COq/sMcfA==}
@@ -871,10 +860,6 @@ packages:
 snapshots:
 
   '@cloudflare/workers-types@4.20260124.0': {}
-
-  '@dotdo/types@file:../../types(typescript@5.9.3)':
-    optionalDependencies:
-      typescript: 5.9.3
 
   '@esbuild/aix-ppc64@0.21.5':
     optional: true
@@ -1271,7 +1256,7 @@ snapshots:
   fsevents@2.3.3:
     optional: true
 
-  hyparquet-writer@0.12.0:
+  hyparquet-writer@https://codeload.github.com/dot-do/hyparquet-writer/tar.gz/590a8ffc319a4d34d27b7c2d653c73c9c85eaffd:
     dependencies:
       hyparquet: 1.24.1
 

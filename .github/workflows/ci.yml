@@ -24,13 +24,21 @@ jobs:
         with:
           node-version: 20.x
           cache: pnpm
-          cache-dependency-path: core/pnpm-lock.yaml
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            core/pnpm-lock.yaml
+
+      - name: Install dependencies (root)
+        run: pnpm install --frozen-lockfile
 
       - name: Install dependencies (core)
         run: cd core && pnpm install --frozen-lockfile
 
-      - name: TypeScript check
-        run: cd core && npx tsc --noEmit
+      - name: TypeScript check (worker)
+        run: pnpm exec tsc --noEmit
+
+      - name: TypeScript check (core)
+        run: cd core && pnpm exec tsc --noEmit
 
       - name: Run tests
         run: cd core && pnpm test

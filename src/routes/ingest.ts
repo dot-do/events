@@ -9,6 +9,7 @@ import { getEventBuffer, type EventRecord } from '../event-writer'
 import { ingestWithOverflow } from '../event-writer-do'
 import { ulid } from '../../core/src/ulid'
 import { corsHeaders } from '../utils'
+import { checkRateLimit } from '../middleware/rate-limit'
 
 // ============================================================================
 // Input Validation
@@ -65,6 +66,12 @@ export async function handleIngest(request: Request, env: Env, ctx: ExecutionCon
       { error: 'Invalid batch: must have events array with max 1000 events' },
       { status: 400, headers: corsHeaders() }
     )
+  }
+
+  // Rate limiting check (after batch validation so we know event count)
+  const rateLimitResponse = await checkRateLimit(request, env, batch.events.length)
+  if (rateLimitResponse) {
+    return rateLimitResponse
   }
 
   // Extract optional batchId for deduplication/idempotency
@@ -151,85 +158,98 @@ export async function handleIngest(request: Request, env: Env, ctx: ExecutionCon
       })
     }
 
-    // Optionally send to Queue for real-time consumers
-    if (env.EVENTS_QUEUE) {
+    // Check if queue-based fanout is enabled
+    const useQueueFanout = env.USE_QUEUE_FANOUT === 'true' && env.EVENTS_QUEUE
+
+    if (useQueueFanout) {
+      // Queue-based fanout: send to queue and let the consumer handle CDC/subscription
+      // This provides better scalability and decoupled processing
+      await env.EVENTS_QUEUE!.send(validatedBatch)
+      console.log(`[ingest] Sent ${validatedBatch.events.length} events to queue for fanout`)
+    } else if (env.EVENTS_QUEUE) {
+      // Queue is bound but fanout is disabled - send to queue for real-time consumers only
+      // (CDC/subscription will be handled directly below)
       await env.EVENTS_QUEUE.send(validatedBatch)
     }
   })())
 
   // Fan out CDC events to CDCProcessorDO and all events to SubscriptionDO (non-blocking)
-  ctx.waitUntil((async () => {
-    try {
-      // Collect CDC events (type starts with 'collection.')
-      const cdcEvents = validatedBatch.events.filter(e => e.type.startsWith('collection.'))
+  // Skip this if queue-based fanout is enabled (queue consumer will handle it)
+  const useQueueFanout = env.USE_QUEUE_FANOUT === 'true' && env.EVENTS_QUEUE
+  if (!useQueueFanout) {
+    ctx.waitUntil((async () => {
+      try {
+        // Collect CDC events (type starts with 'collection.')
+        const cdcEvents = validatedBatch.events.filter(e => e.type.startsWith('collection.'))
 
-      if (cdcEvents.length > 0 && env.CDC_PROCESSOR) {
-        // Group CDC events by namespace/collection for routing to the correct DO instance
-        const cdcByKey = new Map<string, CDCEvent[]>()
-        for (const event of cdcEvents) {
-          const cdcEvent = event as unknown as CDCEvent
-          const ns = cdcEvent.do?.class || cdcEvent.do?.name || 'default'
-          const collection = cdcEvent.collection || 'default'
-          const key = `${ns}/${collection}`
-          const existing = cdcByKey.get(key) ?? []
-          existing.push(cdcEvent)
-          cdcByKey.set(key, existing)
+        if (cdcEvents.length > 0 && env.CDC_PROCESSOR) {
+          // Group CDC events by namespace/collection for routing to the correct DO instance
+          const cdcByKey = new Map<string, CDCEvent[]>()
+          for (const event of cdcEvents) {
+            const cdcEvent = event as unknown as CDCEvent
+            const ns = cdcEvent.do?.class || cdcEvent.do?.name || 'default'
+            const collection = cdcEvent.collection || 'default'
+            const key = `${ns}/${collection}`
+            const existing = cdcByKey.get(key) ?? []
+            existing.push(cdcEvent)
+            cdcByKey.set(key, existing)
+          }
+
+          // Send each group to the appropriate CDCProcessorDO instance
+          const cdcPromises = Array.from(cdcByKey.entries()).map(async ([key, events]) => {
+            try {
+              const processorId = env.CDC_PROCESSOR.idFromName(key)
+              const processor = env.CDC_PROCESSOR.get(processorId)
+              await processor.process(events)
+            } catch (err) {
+              console.error(`[ingest] CDC processor error for ${key}:`, err)
+            }
+          })
+          await Promise.all(cdcPromises)
         }
 
-        // Send each group to the appropriate CDCProcessorDO instance
-        const cdcPromises = Array.from(cdcByKey.entries()).map(async ([key, events]) => {
-          try {
-            const processorId = env.CDC_PROCESSOR.idFromName(key)
-            const processor = env.CDC_PROCESSOR.get(processorId)
-            await processor.process(events)
-          } catch (err) {
-            console.error(`[ingest] CDC processor error for ${key}:`, err)
+        // Fan out all events to subscription matching and delivery
+        // Route to per-type-prefix shards (e.g., "collection.*" -> shard "collection")
+        if (env.SUBSCRIPTIONS) {
+          // Group events by shard key (first segment before '.', or 'default')
+          const eventsByShard = new Map<string, typeof validatedBatch.events>()
+          for (const event of validatedBatch.events) {
+            const dotIndex = event.type.indexOf('.')
+            const shardKey = dotIndex > 0 ? event.type.slice(0, dotIndex) : 'default'
+            const existing = eventsByShard.get(shardKey) ?? []
+            existing.push(event)
+            eventsByShard.set(shardKey, existing)
           }
-        })
-        await Promise.all(cdcPromises)
-      }
 
-      // Fan out all events to subscription matching and delivery
-      // Route to per-type-prefix shards (e.g., "collection.*" -> shard "collection")
-      if (env.SUBSCRIPTIONS) {
-        // Group events by shard key (first segment before '.', or 'default')
-        const eventsByShard = new Map<string, typeof validatedBatch.events>()
-        for (const event of validatedBatch.events) {
-          const dotIndex = event.type.indexOf('.')
-          const shardKey = dotIndex > 0 ? event.type.slice(0, dotIndex) : 'default'
-          const existing = eventsByShard.get(shardKey) ?? []
-          existing.push(event)
-          eventsByShard.set(shardKey, existing)
+          // Fan out each group to its corresponding shard
+          const shardPromises = Array.from(eventsByShard.entries()).map(async ([shardKey, events]) => {
+            try {
+              const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
+              const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
+              const fanoutPromises = events.map(async (event) => {
+                try {
+                  await subscriptionDO.fanout({
+                    id: ulid(),
+                    type: event.type,
+                    ts: event.ts,
+                    payload: event,
+                  })
+                } catch (err) {
+                  console.error(`[ingest] Subscription fanout error for event type ${event.type}:`, err)
+                }
+              })
+              await Promise.all(fanoutPromises)
+            } catch (err) {
+              console.error(`[ingest] Subscription shard error for shard ${shardKey}:`, err)
+            }
+          })
+          await Promise.all(shardPromises)
         }
-
-        // Fan out each group to its corresponding shard
-        const shardPromises = Array.from(eventsByShard.entries()).map(async ([shardKey, events]) => {
-          try {
-            const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
-            const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
-            const fanoutPromises = events.map(async (event) => {
-              try {
-                await subscriptionDO.fanout({
-                  id: ulid(),
-                  type: event.type,
-                  ts: event.ts,
-                  payload: event,
-                })
-              } catch (err) {
-                console.error(`[ingest] Subscription fanout error for event type ${event.type}:`, err)
-              }
-            })
-            await Promise.all(fanoutPromises)
-          } catch (err) {
-            console.error(`[ingest] Subscription shard error for shard ${shardKey}:`, err)
-          }
-        })
-        await Promise.all(shardPromises)
+      } catch (err) {
+        console.error('[ingest] CDC/subscription pipeline error:', err)
       }
-    } catch (err) {
-      console.error('[ingest] CDC/subscription pipeline error:', err)
-    }
-  })())
+    })())
+  }
 
   return Response.json({
     ok: true,

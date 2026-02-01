@@ -10,6 +10,7 @@ import type { CatalogDO } from '../core/src/catalog'
 import type { SubscriptionDO } from '../core/src/subscription'
 import type { CDCProcessorDO } from '../core/src/cdc-processor'
 import type { EventWriterDO } from './event-writer-do'
+import type { RateLimiterDO } from './middleware/rate-limiter-do'
 import type { WebhookEnv } from './webhook-handler'
 import type { EventBatch } from '@dotdo/events'
 import type { AuthBinding } from 'oauth.do/rpc'
@@ -25,11 +26,18 @@ export interface Env extends WebhookEnv {
   SUBSCRIPTIONS: DurableObjectNamespace<SubscriptionDO>
   CDC_PROCESSOR: DurableObjectNamespace<CDCProcessorDO>
   EVENT_WRITER: DurableObjectNamespace<EventWriterDO>
+  RATE_LIMITER: DurableObjectNamespace<RateLimiterDO>
   EVENTS_QUEUE?: Queue<EventBatch>
+  /** When true and EVENTS_QUEUE is bound, use queue for CDC/subscription fanout instead of direct DO calls */
+  USE_QUEUE_FANOUT?: string
   AUTH_TOKEN?: string
   AUTH: AuthBinding
   OAUTH: Fetcher
   ENVIRONMENT: string
   ALLOWED_ORIGINS?: string
   TAIL_AUTH_SECRET?: string
+  /** Max requests per minute for /ingest endpoint (default: 1000) */
+  RATE_LIMIT_REQUESTS_PER_MINUTE?: string
+  /** Max events per minute for /ingest endpoint (default: 100000) */
+  RATE_LIMIT_EVENTS_PER_MINUTE?: string
 }

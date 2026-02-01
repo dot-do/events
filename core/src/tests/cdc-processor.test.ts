@@ -20,90 +20,26 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { CollectionChangeEvent } from '../types.js'
+import type {
+  CDCEvent,
+  DocumentState,
+  DeltaRef,
+  ProcessorManifest,
+  ProcessorState,
+} from '../cdc-processor.js'
 
 // ============================================================================
 // Types
 // ============================================================================
 
 /**
- * CDC event for processing (subset of CollectionChangeEvent with required fields)
- */
-interface CDCEvent {
-  type: 'collection.insert' | 'collection.update' | 'collection.delete'
-  ts: string
-  collection: string
-  docId: string
-  doc?: Record<string, unknown>
-  prev?: Record<string, unknown>
-  bookmark?: string
-  do: {
-    id: string
-    name?: string
-    class?: string
-  }
-}
-
-/**
- * Current state of a document in the processor
- */
-interface DocumentState {
-  docId: string
-  doc: Record<string, unknown>
-  version: number
-  lastUpdated: string
-  bookmark?: string
-  deleted: boolean
-}
-
-/**
- * Delta file reference in manifest
- */
-interface DeltaRef {
-  sequence: number
-  path: string
-  createdAt: string
-  eventCount: number
-  minTs: string
-  maxTs: string
-}
-
-/**
- * Collection manifest with schema and delta references
- */
-interface CollectionManifest {
-  collection: string
-  schema?: Record<string, string>
-  deltaSequence: number
-  deltas: DeltaRef[]
-  lastFlushAt: string | null
-  lastSnapshotAt: string | null
-  stats: {
-    totalDocs: number
-    totalEvents: number
-    insertCount: number
-    updateCount: number
-    deleteCount: number
-  }
-}
-
-/**
- * Processor state returned by getState()
- */
-interface ProcessorState {
-  collection: string
-  documents: DocumentState[]
-  pendingCount: number
-  lastEventTs: string | null
-}
-
-/**
  * CDCProcessorDO interface (to be implemented)
  */
-interface CDCProcessorDO {
+interface CDCProcessorDOInterface {
   process(events: CDCEvent[]): Promise<{ processed: number; pending: number }>
   flush(force?: boolean): Promise<{ flushed: boolean; deltaPath?: string; eventCount?: number }>
   getState(collection: string): Promise<ProcessorState>
-  getManifest(collection: string): Promise<CollectionManifest | null>
+  getManifest(collection: string): Promise<ProcessorManifest | null>
   getDocument(collection: string, docId: string): Promise<DocumentState | null>
 }
 

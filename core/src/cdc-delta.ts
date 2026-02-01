@@ -12,7 +12,7 @@
  */
 
 import { parquetReadObjects } from 'hyparquet'
-import { parquetWriteBuffer } from 'hyparquet-writer'
+import { parquetWriteBuffer } from '@dotdo/hyparquet-writer'
 import { createAsyncBuffer } from './async-buffer.js'
 
 // ============================================================================

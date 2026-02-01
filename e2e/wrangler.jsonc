@@ -1,0 +1,22 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  // E2E Test Worker - Tests events.do receiver
+  "name": "events-do-e2e",
+  "main": "../src/index.ts",
+  "compatibility_date": "2026-01-25",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // R2 bucket for event storage (simulated in tests)
+  "r2_buckets": [
+    { "binding": "EVENTS_BUCKET", "bucket_name": "events-test" }
+  ],
+
+  "vars": {
+    "ENVIRONMENT": "test"
+  },
+
+  // Dev settings
+  "dev": {
+    "port": 8788
+  }
+}

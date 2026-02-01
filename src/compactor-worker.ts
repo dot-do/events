@@ -114,7 +114,7 @@ export default {
       if (day) {
         // Compact entire day
         const [year, month, dayNum] = day.split('/').map(Number)
-        const date = new Date(Date.UTC(year, month - 1, dayNum))
+        const date = new Date(Date.UTC(year!, (month ?? 1) - 1, dayNum))
         const result = await compactDay(env, date)
         return Response.json(result, { headers: corsHeaders() })
       }
