@@ -15,7 +15,7 @@ import { DeltaTable, type StorageBackend } from '@dotdo/deltalake'
 import { ulid } from '../core/src/ulid'
 import { sanitizeR2Path, buildSafeR2Path, sanitizePathSegment, InvalidR2PathError } from './utils'
 import { createR2Storage } from '../core/src/deltalake-storage'
-import { createEventsTable, type EventDeltaRecord } from '../core/src/deltalake-factory'
+import { createEventsTable, getEventsTablePath, type EventDeltaRecord } from '../core/src/deltalake-factory'
 
 export { ulid }
 
@@ -169,6 +169,8 @@ export async function writeEvents(
 export interface DeltaWriteResult {
   version: number
   events: number
+  bytes: number
+  path: string
   cpuMs: number
 }
 
@@ -254,16 +256,24 @@ export async function writeEventsDelta(
   // Convert events to DeltaLake format
   const deltaRecords = events.map(toEventDeltaRecord)
 
+  // Estimate bytes from serialized records (for metrics)
+  const estimatedBytes = deltaRecords.reduce((sum, record) => {
+    return sum + JSON.stringify(record).length
+  }, 0)
+
   // Write with ACID guarantees
   const commit = await table.write(deltaRecords)
 
   const cpuMs = performance.now() - startCpu
+  const tablePath = getEventsTablePath(shardId)
 
   console.log(`[WRITE-DELTA] shard=${shardId} version=${commit.version} events=${events.length} cpuMs=${cpuMs.toFixed(2)}`)
 
   return {
     version: commit.version,
     events: events.length,
+    bytes: estimatedBytes,
+    path: `${tablePath}/_delta_log/${String(commit.version).padStart(20, '0')}.json`,
     cpuMs,
   }
 }

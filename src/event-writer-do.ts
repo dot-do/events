@@ -15,7 +15,7 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { writeEvents, ulid, type EventRecord, type WriteResult } from './event-writer'
+import { writeEvents, writeEventsDelta, writeEventsDualWrite, ulid, type EventRecord, type WriteResult, type DeltaWriteResult } from './event-writer'
 import { recordWriterDOMetric, recordR2WriteMetric, MetricTimer } from './metrics'
 import type { ShardCoordinatorDO } from './shard-coordinator-do'
 import { logger, sanitize, logError, type Logger } from './logger'
@@ -41,7 +41,7 @@ const DEFAULT_DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours default TTL for ded
 
 import type { Env as FullEnv } from './env'
 
-export type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'ANALYTICS' | 'SHARD_COORDINATOR'>
+export type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'ANALYTICS' | 'SHARD_COORDINATOR' | 'USE_DELTALAKE' | 'DELTALAKE_DUAL_WRITE'>
 
 // ============================================================================
 // Configuration
@@ -547,21 +547,47 @@ export class EventWriterDO extends DurableObject<Env> {
 
     const results: WriteResult[] = []
     let totalBytes = 0
+    const useDeltalake = this.env.USE_DELTALAKE === 'true'
+    const useDualWrite = this.env.DELTALAKE_DUAL_WRITE === 'true'
     try {
       // Write each source group to its own prefix
       for (const [source, sourceEvents] of eventsBySource) {
         const writeTimer = new MetricTimer()
-        const result = await writeEvents(this.env.EVENTS_BUCKET, source, sourceEvents)
-        logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Flushed', { key: sanitize.id(result.key, 64) })
+        let result: WriteResult
+        let bytes: number
+
+        if (useDualWrite) {
+          // Dual-write mode: write to both legacy and DeltaTable during migration
+          const dualResult = await writeEventsDualWrite(this.env.EVENTS_BUCKET, source, sourceEvents, this.shardId)
+          result = dualResult.legacy
+          bytes = dualResult.legacy.bytes + dualResult.delta.bytes
+        } else if (useDeltalake) {
+          // DeltaTable-only mode
+          const deltaResult = await writeEventsDelta(this.env.EVENTS_BUCKET, sourceEvents, this.shardId)
+          // Convert delta result to WriteResult format for compatibility
+          result = {
+            key: deltaResult.path,
+            bytes: deltaResult.bytes,
+            events: deltaResult.events,
+            cpuMs: deltaResult.cpuMs,
+          }
+          bytes = deltaResult.bytes
+        } else {
+          // Legacy mode (default)
+          result = await writeEvents(this.env.EVENTS_BUCKET, source, sourceEvents)
+          bytes = result.bytes
+        }
+
+        logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Flushed', { key: sanitize.id(result.key, 64), mode: useDualWrite ? 'dual' : useDeltalake ? 'deltalake' : 'legacy' })
         results.push(result)
-        totalBytes += result.bytes
+        totalBytes += bytes
 
         // Record R2 write metric for each source
         recordR2WriteMetric(
           this.env.ANALYTICS,
           'success',
           sourceEvents.length,
-          result.bytes,
+          bytes,
           writeTimer.elapsed(),
           source
         )
