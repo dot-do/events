@@ -749,6 +749,32 @@ describe('EventEmitter', () => {
       expect(info.openedAt).toBeInstanceOf(Date)
       expect(info.resetAt).toBeInstanceOf(Date)
     })
+
+    it('should cap circuitBreakerResetMs at 1 hour maximum', async () => {
+      const twoHoursMs = 2 * 60 * 60 * 1000 // 2 hours
+      const oneHourMs = 60 * 60 * 1000 // 1 hour (max)
+
+      const emitter = new EventEmitter(mockCtx, mockEnv, {
+        maxConsecutiveFailures: 2,
+        circuitBreakerResetMs: twoHoursMs, // Try to set 2 hours
+      })
+
+      // Fail twice to open circuit
+      for (let i = 0; i < 2; i++) {
+        mockFetch.mockRejectedValueOnce(new Error('Network error'))
+        emitter.emit({ type: `test.event.${i}` })
+        await emitter.flush()
+      }
+
+      const info = await emitter.getCircuitBreakerInfo()
+      expect(info.isOpen).toBe(true)
+      expect(info.openedAt).toBeInstanceOf(Date)
+      expect(info.resetAt).toBeInstanceOf(Date)
+
+      // Reset time should be capped at 1 hour, not 2 hours
+      const resetDelta = info.resetAt!.getTime() - info.openedAt!.getTime()
+      expect(resetDelta).toBe(oneHourMs)
+    })
   })
 
   describe('retry queue stats', () => {

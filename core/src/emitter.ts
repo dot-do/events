@@ -11,6 +11,7 @@ import {
   DEFAULT_MAX_RETRY_QUEUE_SIZE,
   DEFAULT_MAX_CONSECUTIVE_FAILURES,
   DEFAULT_CIRCUIT_BREAKER_RESET_MS,
+  MAX_CIRCUIT_BREAKER_RESET_MS,
   DEFAULT_FETCH_TIMEOUT_MS,
   RETRY_BASE_DELAY_MS,
   RETRY_MAX_DELAY_MS,
@@ -122,7 +123,10 @@ export class EventEmitter {
       apiKey: options.apiKey,
       maxRetryQueueSize: options.maxRetryQueueSize ?? DEFAULT_MAX_RETRY_QUEUE_SIZE,
       maxConsecutiveFailures: options.maxConsecutiveFailures ?? DEFAULT_MAX_CONSECUTIVE_FAILURES,
-      circuitBreakerResetMs: options.circuitBreakerResetMs ?? DEFAULT_CIRCUIT_BREAKER_RESET_MS,
+      circuitBreakerResetMs: Math.min(
+        options.circuitBreakerResetMs ?? DEFAULT_CIRCUIT_BREAKER_RESET_MS,
+        MAX_CIRCUIT_BREAKER_RESET_MS
+      ),
       fetchTimeoutMs: options.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
     }
 
