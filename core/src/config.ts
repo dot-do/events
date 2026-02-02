@@ -59,6 +59,18 @@ export const SUBSCRIPTION_RETRY_BASE_DELAY_MS = 1000
 /** Maximum delay for subscription retry backoff (ms) - 5 minutes */
 export const SUBSCRIPTION_RETRY_MAX_DELAY_MS = 300000
 
+/** Default batch size for batched delivery */
+export const DEFAULT_BATCH_DELIVERY_SIZE = 100
+
+/** Default batch window in ms for batched delivery */
+export const DEFAULT_BATCH_DELIVERY_WINDOW_MS = 1000
+
+/** Maximum batch size for batched delivery */
+export const MAX_BATCH_DELIVERY_SIZE = 1000
+
+/** Maximum batch window in ms for batched delivery (10 seconds) */
+export const MAX_BATCH_DELIVERY_WINDOW_MS = 10000
+
 // ============================================================================
 // Pattern Validation
 // ============================================================================
@@ -78,6 +90,22 @@ export const ALLOWED_PATTERN_CHARS = /^[a-zA-Z0-9._*-]+$/
 
 /** Maximum iterations for pattern matching to prevent runaway computation */
 export const MAX_PATTERN_MATCH_ITERATIONS = 10000
+
+// ============================================================================
+// Parallel Compaction Configuration
+// ============================================================================
+
+/** Default parallelism level for CDC compaction (number of concurrent workers) */
+export const DEFAULT_COMPACTION_PARALLELISM = 4
+
+/** Default chunk size (number of delta files to process per parallel worker) */
+export const DEFAULT_COMPACTION_CHUNK_SIZE = 10
+
+/** Minimum number of delta files to trigger parallel processing */
+export const MIN_DELTAS_FOR_PARALLEL = 5
+
+/** Maximum parallelism level allowed */
+export const MAX_COMPACTION_PARALLELISM = 16
 
 // ============================================================================
 // Storage Keys
@@ -119,6 +147,10 @@ export const coreConfig = {
     batchLimit: SUBSCRIPTION_BATCH_LIMIT,
     retryBaseDelayMs: SUBSCRIPTION_RETRY_BASE_DELAY_MS,
     retryMaxDelayMs: SUBSCRIPTION_RETRY_MAX_DELAY_MS,
+    defaultBatchDeliverySize: DEFAULT_BATCH_DELIVERY_SIZE,
+    defaultBatchDeliveryWindowMs: DEFAULT_BATCH_DELIVERY_WINDOW_MS,
+    maxBatchDeliverySize: MAX_BATCH_DELIVERY_SIZE,
+    maxBatchDeliveryWindowMs: MAX_BATCH_DELIVERY_WINDOW_MS,
   },
   pattern: {
     maxLength: MAX_PATTERN_LENGTH,
@@ -131,5 +163,11 @@ export const coreConfig = {
     retryCount: STORAGE_KEY_RETRY_COUNT,
     batch: STORAGE_KEY_BATCH,
     circuitBreaker: STORAGE_KEY_CIRCUIT_BREAKER,
+  },
+  compaction: {
+    defaultParallelism: DEFAULT_COMPACTION_PARALLELISM,
+    defaultChunkSize: DEFAULT_COMPACTION_CHUNK_SIZE,
+    minDeltasForParallel: MIN_DELTAS_FOR_PARALLEL,
+    maxParallelism: MAX_COMPACTION_PARALLELISM,
   },
 } as const

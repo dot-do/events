@@ -57,11 +57,15 @@ export type {
   CompactionOptions,
   CompactionResult,
   CollectionManifest as CompactionManifest,
+  ParallelCompactionOptions,
+  ParallelCompactionProgress,
 } from './cdc-compaction.js'
 export {
   compactCollection,
+  compactCollectionParallel,
   applyDeltasToState,
   writeDataParquet,
+  mergeChunkStates,
 } from './cdc-compaction.js'
 
 // CDC Processor (Durable Object)
@@ -127,8 +131,25 @@ export type {
   DeliveryLog,
   DeadLetter,
   SubscriptionStats,
+  BatchDeliveryConfig,
+  BatchDeliveryResult,
+  PendingBatch,
 } from './subscription.js'
 export { SubscriptionDO } from './subscription.js'
+
+// Worker ID validation (SSRF prevention for subscription delivery)
+export type { ValidationResult as WorkerIdValidationResult } from './worker-id-validation.js'
+export {
+  validateWorkerId,
+  validateRpcMethod,
+  assertValidDeliveryTarget,
+  buildSafeDeliveryUrl,
+  WORKER_ID_PATTERN,
+  RPC_METHOD_PATTERN,
+  MAX_WORKER_ID_LENGTH,
+  MAX_RPC_METHOD_LENGTH,
+  SSRF_BLOCKLIST_PATTERNS,
+} from './worker-id-validation.js'
 
 // === Schema Registry: Event Validation ===
 
@@ -141,12 +162,31 @@ export type {
 } from './schema-registry.js'
 export { SchemaRegistryDO, validateAgainstSchema } from './schema-registry.js'
 
+// === Safe Regex: ReDoS Prevention ===
+
+export type { RegexSafetyResult, SafeRegexOptions, SafeRegexResult } from './safe-regex.js'
+export {
+  analyzeRegexSafety,
+  createSafeRegex,
+  safeRegexTest,
+  safeRegexMatch,
+  validateSchemaPattern,
+  getCachedSafeRegex,
+  clearRegexCache,
+  MAX_PATTERN_LENGTH as REGEX_MAX_PATTERN_LENGTH,
+  MAX_INPUT_LENGTH as REGEX_MAX_INPUT_LENGTH,
+  MAX_QUANTIFIER as REGEX_MAX_QUANTIFIER,
+  MAX_REGEX_EXECUTION_MS,
+} from './safe-regex.js'
+
 // Pattern matching for subscriptions
 export {
   matchPattern,
   extractPatternPrefix,
   findMatchingSubscriptions,
   clearPatternCache,
+  getPatternCacheSize,
+  PATTERN_CACHE_MAX_SIZE,
 } from './pattern-matcher.js'
 
 // === Compaction: Parquet ===
@@ -188,9 +228,10 @@ export {
 
 // === SQL Row Mapper ===
 
-export type { SqlRow } from './sql-mapper.js'
+export type { SqlRow, JsonValidator, JsonValidationResult } from './sql-mapper.js'
 export {
   SqlTypeError,
+  JsonValidationError,
   getString,
   getNumber,
   getBoolean,
@@ -199,6 +240,19 @@ export {
   getOptionalBoolean,
   getJson,
   getOptionalJson,
+  getValidatedJson,
+  getValidatedOptionalJson,
+  // Type guard utilities
+  isObject,
+  isArray,
+  isArrayOf,
+  isString,
+  isNumber,
+  isBoolean,
+  isNull,
+  createObjectValidator,
+  nullable,
+  optional,
 } from './sql-mapper.js'
 
 // === Dedup Cache ===
@@ -217,8 +271,46 @@ export {
 
 // === Browser SDK ===
 // Note: For browser usage, import from '@dotdo/events/browser' for the standalone bundle
-export type { BrowserConfig } from './browser.js'
-export { EventsSDK, init as initBrowser, page, track, identify, flush as flushBrowser } from './browser.js'
+export type { BrowserConfig, EncryptionConfig } from './browser.js'
+export {
+  EventsSDK,
+  StorageEncryption,
+  init as initBrowser,
+  initAsync as initBrowserAsync,
+  page,
+  track,
+  identify,
+  flush as flushBrowser
+} from './browser.js'
+
+// === End-to-End Encryption ===
+// Provides AES-256-GCM encryption for sensitive event payloads
+export type {
+  EncryptedPayload,
+  EncryptionKeyInfo,
+  EncryptionKeyStore,
+  PayloadEncryptionConfig,
+  EncryptOptions,
+} from './encryption.js'
+export {
+  // Key management
+  generateEncryptionKey,
+  generateEncryptionKeyInfo,
+  createKeyStore,
+  initializeKeyStore,
+  rotateEncryptionKey,
+  // Encryption/decryption
+  encryptPayload,
+  decryptPayload,
+  encryptFields,
+  decryptFields,
+  reencryptPayload,
+  // Utilities
+  isEncryptedPayload,
+  shouldEncryptEvent,
+  constantTimeCompare,
+  ENCRYPTED_MARKER,
+} from './encryption.js'
 
 // === Configuration ===
 // Centralized configuration constants for tuning and defaults
@@ -241,6 +333,11 @@ export {
   SUBSCRIPTION_BATCH_LIMIT,
   SUBSCRIPTION_RETRY_BASE_DELAY_MS,
   SUBSCRIPTION_RETRY_MAX_DELAY_MS,
+  // Batched delivery configuration
+  DEFAULT_BATCH_DELIVERY_SIZE,
+  DEFAULT_BATCH_DELIVERY_WINDOW_MS,
+  MAX_BATCH_DELIVERY_SIZE,
+  MAX_BATCH_DELIVERY_WINDOW_MS,
   // Pattern validation
   MAX_PATTERN_LENGTH,
   MAX_PATTERN_SEGMENTS,
@@ -251,4 +348,9 @@ export {
   STORAGE_KEY_RETRY_COUNT,
   STORAGE_KEY_BATCH,
   STORAGE_KEY_CIRCUIT_BREAKER,
+  // Parallel compaction configuration
+  DEFAULT_COMPACTION_PARALLELISM,
+  DEFAULT_COMPACTION_CHUNK_SIZE,
+  MIN_DELTAS_FOR_PARALLEL,
+  MAX_COMPACTION_PARALLELISM,
 } from './config.js'

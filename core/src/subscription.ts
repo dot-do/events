@@ -9,16 +9,18 @@
  * - Deliveries: Tracking of event delivery attempts to subscribers
  * - Dead Letters: Failed deliveries after max retries
  * - Pattern Matching: Glob-style patterns for event type matching
+ * - Batched Delivery: Collect events over a time window and deliver as a batch
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { findMatchingSubscriptions } from './pattern-matcher.js'
+import { findMatchingSubscriptions, matchPattern, extractPatternPrefix } from './pattern-matcher.js'
 import {
   getString,
   getNumber,
   getBoolean,
   getOptionalString,
   getOptionalNumber,
+  getOptionalBoolean,
   type SqlRow,
 } from './sql-mapper.js'
 import { ulid } from './ulid.js'
@@ -28,7 +30,16 @@ import {
   SUBSCRIPTION_BATCH_LIMIT,
   SUBSCRIPTION_RETRY_BASE_DELAY_MS,
   SUBSCRIPTION_RETRY_MAX_DELAY_MS,
+  DEFAULT_BATCH_DELIVERY_SIZE,
+  DEFAULT_BATCH_DELIVERY_WINDOW_MS,
+  MAX_BATCH_DELIVERY_SIZE,
+  MAX_BATCH_DELIVERY_WINDOW_MS,
 } from './config.js'
+import {
+  validateWorkerId,
+  validateRpcMethod,
+  buildSafeDeliveryUrl,
+} from './worker-id-validation.js'
 
 // ============================================================================
 // Types
@@ -46,6 +57,57 @@ export interface Subscription {
   active: boolean
   createdAt: number
   updatedAt: number
+  /** Enable batched delivery (false = deliver immediately per event) */
+  batchEnabled: boolean
+  /** Maximum number of events to batch together */
+  batchSize: number
+  /** Maximum time window in ms to collect events before delivery */
+  batchWindowMs: number
+}
+
+/** Configuration for batched delivery */
+export interface BatchDeliveryConfig {
+  /** Enable batched delivery */
+  enabled: boolean
+  /** Maximum number of events to batch together (1-1000, default 100) */
+  batchSize?: number
+  /** Maximum time window in ms to collect events (1-10000, default 1000) */
+  batchWindowMs?: number
+}
+
+/** Result of a batched delivery attempt */
+export interface BatchDeliveryResult {
+  /** Total events in the batch */
+  total: number
+  /** Successfully delivered events */
+  delivered: number
+  /** Failed events */
+  failed: number
+  /** Duration in ms */
+  durationMs: number
+  /** Individual event results */
+  results: Array<{
+    deliveryId: string
+    eventId: string
+    success: boolean
+    error?: string
+  }>
+}
+
+/** Pending batch for a subscription */
+export interface PendingBatch {
+  id: string
+  subscriptionId: string
+  deliveryIds: string[]
+  eventCount: number
+  windowStart: number
+  windowEnd?: number
+  status: 'pending' | 'delivered' | 'failed' | 'dead'
+  attemptCount: number
+  nextAttemptAt?: number
+  lastError?: string
+  createdAt: number
+  deliveredAt?: number
 }
 
 export interface Delivery {
@@ -95,7 +157,6 @@ export interface SubscriptionStats {
 }
 
 // Env type - users should extend this for their specific bindings
-// eslint-disable-next-line @typescript-eslint/no-empty-interface
 interface Env {
   // Service bindings will be added dynamically
   [key: string]: unknown
@@ -129,6 +190,9 @@ export class SubscriptionDO extends DurableObject<Env> {
         max_retries INTEGER DEFAULT 5,
         timeout_ms INTEGER DEFAULT 30000,
         active INTEGER DEFAULT 1,
+        batch_enabled INTEGER DEFAULT 0,
+        batch_size INTEGER DEFAULT 100,
+        batch_window_ms INTEGER DEFAULT 1000,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         UNIQUE(worker_id, pattern, rpc_method)
@@ -143,6 +207,9 @@ export class SubscriptionDO extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS idx_subscriptions_worker
         ON subscriptions(worker_id);
 
+      CREATE INDEX IF NOT EXISTS idx_subscriptions_batch
+        ON subscriptions(batch_enabled) WHERE batch_enabled = 1;
+
       CREATE TABLE IF NOT EXISTS deliveries (
         id TEXT PRIMARY KEY,
         subscription_id TEXT NOT NULL,
@@ -155,6 +222,7 @@ export class SubscriptionDO extends DurableObject<Env> {
         last_error TEXT,
         created_at INTEGER NOT NULL,
         delivered_at INTEGER,
+        batch_id TEXT,
         FOREIGN KEY (subscription_id) REFERENCES subscriptions(id),
         UNIQUE(subscription_id, event_id)
       );
@@ -165,6 +233,9 @@ export class SubscriptionDO extends DurableObject<Env> {
 
       CREATE INDEX IF NOT EXISTS idx_deliveries_subscription
         ON deliveries(subscription_id);
+
+      CREATE INDEX IF NOT EXISTS idx_deliveries_batch
+        ON deliveries(batch_id) WHERE batch_id IS NOT NULL;
 
       CREATE TABLE IF NOT EXISTS delivery_log (
         id TEXT PRIMARY KEY,
@@ -194,7 +265,58 @@ export class SubscriptionDO extends DurableObject<Env> {
 
       CREATE INDEX IF NOT EXISTS idx_dead_letters_subscription
         ON dead_letters(subscription_id);
+
+      -- Batch delivery tracking table
+      CREATE TABLE IF NOT EXISTS batch_deliveries (
+        id TEXT PRIMARY KEY,
+        subscription_id TEXT NOT NULL,
+        delivery_ids TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        event_count INTEGER NOT NULL,
+        window_start INTEGER NOT NULL,
+        window_end INTEGER,
+        attempt_count INTEGER DEFAULT 0,
+        next_attempt_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        FOREIGN KEY (subscription_id) REFERENCES subscriptions(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_batch_deliveries_pending
+        ON batch_deliveries(status, next_attempt_at)
+        WHERE status IN ('pending', 'failed');
+
+      CREATE INDEX IF NOT EXISTS idx_batch_deliveries_subscription
+        ON batch_deliveries(subscription_id);
     `)
+
+    // Schema migration: add batch columns to existing subscriptions tables
+    this.migrateSchema()
+  }
+
+  /**
+   * Migrate existing schema to add batch delivery columns
+   */
+  private migrateSchema(): void {
+    // Check if batch_enabled column exists
+    const columns = this.sql.exec(`PRAGMA table_info(subscriptions)`).toArray()
+    const hasBatchEnabled = columns.some(col => col.name === 'batch_enabled')
+
+    if (!hasBatchEnabled) {
+      // Add batch delivery columns to existing table
+      this.sql.exec(`ALTER TABLE subscriptions ADD COLUMN batch_enabled INTEGER DEFAULT 0`)
+      this.sql.exec(`ALTER TABLE subscriptions ADD COLUMN batch_size INTEGER DEFAULT 100`)
+      this.sql.exec(`ALTER TABLE subscriptions ADD COLUMN batch_window_ms INTEGER DEFAULT 1000`)
+    }
+
+    // Check if batch_id column exists in deliveries
+    const deliveryCols = this.sql.exec(`PRAGMA table_info(deliveries)`).toArray()
+    const hasBatchId = deliveryCols.some(col => col.name === 'batch_id')
+
+    if (!hasBatchId) {
+      this.sql.exec(`ALTER TABLE deliveries ADD COLUMN batch_id TEXT`)
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -211,16 +333,46 @@ export class SubscriptionDO extends DurableObject<Env> {
     rpcMethod: string
     maxRetries?: number
     timeoutMs?: number
+    batchConfig?: BatchDeliveryConfig
   }): Promise<{ ok: true; subscriptionId: string } | { ok: false; error: string }> {
-    const patternPrefix = this.extractPrefix(params.pattern)
+    // Validate workerId to prevent SSRF attacks
+    const workerIdValidation = validateWorkerId(params.workerId)
+    if (!workerIdValidation.valid) {
+      return { ok: false, error: `Invalid workerId: ${workerIdValidation.error}` }
+    }
+
+    // Validate rpcMethod to prevent path traversal
+    const rpcMethodValidation = validateRpcMethod(params.rpcMethod)
+    if (!rpcMethodValidation.valid) {
+      return { ok: false, error: `Invalid rpcMethod: ${rpcMethodValidation.error}` }
+    }
+
+    // Validate batch config if provided
+    if (params.batchConfig?.enabled) {
+      const batchSize = params.batchConfig.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
+      const batchWindowMs = params.batchConfig.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
+
+      if (batchSize < 1 || batchSize > MAX_BATCH_DELIVERY_SIZE) {
+        return { ok: false, error: `batchSize must be between 1 and ${MAX_BATCH_DELIVERY_SIZE}` }
+      }
+      if (batchWindowMs < 1 || batchWindowMs > MAX_BATCH_DELIVERY_WINDOW_MS) {
+        return { ok: false, error: `batchWindowMs must be between 1 and ${MAX_BATCH_DELIVERY_WINDOW_MS}` }
+      }
+    }
+
+    const patternPrefix = extractPatternPrefix(params.pattern)
     const id = ulid()
     const now = Date.now()
+
+    const batchEnabled = params.batchConfig?.enabled ?? false
+    const batchSize = params.batchConfig?.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
+    const batchWindowMs = params.batchConfig?.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
 
     try {
       this.sql.exec(
         `INSERT INTO subscriptions
-         (id, worker_id, worker_binding, pattern, pattern_prefix, rpc_method, max_retries, timeout_ms, active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+         (id, worker_id, worker_binding, pattern, pattern_prefix, rpc_method, max_retries, timeout_ms, active, batch_enabled, batch_size, batch_window_ms, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
         id,
         params.workerId,
         params.workerBinding ?? null,
@@ -229,6 +381,9 @@ export class SubscriptionDO extends DurableObject<Env> {
         params.rpcMethod,
         params.maxRetries ?? DEFAULT_SUBSCRIPTION_MAX_RETRIES,
         params.timeoutMs ?? DEFAULT_SUBSCRIPTION_TIMEOUT_MS,
+        batchEnabled ? 1 : 0,
+        batchSize,
+        batchWindowMs,
         now,
         now
       )
@@ -270,7 +425,7 @@ export class SubscriptionDO extends DurableObject<Env> {
   /**
    * Permanently delete a subscription and all related data
    */
-  async deleteSubscription(subscriptionId: string): Promise<{ ok: boolean; deleted: { deliveries: number; logs: number; deadLetters: number } }> {
+  async deleteSubscription(subscriptionId: string): Promise<{ ok: boolean; deleted: { deliveries: number; logs: number; deadLetters: number; batchDeliveries: number } }> {
     // Delete in order due to foreign key-like relationships
     const deadLettersDeleted = this.sql.exec(
       `DELETE FROM dead_letters WHERE subscription_id = ?`,
@@ -287,6 +442,11 @@ export class SubscriptionDO extends DurableObject<Env> {
       subscriptionId
     ).rowsWritten
 
+    const batchDeliveriesDeleted = this.sql.exec(
+      `DELETE FROM batch_deliveries WHERE subscription_id = ?`,
+      subscriptionId
+    ).rowsWritten
+
     this.sql.exec(
       `DELETE FROM subscriptions WHERE id = ?`,
       subscriptionId
@@ -298,6 +458,7 @@ export class SubscriptionDO extends DurableObject<Env> {
         deliveries: deliveriesDeleted,
         logs: logsDeleted,
         deadLetters: deadLettersDeleted,
+        batchDeliveries: batchDeliveriesDeleted,
       },
     }
   }
@@ -311,8 +472,30 @@ export class SubscriptionDO extends DurableObject<Env> {
       maxRetries?: number
       timeoutMs?: number
       rpcMethod?: string
+      batchConfig?: BatchDeliveryConfig
     }
-  ): Promise<{ ok: boolean }> {
+  ): Promise<{ ok: boolean; error?: string }> {
+    // Validate rpcMethod if being updated
+    if (updates.rpcMethod !== undefined) {
+      const rpcMethodValidation = validateRpcMethod(updates.rpcMethod)
+      if (!rpcMethodValidation.valid) {
+        return { ok: false, error: `Invalid rpcMethod: ${rpcMethodValidation.error}` }
+      }
+    }
+
+    // Validate batch config if provided
+    if (updates.batchConfig?.enabled) {
+      const batchSize = updates.batchConfig.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
+      const batchWindowMs = updates.batchConfig.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
+
+      if (batchSize < 1 || batchSize > MAX_BATCH_DELIVERY_SIZE) {
+        return { ok: false, error: `batchSize must be between 1 and ${MAX_BATCH_DELIVERY_SIZE}` }
+      }
+      if (batchWindowMs < 1 || batchWindowMs > MAX_BATCH_DELIVERY_WINDOW_MS) {
+        return { ok: false, error: `batchWindowMs must be between 1 and ${MAX_BATCH_DELIVERY_WINDOW_MS}` }
+      }
+    }
+
     const setClauses: string[] = ['updated_at = ?']
     const params: unknown[] = [Date.now()]
 
@@ -327,6 +510,18 @@ export class SubscriptionDO extends DurableObject<Env> {
     if (updates.rpcMethod !== undefined) {
       setClauses.push('rpc_method = ?')
       params.push(updates.rpcMethod)
+    }
+    if (updates.batchConfig !== undefined) {
+      setClauses.push('batch_enabled = ?')
+      params.push(updates.batchConfig.enabled ? 1 : 0)
+      if (updates.batchConfig.batchSize !== undefined) {
+        setClauses.push('batch_size = ?')
+        params.push(updates.batchConfig.batchSize)
+      }
+      if (updates.batchConfig.batchWindowMs !== undefined) {
+        setClauses.push('batch_window_ms = ?')
+        params.push(updates.batchConfig.batchWindowMs)
+      }
     }
 
     params.push(subscriptionId)
@@ -345,6 +540,7 @@ export class SubscriptionDO extends DurableObject<Env> {
     active?: boolean
     workerId?: string
     patternPrefix?: string
+    batchEnabled?: boolean
     limit?: number
     offset?: number
   }): Promise<Subscription[]> {
@@ -362,6 +558,10 @@ export class SubscriptionDO extends DurableObject<Env> {
     if (options?.patternPrefix) {
       query += ' AND pattern_prefix LIKE ?'
       params.push(options.patternPrefix + '%')
+    }
+    if (options?.batchEnabled !== undefined) {
+      query += ' AND batch_enabled = ?'
+      params.push(options.batchEnabled ? 1 : 0)
     }
 
     query += ' ORDER BY created_at DESC'
@@ -395,7 +595,7 @@ export class SubscriptionDO extends DurableObject<Env> {
   async findMatchingSubscriptions(eventType: string): Promise<Subscription[]> {
     // Get all active subscriptions and filter by pattern match
     // For efficiency, first filter by prefix
-    const prefix = this.extractPrefix(eventType)
+    const prefix = extractPatternPrefix(eventType)
 
     const rows = this.sql.exec(
       `SELECT * FROM subscriptions
@@ -406,10 +606,10 @@ export class SubscriptionDO extends DurableObject<Env> {
       eventType
     ).toArray()
 
-    // Filter by full pattern match
+    // Filter by full pattern match using the shared pattern matcher
     return rows
       .map(row => this.rowToSubscription(row))
-      .filter(sub => this.matchesPattern(eventType, sub.pattern))
+      .filter(sub => matchPattern(sub.pattern, eventType))
   }
 
   // ---------------------------------------------------------------------------
@@ -424,6 +624,7 @@ export class SubscriptionDO extends DurableObject<Env> {
     eventId: string
     eventType: string
     eventPayload: unknown
+    batchId?: string
   }): Promise<{ ok: true; deliveryId: string } | { ok: false; error: string }> {
     const id = ulid()
     const now = Date.now()
@@ -431,15 +632,16 @@ export class SubscriptionDO extends DurableObject<Env> {
     try {
       this.sql.exec(
         `INSERT INTO deliveries
-         (id, subscription_id, event_id, event_type, event_payload, status, attempt_count, next_attempt_at, created_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)`,
+         (id, subscription_id, event_id, event_type, event_payload, status, attempt_count, next_attempt_at, created_at, batch_id)
+         VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)`,
         id,
         params.subscriptionId,
         params.eventId,
         params.eventType,
         JSON.stringify(params.eventPayload),
         now,  // next_attempt_at = now (ready immediately)
-        now
+        now,
+        params.batchId ?? null
       )
       return { ok: true, deliveryId: id }
     } catch (e) {
@@ -460,6 +662,7 @@ export class SubscriptionDO extends DurableObject<Env> {
       `SELECT * FROM deliveries
        WHERE status IN ('pending', 'failed')
        AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       AND batch_id IS NULL
        ORDER BY next_attempt_at ASC
        LIMIT ?`,
       now,
@@ -594,6 +797,393 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------
+  // Batched Delivery
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Add a delivery to a batch for a subscription
+   * Creates a new batch if needed, or adds to existing batch
+   */
+  private async addToBatch(subscriptionId: string, deliveryId: string, subscription: Subscription): Promise<void> {
+    const now = Date.now()
+
+    // Find an open batch for this subscription
+    const openBatch = this.sql.exec(
+      `SELECT * FROM batch_deliveries
+       WHERE subscription_id = ?
+       AND status = 'pending'
+       AND window_end IS NULL
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      subscriptionId
+    ).one()
+
+    if (openBatch) {
+      const deliveryIds = JSON.parse(getString(openBatch as SqlRow, 'delivery_ids')) as string[]
+      const eventCount = getNumber(openBatch as SqlRow, 'event_count')
+      const windowStart = getNumber(openBatch as SqlRow, 'window_start')
+
+      // Check if batch is full or window expired
+      const windowExpired = (now - windowStart) >= subscription.batchWindowMs
+      const batchFull = eventCount >= subscription.batchSize
+
+      if (windowExpired || batchFull) {
+        // Close current batch and schedule delivery
+        this.sql.exec(
+          `UPDATE batch_deliveries
+           SET window_end = ?, next_attempt_at = ?
+           WHERE id = ?`,
+          now,
+          now,
+          openBatch.id
+        )
+
+        // Schedule alarm for batch delivery
+        await this.scheduleBatchAlarm()
+
+        // Create new batch with this delivery
+        await this.createNewBatch(subscriptionId, deliveryId)
+      } else {
+        // Add to existing batch
+        deliveryIds.push(deliveryId)
+        this.sql.exec(
+          `UPDATE batch_deliveries
+           SET delivery_ids = ?, event_count = ?
+           WHERE id = ?`,
+          JSON.stringify(deliveryIds),
+          eventCount + 1,
+          openBatch.id
+        )
+
+        // Update delivery with batch_id
+        this.sql.exec(
+          `UPDATE deliveries SET batch_id = ? WHERE id = ?`,
+          openBatch.id,
+          deliveryId
+        )
+      }
+    } else {
+      // Create new batch
+      await this.createNewBatch(subscriptionId, deliveryId)
+    }
+  }
+
+  /**
+   * Create a new batch for a subscription
+   */
+  private async createNewBatch(subscriptionId: string, deliveryId: string): Promise<void> {
+    const batchId = ulid()
+    const now = Date.now()
+
+    this.sql.exec(
+      `INSERT INTO batch_deliveries
+       (id, subscription_id, delivery_ids, status, event_count, window_start, created_at)
+       VALUES (?, ?, ?, 'pending', 1, ?, ?)`,
+      batchId,
+      subscriptionId,
+      JSON.stringify([deliveryId]),
+      now,
+      now
+    )
+
+    // Update delivery with batch_id
+    this.sql.exec(
+      `UPDATE deliveries SET batch_id = ? WHERE id = ?`,
+      batchId,
+      deliveryId
+    )
+
+    // Get subscription to schedule window end alarm
+    const sub = await this.getSubscription(subscriptionId)
+    if (sub) {
+      const windowEndTime = now + sub.batchWindowMs
+      const currentAlarm = await this.ctx.storage.getAlarm()
+      if (!currentAlarm || windowEndTime < currentAlarm) {
+        await this.ctx.storage.setAlarm(windowEndTime)
+      }
+    }
+  }
+
+  /**
+   * Schedule an alarm for batch delivery
+   */
+  private async scheduleBatchAlarm(): Promise<void> {
+    const nextBatch = this.sql.exec(
+      `SELECT MIN(next_attempt_at) as next_time FROM batch_deliveries
+       WHERE status IN ('pending', 'failed')
+       AND window_end IS NOT NULL`
+    ).one()
+
+    if (nextBatch?.next_time) {
+      const currentAlarm = await this.ctx.storage.getAlarm()
+      const nextTime = getNumber(nextBatch as SqlRow, 'next_time')
+
+      // Only set alarm if no alarm or new time is sooner
+      if (!currentAlarm || nextTime < currentAlarm) {
+        await this.ctx.storage.setAlarm(nextTime)
+      }
+    }
+  }
+
+  /**
+   * Deliver a batch of events to a subscriber
+   */
+  async deliverBatch(batchId: string): Promise<BatchDeliveryResult> {
+    const startTime = performance.now()
+
+    // Get batch and subscription info
+    const batchRow = this.sql.exec(
+      `SELECT b.*, s.worker_id, s.worker_binding, s.rpc_method, s.max_retries, s.timeout_ms
+       FROM batch_deliveries b
+       JOIN subscriptions s ON b.subscription_id = s.id
+       WHERE b.id = ?`,
+      batchId
+    ).one()
+
+    if (!batchRow || batchRow.status === 'delivered' || batchRow.status === 'dead') {
+      return { total: 0, delivered: 0, failed: 0, durationMs: 0, results: [] }
+    }
+
+    const deliveryIds = JSON.parse(getString(batchRow as SqlRow, 'delivery_ids')) as string[]
+    const subscriptionId = getString(batchRow as SqlRow, 'subscription_id')
+    const attemptNumber = getNumber(batchRow as SqlRow, 'attempt_count') + 1
+
+    // Get all deliveries in the batch
+    const deliveries = this.sql.exec(
+      `SELECT * FROM deliveries WHERE id IN (${deliveryIds.map(() => '?').join(',')})`,
+      ...deliveryIds
+    ).toArray()
+
+    // Build batch payload
+    const events = deliveries.map(d => ({
+      deliveryId: getString(d as SqlRow, 'id'),
+      eventId: getString(d as SqlRow, 'event_id'),
+      eventType: getString(d as SqlRow, 'event_type'),
+      payload: JSON.parse(getString(d as SqlRow, 'event_payload')),
+    }))
+
+    const results: BatchDeliveryResult['results'] = []
+    let deliveredCount = 0
+    let failedCount = 0
+
+    try {
+      let response: unknown
+
+      // Try RPC via service binding first
+      const workerBinding = getOptionalString(batchRow as SqlRow, 'worker_binding')
+      if (workerBinding && this.env[workerBinding]) {
+        const worker = this.env[workerBinding] as { [method: string]: (payload: unknown) => Promise<unknown> }
+        const rpcMethod = getString(batchRow as SqlRow, 'rpc_method')
+
+        if (typeof worker[rpcMethod] === 'function') {
+          const timeoutMs = getNumber(batchRow as SqlRow, 'timeout_ms')
+          response = await Promise.race([
+            worker[rpcMethod]({ batch: true, events }),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('RPC timeout')), timeoutMs)
+            ),
+          ])
+        } else {
+          throw new Error(`RPC method ${rpcMethod} not found on worker`)
+        }
+      } else {
+        // Fallback to HTTP
+        const workerId = getString(batchRow as SqlRow, 'worker_id')
+        const rpcMethod = getString(batchRow as SqlRow, 'rpc_method')
+        const timeoutMs = getNumber(batchRow as SqlRow, 'timeout_ms')
+
+        const deliveryUrl = buildSafeDeliveryUrl(workerId, rpcMethod)
+
+        const httpResponse = await fetch(
+          deliveryUrl,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ batch: true, events }),
+            signal: AbortSignal.timeout(timeoutMs),
+          }
+        )
+
+        if (!httpResponse.ok) {
+          throw new Error(`HTTP ${httpResponse.status}: ${await httpResponse.text()}`)
+        }
+
+        response = await httpResponse.json()
+      }
+
+      // Handle partial success/failure from response
+      const responseObj = response as { results?: Array<{ eventId: string; success: boolean; error?: string }> } | null
+      if (responseObj?.results && Array.isArray(responseObj.results)) {
+        // Response includes per-event results
+        for (const eventResult of responseObj.results) {
+          const delivery = events.find(e => e.eventId === eventResult.eventId)
+          if (delivery) {
+            results.push({
+              deliveryId: delivery.deliveryId,
+              eventId: eventResult.eventId,
+              success: eventResult.success,
+              error: eventResult.error,
+            })
+            if (eventResult.success) {
+              deliveredCount++
+              await this.markDelivered(delivery.deliveryId, 0, JSON.stringify(eventResult))
+            } else {
+              failedCount++
+              await this.markFailed(delivery.deliveryId, eventResult.error ?? 'Batch delivery partial failure', 0)
+            }
+          }
+        }
+      } else {
+        // All events delivered successfully
+        deliveredCount = events.length
+        for (const event of events) {
+          results.push({
+            deliveryId: event.deliveryId,
+            eventId: event.eventId,
+            success: true,
+          })
+          await this.markDelivered(event.deliveryId, 0, JSON.stringify(response))
+        }
+      }
+
+      // Mark batch as delivered
+      this.sql.exec(
+        `UPDATE batch_deliveries
+         SET status = 'delivered', delivered_at = ?, attempt_count = ?
+         WHERE id = ?`,
+        Date.now(),
+        attemptNumber,
+        batchId
+      )
+
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      const maxRetries = getNumber(batchRow as SqlRow, 'max_retries')
+
+      // All events in batch failed
+      failedCount = events.length
+      for (const event of events) {
+        results.push({
+          deliveryId: event.deliveryId,
+          eventId: event.eventId,
+          success: false,
+          error: errorMessage,
+        })
+      }
+
+      if (attemptNumber < maxRetries) {
+        // Schedule retry with exponential backoff
+        const delay = this.calculateRetryDelay(attemptNumber)
+        const nextAttemptAt = Date.now() + delay
+
+        this.sql.exec(
+          `UPDATE batch_deliveries
+           SET status = 'failed', attempt_count = ?, next_attempt_at = ?, last_error = ?
+           WHERE id = ?`,
+          attemptNumber,
+          nextAttemptAt,
+          errorMessage,
+          batchId
+        )
+
+        await this.scheduleBatchAlarm()
+      } else {
+        // Move batch to dead status
+        this.sql.exec(
+          `UPDATE batch_deliveries
+           SET status = 'dead', attempt_count = ?, last_error = ?
+           WHERE id = ?`,
+          attemptNumber,
+          errorMessage,
+          batchId
+        )
+
+        // Move all deliveries to dead letter queue
+        for (const event of events) {
+          await this.markFailed(event.deliveryId, errorMessage, 0)
+        }
+      }
+
+      // Log batch attempt failure
+      this.sql.exec(
+        `INSERT INTO delivery_log
+         (id, delivery_id, subscription_id, attempt_number, status, duration_ms, error_message, created_at)
+         VALUES (?, ?, ?, ?, 'failed', ?, ?, ?)`,
+        ulid(),
+        batchId,
+        subscriptionId,
+        attemptNumber,
+        Math.round(performance.now() - startTime),
+        errorMessage,
+        Date.now()
+      )
+    }
+
+    const durationMs = Math.round(performance.now() - startTime)
+
+    return {
+      total: events.length,
+      delivered: deliveredCount,
+      failed: failedCount,
+      durationMs,
+      results,
+    }
+  }
+
+  /**
+   * Get pending batches for a subscription
+   */
+  async getPendingBatches(subscriptionId: string, limit = 100): Promise<PendingBatch[]> {
+    const rows = this.sql.exec(
+      `SELECT * FROM batch_deliveries
+       WHERE subscription_id = ?
+       AND status IN ('pending', 'failed')
+       ORDER BY created_at ASC
+       LIMIT ?`,
+      subscriptionId,
+      limit
+    ).toArray()
+
+    return rows.map(row => ({
+      id: getString(row as SqlRow, 'id'),
+      subscriptionId: getString(row as SqlRow, 'subscription_id'),
+      deliveryIds: JSON.parse(getString(row as SqlRow, 'delivery_ids')),
+      eventCount: getNumber(row as SqlRow, 'event_count'),
+      windowStart: getNumber(row as SqlRow, 'window_start'),
+      windowEnd: getOptionalNumber(row as SqlRow, 'window_end'),
+      status: getString(row as SqlRow, 'status') as 'pending' | 'delivered' | 'failed' | 'dead',
+      attemptCount: getNumber(row as SqlRow, 'attempt_count'),
+      nextAttemptAt: getOptionalNumber(row as SqlRow, 'next_attempt_at'),
+      lastError: getOptionalString(row as SqlRow, 'last_error'),
+      createdAt: getNumber(row as SqlRow, 'created_at'),
+      deliveredAt: getOptionalNumber(row as SqlRow, 'delivered_at'),
+    }))
+  }
+
+  /**
+   * Flush all open batches for immediate delivery
+   */
+  async flushBatches(): Promise<{ flushed: number }> {
+    const now = Date.now()
+
+    // Close all open batches
+    const result = this.sql.exec(
+      `UPDATE batch_deliveries
+       SET window_end = ?, next_attempt_at = ?
+       WHERE status = 'pending'
+       AND window_end IS NULL`,
+      now,
+      now
+    )
+
+    if (result.rowsWritten > 0) {
+      await this.scheduleBatchAlarm()
+    }
+
+    return { flushed: result.rowsWritten }
+  }
+
+  // ---------------------------------------------------------------------------
   // Status and Stats
   // ---------------------------------------------------------------------------
 
@@ -637,7 +1227,7 @@ export class SubscriptionDO extends DurableObject<Env> {
       subscriptionId
     ).one()
 
-    const totalDelivered = pendingRow ? getNumber(deliveredRow as SqlRow, 'count') : 0
+    const totalDelivered = deliveredRow ? getNumber(deliveredRow as SqlRow, 'count') : 0
     const totalAttempts = totalAttemptsRow ? getOptionalNumber(totalAttemptsRow as SqlRow, 'total') ?? 0 : 0
 
     return {
@@ -673,7 +1263,7 @@ export class SubscriptionDO extends DurableObject<Env> {
       eventId: getString(row as SqlRow, 'event_id'),
       eventPayload: getString(row as SqlRow, 'event_payload'),
       reason: getString(row as SqlRow, 'reason'),
-      lastError: getOptionalString(row as SqlRow, 'last_error') ?? undefined,
+      lastError: getOptionalString(row as SqlRow, 'last_error'),
       createdAt: getNumber(row as SqlRow, 'created_at'),
     }))
   }
@@ -735,9 +1325,9 @@ export class SubscriptionDO extends DurableObject<Env> {
       subscriptionId: getString(row as SqlRow, 'subscription_id'),
       attemptNumber: getNumber(row as SqlRow, 'attempt_number'),
       status: getString(row as SqlRow, 'status'),
-      durationMs: getOptionalNumber(row as SqlRow, 'duration_ms') ?? undefined,
-      errorMessage: getOptionalString(row as SqlRow, 'error_message') ?? undefined,
-      workerResponse: getOptionalString(row as SqlRow, 'worker_response') ?? undefined,
+      durationMs: getOptionalNumber(row as SqlRow, 'duration_ms'),
+      errorMessage: getOptionalString(row as SqlRow, 'error_message'),
+      workerResponse: getOptionalString(row as SqlRow, 'worker_response'),
       createdAt: getNumber(row as SqlRow, 'created_at'),
     }))
   }
@@ -747,92 +1337,13 @@ export class SubscriptionDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Extract prefix from pattern for indexing
-   * "webhook.github.*" -> "webhook.github"
-   * "webhook.github.push" -> "webhook.github.push"
-   * "**" -> ""
-   */
-  private extractPrefix(pattern: string): string {
-    const parts = pattern.split('.')
-    const wildcardIdx = parts.findIndex(p => p === '*' || p === '**')
-    if (wildcardIdx === -1) {
-      return pattern
-    }
-    if (wildcardIdx === 0) {
-      return ''
-    }
-    return parts.slice(0, wildcardIdx).join('.')
-  }
-
-  /**
-   * Check if an event type matches a subscription pattern
-   * Supports:
-   * - Exact match: "webhook.github.push"
-   * - Single wildcard: "webhook.github.*" matches "webhook.github.push" but not "webhook.github.push.v1"
-   * - Double wildcard: "webhook.**" matches "webhook", "webhook.github.push" and "webhook.github.push.v1"
-   */
-  private matchesPattern(eventType: string, pattern: string): boolean {
-    // Handle special root patterns
-    if (pattern === '**') {
-      return true
-    }
-    if (pattern === '*') {
-      // * at root matches only single-segment event types
-      return !eventType.includes('.')
-    }
-
-    const eventParts = eventType.split('.')
-    const patternParts = pattern.split('.')
-
-    let eventIdx = 0
-    let patternIdx = 0
-
-    while (patternIdx < patternParts.length) {
-      const p = patternParts[patternIdx]
-
-      if (p === '**') {
-        // ** matches zero or more segments
-        // If it's the last pattern part, match everything remaining (including nothing)
-        if (patternIdx === patternParts.length - 1) {
-          return true
-        }
-        // Try matching remaining pattern against rest of event (including empty)
-        for (let i = eventIdx; i <= eventParts.length; i++) {
-          const remainingEvent = eventParts.slice(i).join('.')
-          const remainingPattern = patternParts.slice(patternIdx + 1).join('.')
-          if (this.matchesPattern(remainingEvent, remainingPattern)) {
-            return true
-          }
-        }
-        return false
-      } else if (eventIdx >= eventParts.length) {
-        // No more event parts but pattern still has non-** parts
-        return false
-      } else if (p === '*') {
-        // * matches exactly one segment
-        eventIdx++
-        patternIdx++
-      } else if (p === eventParts[eventIdx]) {
-        // Exact match
-        eventIdx++
-        patternIdx++
-      } else {
-        return false
-      }
-    }
-
-    // Both should be exhausted for a match
-    return eventIdx === eventParts.length && patternIdx === patternParts.length
-  }
-
-  /**
    * Convert database row to Subscription object
    */
   private rowToSubscription(row: SqlRow): Subscription {
     return {
       id: getString(row, 'id'),
       workerId: getString(row, 'worker_id'),
-      workerBinding: getOptionalString(row, 'worker_binding') ?? undefined,
+      workerBinding: getOptionalString(row, 'worker_binding'),
       pattern: getString(row, 'pattern'),
       patternPrefix: getString(row, 'pattern_prefix'),
       rpcMethod: getString(row, 'rpc_method'),
@@ -841,6 +1352,9 @@ export class SubscriptionDO extends DurableObject<Env> {
       active: getBoolean(row, 'active'),
       createdAt: getNumber(row, 'created_at'),
       updatedAt: getNumber(row, 'updated_at'),
+      batchEnabled: getOptionalBoolean(row, 'batch_enabled') ?? false,
+      batchSize: getOptionalNumber(row, 'batch_size') ?? DEFAULT_BATCH_DELIVERY_SIZE,
+      batchWindowMs: getOptionalNumber(row, 'batch_window_ms') ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS,
     }
   }
 
@@ -856,10 +1370,10 @@ export class SubscriptionDO extends DurableObject<Env> {
       eventPayload: getString(row, 'event_payload'),
       status: getString(row, 'status') as 'pending' | 'delivered' | 'failed' | 'dead',
       attemptCount: getNumber(row, 'attempt_count'),
-      nextAttemptAt: getOptionalNumber(row, 'next_attempt_at') ?? undefined,
-      lastError: getOptionalString(row, 'last_error') ?? undefined,
+      nextAttemptAt: getOptionalNumber(row, 'next_attempt_at'),
+      lastError: getOptionalString(row, 'last_error'),
       createdAt: getNumber(row, 'created_at'),
-      deliveredAt: getOptionalNumber(row, 'delivered_at') ?? undefined,
+      deliveredAt: getOptionalNumber(row, 'delivered_at'),
     }
   }
 
@@ -873,7 +1387,8 @@ export class SubscriptionDO extends DurableObject<Env> {
    * 1. Gets all active subscriptions
    * 2. Finds matching subscriptions using pattern matcher
    * 3. Creates delivery records for each match
-   * 4. Attempts immediate delivery
+   * 4. For non-batched: attempts immediate delivery
+   * 5. For batched: adds to batch for time-window delivery
    *
    * @param event - The event to fan out
    * @returns Object with matched count and delivery IDs
@@ -883,7 +1398,7 @@ export class SubscriptionDO extends DurableObject<Env> {
     type: string
     ts: string
     payload: unknown
-  }): Promise<{ matched: number; deliveries: string[] }> {
+  }): Promise<{ matched: number; deliveries: string[]; batched: number }> {
     // 1. Get all active subscriptions
     const subscriptions = this.sql.exec(
       `SELECT * FROM subscriptions WHERE active = 1`
@@ -902,10 +1417,13 @@ export class SubscriptionDO extends DurableObject<Env> {
 
     // 3. Create delivery record for each match
     const deliveryIds: string[] = []
+    const immediateDeliveryIds: string[] = []
     const now = Date.now()
+    let batchedCount = 0
 
     for (const sub of matches) {
       const deliveryId = ulid()
+      const subscription = this.rowToSubscription(sub as unknown as SqlRow)
 
       try {
         this.sql.exec(
@@ -920,18 +1438,27 @@ export class SubscriptionDO extends DurableObject<Env> {
           now
         )
         deliveryIds.push(deliveryId)
-      } catch (e) {
+
+        if (subscription.batchEnabled) {
+          // Add to batch for time-window delivery
+          await this.addToBatch(sub.id, deliveryId, subscription)
+          batchedCount++
+        } else {
+          // Queue for immediate delivery
+          immediateDeliveryIds.push(deliveryId)
+        }
+      } catch (_e) {
         // Likely duplicate - already delivered (UNIQUE constraint on subscription_id, event_id)
         console.log(`Delivery already exists for subscription ${sub.id}, event ${event.id}`)
       }
     }
 
-    // 4. Attempt immediate delivery
-    if (deliveryIds.length > 0) {
-      await this.processDeliveries(deliveryIds)
+    // 4. Attempt immediate delivery for non-batched subscriptions
+    if (immediateDeliveryIds.length > 0) {
+      await this.processDeliveries(immediateDeliveryIds)
     }
 
-    return { matched: matches.length, deliveries: deliveryIds }
+    return { matched: matches.length, deliveries: deliveryIds, batched: batchedCount }
   }
 
   /**
@@ -993,8 +1520,11 @@ export class SubscriptionDO extends DurableObject<Env> {
         const rpcMethod = getString(delivery as SqlRow, 'rpc_method')
         const timeoutMs = getNumber(delivery as SqlRow, 'timeout_ms')
 
+        // Build URL with validation to prevent SSRF attacks
+        const deliveryUrl = buildSafeDeliveryUrl(workerId, rpcMethod)
+
         const httpResponse = await fetch(
-          `https://${workerId}.workers.dev/rpc/${rpcMethod}`,
+          deliveryUrl,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1074,10 +1604,6 @@ export class SubscriptionDO extends DurableObject<Env> {
 
   /**
    * Calculate retry delay with exponential backoff and jitter
-   *
-   * Base delay: 1 second
-   * Max delay: 5 minutes
-   * Formula: min(baseDelay * 2^(attempt-1), maxDelay) + random jitter (0-1s)
    */
   private calculateRetryDelay(attemptNumber: number): number {
     const exponential = Math.min(SUBSCRIPTION_RETRY_BASE_DELAY_MS * Math.pow(2, attemptNumber - 1), SUBSCRIPTION_RETRY_MAX_DELAY_MS)
@@ -1087,10 +1613,6 @@ export class SubscriptionDO extends DurableObject<Env> {
 
   /**
    * Schedule an alarm for the next pending retry
-   *
-   * Only sets alarm if:
-   * - There are failed deliveries with next_attempt_at set
-   * - No alarm is currently set, or the new time is sooner
    */
   private async scheduleRetryAlarm(): Promise<void> {
     const nextRetry = this.sql.exec(
@@ -1101,7 +1623,6 @@ export class SubscriptionDO extends DurableObject<Env> {
       const currentAlarm = await this.ctx.storage.getAlarm()
       const nextTime = getNumber(nextRetry as SqlRow, 'next_time')
 
-      // Only set alarm if no alarm or new time is sooner
       if (!currentAlarm || nextTime < currentAlarm) {
         await this.ctx.storage.setAlarm(nextTime)
       }
@@ -1109,19 +1630,49 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Alarm handler - processes failed deliveries ready for retry
-   *
-   * Called by Cloudflare when a scheduled alarm fires.
-   * Processes up to SUBSCRIPTION_BATCH_LIMIT deliveries per alarm to avoid timeout.
+   * Alarm handler - processes failed deliveries and batches ready for delivery
    */
   async alarm(): Promise<void> {
-    // Process all failed deliveries ready for retry
+    const now = Date.now()
+
+    // Close any batches whose windows have expired
+    this.sql.exec(
+      `UPDATE batch_deliveries
+       SET window_end = ?, next_attempt_at = ?
+       WHERE status = 'pending'
+       AND window_end IS NULL
+       AND window_start + (
+         SELECT batch_window_ms FROM subscriptions WHERE id = batch_deliveries.subscription_id
+       ) <= ?`,
+      now,
+      now,
+      now
+    )
+
+    // Process batch deliveries ready for delivery
+    const readyBatches = this.sql.exec(
+      `SELECT id FROM batch_deliveries
+       WHERE status IN ('pending', 'failed')
+       AND window_end IS NOT NULL
+       AND next_attempt_at <= ?
+       ORDER BY next_attempt_at ASC
+       LIMIT ?`,
+      now,
+      SUBSCRIPTION_BATCH_LIMIT
+    ).toArray()
+
+    for (const row of readyBatches) {
+      await this.deliverBatch(getString(row as SqlRow, 'id'))
+    }
+
+    // Process individual failed deliveries ready for retry
     const ready = this.sql.exec(
       `SELECT id FROM deliveries
        WHERE status = 'failed' AND next_attempt_at <= ?
+       AND batch_id IS NULL
        ORDER BY next_attempt_at ASC
        LIMIT ?`,
-      Date.now(),
+      now,
       SUBSCRIPTION_BATCH_LIMIT
     ).toArray()
 
@@ -1129,8 +1680,26 @@ export class SubscriptionDO extends DurableObject<Env> {
       await this.deliverOne(getString(row as SqlRow, 'id'))
     }
 
-    // Schedule next alarm if more retries pending
+    // Schedule next alarm if more retries/batches pending
     await this.scheduleRetryAlarm()
+    await this.scheduleBatchAlarm()
+
+    // Check for open batches that need window-end alarms
+    const openBatch = this.sql.exec(
+      `SELECT MIN(b.window_start + s.batch_window_ms) as next_window
+       FROM batch_deliveries b
+       JOIN subscriptions s ON b.subscription_id = s.id
+       WHERE b.status = 'pending'
+       AND b.window_end IS NULL`
+    ).one()
+
+    if (openBatch?.next_window) {
+      const nextWindow = getNumber(openBatch as SqlRow, 'next_window')
+      const currentAlarm = await this.ctx.storage.getAlarm()
+      if (!currentAlarm || nextWindow < currentAlarm) {
+        await this.ctx.storage.setAlarm(nextWindow)
+      }
+    }
   }
 
   /**
@@ -1167,19 +1736,12 @@ export class SubscriptionDO extends DurableObject<Env> {
 
   /**
    * Clean up old data to prevent unbounded growth
-   *
-   * Deletes:
-   * - Dead letters older than cutoffTs
-   * - Delivery logs for completed/dead deliveries older than cutoffTs
-   * - Completed/dead deliveries older than cutoffTs
-   *
-   * @param cutoffTs - Timestamp (milliseconds) - delete records older than this
-   * @returns Counts of deleted records
    */
   async cleanupOldData(cutoffTs: number): Promise<{
     deadLettersDeleted: number
     deliveryLogsDeleted: number
     deliveriesDeleted: number
+    batchDeliveriesDeleted: number
   }> {
     // 1. Delete old dead letters
     const deadLettersResult = this.sql.exec(
@@ -1188,8 +1750,7 @@ export class SubscriptionDO extends DurableObject<Env> {
     )
     const deadLettersDeleted = deadLettersResult.rowsWritten
 
-    // 2. Delete old delivery logs for completed or dead deliveries
-    // Keep logs for pending/failed deliveries to aid debugging
+    // 2. Delete old delivery logs
     const logsResult = this.sql.exec(
       `DELETE FROM delivery_log
        WHERE created_at < ?
@@ -1203,8 +1764,7 @@ export class SubscriptionDO extends DurableObject<Env> {
     )
     const deliveryLogsDeleted = logsResult.rowsWritten
 
-    // 3. Delete old completed/dead deliveries
-    // Only delete deliveries that are in terminal states
+    // 3. Delete old deliveries
     const deliveriesResult = this.sql.exec(
       `DELETE FROM deliveries
        WHERE status IN ('delivered', 'dead')
@@ -1215,10 +1775,22 @@ export class SubscriptionDO extends DurableObject<Env> {
     )
     const deliveriesDeleted = deliveriesResult.rowsWritten
 
+    // 4. Delete old batch deliveries
+    const batchResult = this.sql.exec(
+      `DELETE FROM batch_deliveries
+       WHERE status IN ('delivered', 'dead')
+       AND created_at < ?
+       AND (delivered_at IS NOT NULL AND delivered_at < ?)`,
+      cutoffTs,
+      cutoffTs
+    )
+    const batchDeliveriesDeleted = batchResult.rowsWritten
+
     return {
       deadLettersDeleted,
       deliveryLogsDeleted,
       deliveriesDeleted,
+      batchDeliveriesDeleted,
     }
   }
 }

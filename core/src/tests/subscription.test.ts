@@ -11,81 +11,16 @@ import { findMatchingSubscriptions, extractPatternPrefix, matchPattern } from '.
 
 // ============================================================================
 // Pattern Matching Logic Tests
-// These test the pattern matching algorithm without DO infrastructure
+// These test the pattern matching algorithm using the shared implementation
+// from pattern-matcher.ts
 // ============================================================================
 
-/**
- * Extract prefix from pattern for indexing
- * Mirrors the logic in SubscriptionDO
- */
-function extractPrefix(pattern: string): string {
-  const parts = pattern.split('.')
-  const wildcardIdx = parts.findIndex(p => p === '*' || p === '**')
-  if (wildcardIdx === -1) {
-    return pattern
-  }
-  if (wildcardIdx === 0) {
-    return ''
-  }
-  return parts.slice(0, wildcardIdx).join('.')
-}
+// Helper to match patterns with the same argument order as the old matchesPattern
+// Note: matchPattern(pattern, eventType) - pattern first, event type second
+const matchesPattern = (eventType: string, pattern: string) => matchPattern(pattern, eventType)
 
-/**
- * Check if an event type matches a subscription pattern
- * Mirrors the logic in SubscriptionDO
- */
-function matchesPattern(eventType: string, pattern: string): boolean {
-  // Handle special root patterns
-  if (pattern === '**') {
-    return true
-  }
-  if (pattern === '*') {
-    // * at root matches only single-segment event types
-    return !eventType.includes('.')
-  }
-
-  const eventParts = eventType.split('.')
-  const patternParts = pattern.split('.')
-
-  let eventIdx = 0
-  let patternIdx = 0
-
-  while (patternIdx < patternParts.length) {
-    const p = patternParts[patternIdx]
-
-    if (p === '**') {
-      // ** matches zero or more segments
-      // If it's the last pattern part, match everything remaining (including nothing)
-      if (patternIdx === patternParts.length - 1) {
-        return true
-      }
-      // Try matching remaining pattern against rest of event (including empty)
-      for (let i = eventIdx; i <= eventParts.length; i++) {
-        const remainingEvent = eventParts.slice(i).join('.')
-        const remainingPattern = patternParts.slice(patternIdx + 1).join('.')
-        if (matchesPattern(remainingEvent, remainingPattern)) {
-          return true
-        }
-      }
-      return false
-    } else if (eventIdx >= eventParts.length) {
-      // No more event parts but pattern still has non-** parts
-      return false
-    } else if (p === '*') {
-      // * matches exactly one segment
-      eventIdx++
-      patternIdx++
-    } else if (p === eventParts[eventIdx]) {
-      // Exact match
-      eventIdx++
-      patternIdx++
-    } else {
-      return false
-    }
-  }
-
-  return eventIdx === eventParts.length && patternIdx === patternParts.length
-}
+// Alias extractPatternPrefix for backward compatibility with existing tests
+const extractPrefix = extractPatternPrefix
 
 // ============================================================================
 // Tests
@@ -214,8 +149,10 @@ describe('SubscriptionDO Logic', () => {
     })
 
     describe('edge cases', () => {
-      it('handles empty segments correctly', () => {
-        expect(matchesPattern('', '')).toBe(true)
+      it('rejects empty patterns (validated by pattern matcher)', () => {
+        // The shared pattern matcher validates patterns and rejects empty strings
+        // as they contain invalid characters (empty string doesn't match ALLOWED_PATTERN_CHARS)
+        expect(() => matchesPattern('', '')).toThrow('Pattern contains invalid characters')
       })
 
       it('handles single segment events', () => {
@@ -860,6 +797,538 @@ describe('Cleanup Logic', () => {
       const now = 1700000000000 // Fixed timestamp for testing
       const cutoff = now - DEAD_LETTER_TTL_MS
       expect(cutoff).toBe(now - 2592000000)
+    })
+  })
+})
+
+// ============================================================================
+// Worker ID Validation Integration Tests
+// ============================================================================
+
+describe('Subscription Worker ID Validation', () => {
+  // These tests verify the validation logic that would be used in SubscriptionDO.subscribe()
+  // The actual DO cannot be tested without vitest-pool-workers, but we can test the validation logic
+  // Import validation functions (they're also tested in worker-id-validation.test.ts)
+  const validateWorkerId = (workerId: unknown) => {
+    if (typeof workerId !== 'string') return { valid: false, error: 'Worker ID must be a string' }
+    if (workerId.length === 0) return { valid: false, error: 'Worker ID cannot be empty' }
+    // Check for blocklisted patterns (SSRF prevention)
+    const blocklist = ['http://', 'https://', 'localhost', '..', '/', '?', '@', ':', '%', '\n', '\r', '169.254.169.254']
+    for (const pattern of blocklist) {
+      if (workerId.toLowerCase().includes(pattern.toLowerCase())) {
+        return { valid: false, error: `Worker ID contains blocked pattern: ${pattern}` }
+      }
+    }
+    // Pattern validation (Cloudflare worker naming)
+    if (!/^[a-z][a-z0-9-]*[a-z0-9]$|^[a-z]$/.test(workerId)) {
+      return { valid: false, error: 'Invalid worker ID format' }
+    }
+    return { valid: true }
+  }
+
+  const validateRpcMethod = (rpcMethod: unknown) => {
+    if (typeof rpcMethod !== 'string') return { valid: false, error: 'RPC method must be a string' }
+    if (rpcMethod.length === 0) return { valid: false, error: 'RPC method cannot be empty' }
+    const blocklist = ['..', '/', '?', '@', '%', '\n', '\r']
+    for (const pattern of blocklist) {
+      if (rpcMethod.includes(pattern)) {
+        return { valid: false, error: `RPC method contains blocked pattern: ${pattern}` }
+      }
+    }
+    if (!/^[a-zA-Z][a-zA-Z0-9_]*$/.test(rpcMethod)) {
+      return { valid: false, error: 'Invalid RPC method format' }
+    }
+    return { valid: true }
+  }
+
+  const buildSafeDeliveryUrl = (workerId: string, rpcMethod: string): string => {
+    const workerIdResult = validateWorkerId(workerId)
+    if (!workerIdResult.valid) throw new Error(`Invalid worker ID: ${workerIdResult.error}`)
+    const rpcMethodResult = validateRpcMethod(rpcMethod)
+    if (!rpcMethodResult.valid) throw new Error(`Invalid RPC method: ${rpcMethodResult.error}`)
+    return `https://${workerId}.workers.dev/rpc/${rpcMethod}`
+  }
+
+  describe('subscribe() validation', () => {
+    function simulateSubscribeValidation(params: {
+      workerId: string
+      rpcMethod: string
+    }): { ok: true } | { ok: false; error: string } {
+      const workerIdResult = validateWorkerId(params.workerId)
+      if (!workerIdResult.valid) {
+        return { ok: false, error: `Invalid workerId: ${workerIdResult.error}` }
+      }
+
+      const rpcMethodResult = validateRpcMethod(params.rpcMethod)
+      if (!rpcMethodResult.valid) {
+        return { ok: false, error: `Invalid rpcMethod: ${rpcMethodResult.error}` }
+      }
+
+      return { ok: true }
+    }
+
+    it('accepts valid subscription parameters', () => {
+      expect(simulateSubscribeValidation({
+        workerId: 'my-worker',
+        rpcMethod: 'handleEvent',
+      })).toEqual({ ok: true })
+    })
+
+    it('rejects invalid workerId with URL', () => {
+      const result = simulateSubscribeValidation({
+        workerId: 'http://evil.com',
+        rpcMethod: 'handleEvent',
+      })
+      expect(result.ok).toBe(false)
+      expect((result as { ok: false; error: string }).error).toContain('Invalid workerId')
+    })
+
+    it('rejects invalid workerId with localhost', () => {
+      const result = simulateSubscribeValidation({
+        workerId: 'localhost',
+        rpcMethod: 'handleEvent',
+      })
+      expect(result.ok).toBe(false)
+      expect((result as { ok: false; error: string }).error).toContain('Invalid workerId')
+    })
+
+    it('rejects invalid rpcMethod with path traversal', () => {
+      const result = simulateSubscribeValidation({
+        workerId: 'my-worker',
+        rpcMethod: '../etc/passwd',
+      })
+      expect(result.ok).toBe(false)
+      expect((result as { ok: false; error: string }).error).toContain('Invalid rpcMethod')
+    })
+  })
+
+  describe('deliverOne() URL construction', () => {
+    it('builds safe URLs for valid inputs', () => {
+      expect(buildSafeDeliveryUrl('my-worker', 'handleEvent'))
+        .toBe('https://my-worker.workers.dev/rpc/handleEvent')
+    })
+
+    it('throws for SSRF attempts during delivery', () => {
+      expect(() => buildSafeDeliveryUrl('evil.com/path', 'method')).toThrow()
+      expect(() => buildSafeDeliveryUrl('localhost', 'method')).toThrow()
+      expect(() => buildSafeDeliveryUrl('169.254.169.254', 'method')).toThrow()
+    })
+  })
+})
+
+// ============================================================================
+// Batched Delivery Logic Tests
+// ============================================================================
+
+describe('Batched Delivery Logic', () => {
+  describe('BatchDeliveryConfig validation', () => {
+    const DEFAULT_BATCH_DELIVERY_SIZE = 100
+    const DEFAULT_BATCH_DELIVERY_WINDOW_MS = 1000
+    const MAX_BATCH_DELIVERY_SIZE = 1000
+    const MAX_BATCH_DELIVERY_WINDOW_MS = 10000
+
+    function validateBatchConfig(config: {
+      enabled: boolean
+      batchSize?: number
+      batchWindowMs?: number
+    }): { ok: true } | { ok: false; error: string } {
+      if (!config.enabled) {
+        return { ok: true }
+      }
+
+      const batchSize = config.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
+      const batchWindowMs = config.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
+
+      if (batchSize < 1 || batchSize > MAX_BATCH_DELIVERY_SIZE) {
+        return { ok: false, error: `batchSize must be between 1 and ${MAX_BATCH_DELIVERY_SIZE}` }
+      }
+
+      if (batchWindowMs < 1 || batchWindowMs > MAX_BATCH_DELIVERY_WINDOW_MS) {
+        return { ok: false, error: `batchWindowMs must be between 1 and ${MAX_BATCH_DELIVERY_WINDOW_MS}` }
+      }
+
+      return { ok: true }
+    }
+
+    it('accepts disabled batch config', () => {
+      expect(validateBatchConfig({ enabled: false })).toEqual({ ok: true })
+    })
+
+    it('accepts valid enabled batch config', () => {
+      expect(validateBatchConfig({
+        enabled: true,
+        batchSize: 50,
+        batchWindowMs: 2000,
+      })).toEqual({ ok: true })
+    })
+
+    it('uses defaults when values not provided', () => {
+      expect(validateBatchConfig({ enabled: true })).toEqual({ ok: true })
+    })
+
+    it('rejects batchSize of 0', () => {
+      const result = validateBatchConfig({
+        enabled: true,
+        batchSize: 0,
+      })
+      expect(result.ok).toBe(false)
+      expect((result as { ok: false; error: string }).error).toContain('batchSize')
+    })
+
+    it('rejects batchSize exceeding max', () => {
+      const result = validateBatchConfig({
+        enabled: true,
+        batchSize: 1001,
+      })
+      expect(result.ok).toBe(false)
+      expect((result as { ok: false; error: string }).error).toContain('batchSize')
+    })
+
+    it('rejects batchWindowMs of 0', () => {
+      const result = validateBatchConfig({
+        enabled: true,
+        batchWindowMs: 0,
+      })
+      expect(result.ok).toBe(false)
+      expect((result as { ok: false; error: string }).error).toContain('batchWindowMs')
+    })
+
+    it('rejects batchWindowMs exceeding max', () => {
+      const result = validateBatchConfig({
+        enabled: true,
+        batchWindowMs: 10001,
+      })
+      expect(result.ok).toBe(false)
+      expect((result as { ok: false; error: string }).error).toContain('batchWindowMs')
+    })
+  })
+
+  describe('Batch window logic', () => {
+    interface BatchState {
+      windowStart: number
+      eventCount: number
+      batchSize: number
+      batchWindowMs: number
+    }
+
+    function shouldCloseBatch(state: BatchState, now: number): {
+      close: boolean
+      reason: 'full' | 'window_expired' | null
+    } {
+      const windowExpired = (now - state.windowStart) >= state.batchWindowMs
+      const batchFull = state.eventCount >= state.batchSize
+
+      if (batchFull) {
+        return { close: true, reason: 'full' }
+      }
+      if (windowExpired) {
+        return { close: true, reason: 'window_expired' }
+      }
+      return { close: false, reason: null }
+    }
+
+    it('keeps batch open when under size and within window', () => {
+      const state: BatchState = {
+        windowStart: 1000,
+        eventCount: 10,
+        batchSize: 100,
+        batchWindowMs: 1000,
+      }
+      const result = shouldCloseBatch(state, 1500)
+      expect(result.close).toBe(false)
+    })
+
+    it('closes batch when full', () => {
+      const state: BatchState = {
+        windowStart: 1000,
+        eventCount: 100,
+        batchSize: 100,
+        batchWindowMs: 1000,
+      }
+      const result = shouldCloseBatch(state, 1500)
+      expect(result.close).toBe(true)
+      expect(result.reason).toBe('full')
+    })
+
+    it('closes batch when window expired', () => {
+      const state: BatchState = {
+        windowStart: 1000,
+        eventCount: 10,
+        batchSize: 100,
+        batchWindowMs: 1000,
+      }
+      const result = shouldCloseBatch(state, 2001)
+      expect(result.close).toBe(true)
+      expect(result.reason).toBe('window_expired')
+    })
+
+    it('prefers full reason over window expired', () => {
+      const state: BatchState = {
+        windowStart: 1000,
+        eventCount: 100,
+        batchSize: 100,
+        batchWindowMs: 1000,
+      }
+      const result = shouldCloseBatch(state, 3000)
+      expect(result.close).toBe(true)
+      expect(result.reason).toBe('full')
+    })
+  })
+
+  describe('Batch payload construction', () => {
+    interface Event {
+      deliveryId: string
+      eventId: string
+      eventType: string
+      payload: unknown
+    }
+
+    function buildBatchPayload(events: Event[]): {
+      batch: true
+      events: Event[]
+    } {
+      return {
+        batch: true,
+        events,
+      }
+    }
+
+    it('creates correct batch payload structure', () => {
+      const events: Event[] = [
+        { deliveryId: 'del1', eventId: 'evt1', eventType: 'user.created', payload: { id: 1 } },
+        { deliveryId: 'del2', eventId: 'evt2', eventType: 'user.updated', payload: { id: 2 } },
+      ]
+
+      const payload = buildBatchPayload(events)
+      expect(payload.batch).toBe(true)
+      expect(payload.events).toHaveLength(2)
+      expect(payload.events[0].eventId).toBe('evt1')
+      expect(payload.events[1].eventId).toBe('evt2')
+    })
+  })
+
+  describe('Partial failure handling', () => {
+    interface EventResult {
+      eventId: string
+      success: boolean
+      error?: string
+    }
+
+    interface BatchResult {
+      total: number
+      delivered: number
+      failed: number
+    }
+
+    function processPartialResults(
+      events: Array<{ eventId: string }>,
+      results: EventResult[]
+    ): BatchResult {
+      let delivered = 0
+      let failed = 0
+
+      for (const result of results) {
+        if (result.success) {
+          delivered++
+        } else {
+          failed++
+        }
+      }
+
+      // Events without results are assumed failed
+      const resultIds = new Set(results.map(r => r.eventId))
+      for (const event of events) {
+        if (!resultIds.has(event.eventId)) {
+          failed++
+        }
+      }
+
+      return {
+        total: events.length,
+        delivered,
+        failed,
+      }
+    }
+
+    it('counts all success correctly', () => {
+      const events = [{ eventId: 'evt1' }, { eventId: 'evt2' }]
+      const results: EventResult[] = [
+        { eventId: 'evt1', success: true },
+        { eventId: 'evt2', success: true },
+      ]
+
+      const result = processPartialResults(events, results)
+      expect(result.total).toBe(2)
+      expect(result.delivered).toBe(2)
+      expect(result.failed).toBe(0)
+    })
+
+    it('counts partial failure correctly', () => {
+      const events = [{ eventId: 'evt1' }, { eventId: 'evt2' }]
+      const results: EventResult[] = [
+        { eventId: 'evt1', success: true },
+        { eventId: 'evt2', success: false, error: 'validation error' },
+      ]
+
+      const result = processPartialResults(events, results)
+      expect(result.total).toBe(2)
+      expect(result.delivered).toBe(1)
+      expect(result.failed).toBe(1)
+    })
+
+    it('counts missing results as failures', () => {
+      const events = [{ eventId: 'evt1' }, { eventId: 'evt2' }, { eventId: 'evt3' }]
+      const results: EventResult[] = [
+        { eventId: 'evt1', success: true },
+        // evt2 and evt3 are missing from results
+      ]
+
+      const result = processPartialResults(events, results)
+      expect(result.total).toBe(3)
+      expect(result.delivered).toBe(1)
+      expect(result.failed).toBe(2)
+    })
+  })
+
+  describe('Subscription fanout with batching', () => {
+    interface MockSubscription {
+      id: string
+      pattern: string
+      batchEnabled: boolean
+      batchSize: number
+      batchWindowMs: number
+    }
+
+    function simulateFanout(
+      eventType: string,
+      subscriptions: MockSubscription[]
+    ): { matched: number; immediate: number; batched: number } {
+      let matched = 0
+      let immediate = 0
+      let batched = 0
+
+      for (const sub of subscriptions) {
+        // Simplified pattern matching
+        if (sub.pattern === eventType || sub.pattern === '**') {
+          matched++
+          if (sub.batchEnabled) {
+            batched++
+          } else {
+            immediate++
+          }
+        }
+      }
+
+      return { matched, immediate, batched }
+    }
+
+    const testSubscriptions: MockSubscription[] = [
+      { id: 'sub1', pattern: 'user.created', batchEnabled: false, batchSize: 100, batchWindowMs: 1000 },
+      { id: 'sub2', pattern: 'user.created', batchEnabled: true, batchSize: 50, batchWindowMs: 2000 },
+      { id: 'sub3', pattern: '**', batchEnabled: true, batchSize: 100, batchWindowMs: 5000 },
+    ]
+
+    it('routes events to batched and immediate subscriptions', () => {
+      const result = simulateFanout('user.created', testSubscriptions)
+      expect(result.matched).toBe(3) // sub1, sub2, sub3 all match
+      expect(result.immediate).toBe(1) // sub1
+      expect(result.batched).toBe(2) // sub2, sub3
+    })
+
+    it('only matches ** for unmatched events', () => {
+      const result = simulateFanout('order.completed', testSubscriptions)
+      expect(result.matched).toBe(1) // only sub3 with ** matches
+      expect(result.immediate).toBe(0)
+      expect(result.batched).toBe(1)
+    })
+  })
+
+  describe('Batch retry scheduling', () => {
+    function calculateBatchRetryDelay(attemptNumber: number): number {
+      const baseDelay = 1000
+      const maxDelay = 300000
+      const exponential = Math.min(baseDelay * Math.pow(2, attemptNumber - 1), maxDelay)
+      return exponential
+    }
+
+    it('calculates exponential backoff for batch retries', () => {
+      expect(calculateBatchRetryDelay(1)).toBe(1000)
+      expect(calculateBatchRetryDelay(2)).toBe(2000)
+      expect(calculateBatchRetryDelay(3)).toBe(4000)
+      expect(calculateBatchRetryDelay(4)).toBe(8000)
+    })
+
+    it('caps batch retry delay at maximum', () => {
+      expect(calculateBatchRetryDelay(10)).toBe(300000)
+      expect(calculateBatchRetryDelay(20)).toBe(300000)
+    })
+  })
+
+  describe('Batch delivery result tracking', () => {
+    interface BatchDeliveryResult {
+      total: number
+      delivered: number
+      failed: number
+      durationMs: number
+      results: Array<{
+        deliveryId: string
+        eventId: string
+        success: boolean
+        error?: string
+      }>
+    }
+
+    function aggregateBatchResults(results: BatchDeliveryResult[]): {
+      totalBatches: number
+      totalEvents: number
+      totalDelivered: number
+      totalFailed: number
+      avgDurationMs: number
+    } {
+      if (results.length === 0) {
+        return { totalBatches: 0, totalEvents: 0, totalDelivered: 0, totalFailed: 0, avgDurationMs: 0 }
+      }
+
+      let totalEvents = 0
+      let totalDelivered = 0
+      let totalFailed = 0
+      let totalDuration = 0
+
+      for (const result of results) {
+        totalEvents += result.total
+        totalDelivered += result.delivered
+        totalFailed += result.failed
+        totalDuration += result.durationMs
+      }
+
+      return {
+        totalBatches: results.length,
+        totalEvents,
+        totalDelivered,
+        totalFailed,
+        avgDurationMs: totalDuration / results.length,
+      }
+    }
+
+    it('aggregates multiple batch results correctly', () => {
+      const results: BatchDeliveryResult[] = [
+        { total: 10, delivered: 8, failed: 2, durationMs: 100, results: [] },
+        { total: 20, delivered: 20, failed: 0, durationMs: 200, results: [] },
+        { total: 15, delivered: 10, failed: 5, durationMs: 150, results: [] },
+      ]
+
+      const aggregate = aggregateBatchResults(results)
+      expect(aggregate.totalBatches).toBe(3)
+      expect(aggregate.totalEvents).toBe(45)
+      expect(aggregate.totalDelivered).toBe(38)
+      expect(aggregate.totalFailed).toBe(7)
+      expect(aggregate.avgDurationMs).toBe(150)
+    })
+
+    it('handles empty results', () => {
+      const aggregate = aggregateBatchResults([])
+      expect(aggregate.totalBatches).toBe(0)
+      expect(aggregate.totalEvents).toBe(0)
     })
   })
 })
