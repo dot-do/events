@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@dotdo/deltalake':
+        specifier: file:../deltalake
+        version: file:../deltalake
       '@dotdo/events':
         specifier: file:./core
         version: link:core
@@ -63,6 +66,9 @@ importers:
 
   core:
     dependencies:
+      '@dotdo/deltalake':
+        specifier: file:../../deltalake
+        version: file:../deltalake
       '@dotdo/hyparquet-writer':
         specifier: github:dot-do/hyparquet-writer
         version: hyparquet-writer@https://codeload.github.com/dot-do/hyparquet-writer/tar.gz/590a8ffc319a4d34d27b7c2d653c73c9c85eaffd
@@ -271,6 +277,16 @@ packages:
     peerDependenciesMeta:
       '@cloudflare/workers-types':
         optional: true
+
+  '@dotdo/deltalake@file:../deltalake':
+    resolution: {directory: ../deltalake, type: directory}
+    engines: {node: '>=18.0.0'}
+
+  '@dotdo/hyparquet-writer@0.12.0':
+    resolution: {integrity: sha512-u12Td/ESkUFAOb6KVmXgeMH4rjCZkFK8jk1pEhGswCYXHIS+44OmhipEeo/JxBfrnO8BzBbtuVIYzFMsoCE/SQ==}
+
+  '@dotdo/hyparquet@1.17.1':
+    resolution: {integrity: sha512-+rVVsqcRnr0l+/jtQQr79PVdMEEhprPZcyhNjOo26IF3OkZYfK+eeYJsj8WclLp81ECdTQKjjcMXD8piiptGRQ==}
 
   '@dotdo/oauth@0.1.7':
     resolution: {integrity: sha512-I0NPrpxcuGvogOH5jPtyUbCQPdcqnrwNPTSqj4hw+UFicHMCaw5K/NP8PsASm1mWMZH3RcTWljgJDYA5pL0+Bg==}
@@ -2063,6 +2079,18 @@ snapshots:
       '@cloudflare/workers-types': 4.20260131.0
     transitivePeerDependencies:
       - typescript
+
+  '@dotdo/deltalake@file:../deltalake':
+    dependencies:
+      '@dotdo/hyparquet': 1.17.1
+      '@dotdo/hyparquet-writer': 0.12.0
+      hyparquet-compressors: 1.1.1
+
+  '@dotdo/hyparquet-writer@0.12.0':
+    dependencies:
+      '@dotdo/hyparquet': 1.17.1
+
+  '@dotdo/hyparquet@1.17.1': {}
 
   '@dotdo/oauth@0.1.7(@cloudflare/workers-types@4.20260131.0)(hono@4.11.7)(typescript@5.9.3)':
     dependencies:

@@ -80,4 +80,15 @@ export interface Env extends WebhookEnv {
   MAX_WEBHOOK_BODY_SIZE?: string
   /** Max request body size in bytes for query endpoint (default: 65536 = 64KB) */
   MAX_QUERY_BODY_SIZE?: string
+
+  // ============================================================================
+  // DeltaLake Integration Configuration
+  // ============================================================================
+
+  /** Enable DeltaTable for event storage (default: false) */
+  USE_DELTALAKE?: string
+  /** Enable DeltaTable for CDC storage (default: false) */
+  USE_DELTALAKE_CDC?: string
+  /** Enable dual-write mode during migration - writes to both legacy and DeltaTable (default: false) */
+  DELTALAKE_DUAL_WRITE?: string
 }

@@ -24,12 +24,31 @@ import { withSchedulerLock } from '../scheduler-lock'
 import { KNOWN_SUBSCRIPTION_SHARDS } from '../subscription-routes'
 import { createLogger, logError, generateCorrelationId, type Logger } from '../logger'
 import { runReconciliation, getReconciliationConfig } from '../jobs/reconciliation'
+import { compact, vacuum, deduplicate, type DeltaTable } from '@dotdo/deltalake'
+import { createR2Storage } from '../../core/src/deltalake-storage'
+import { createEventsTable, createSimpleCDCTable } from '../../core/src/deltalake-factory'
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
 const DEAD_LETTER_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 const SUBSCRIPTION_DEAD_LETTER_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+const DELTALAKE_VACUUM_RETENTION_HOURS = 168 // 7 days
+const DELTALAKE_TARGET_FILE_SIZE = 128 * 1024 * 1024 // 128MB
 
 // Note: log is created per-invocation in handleScheduled to include correlation ID
+
+/**
+ * Check if deltalake is enabled for events.
+ */
+function useDeltalakeEvents(env: Env): boolean {
+  return env.USE_DELTALAKE === 'true'
+}
+
+/**
+ * Check if deltalake is enabled for CDC.
+ */
+function useDeltalakeCDC(env: Env): boolean {
+  return env.USE_DELTALAKE_CDC === 'true'
+}
 
 /**
  * Task 1: Dedup marker cleanup (delete markers older than 24 hours)
@@ -224,6 +243,199 @@ async function runEventStreamCompaction(env: Env, log: Logger): Promise<void> {
     }
   } catch (err) {
     logError(log, 'Error during event stream compaction', err)
+  }
+}
+
+/**
+ * Task 3b: DeltaLake Event Compaction (hourly, when USE_DELTALAKE=true)
+ * Uses native deltalake compact() and vacuum() for event tables.
+ */
+async function runDeltalakeEventCompaction(env: Env, log: Logger): Promise<void> {
+  if (!useDeltalakeEvents(env)) {
+    return
+  }
+
+  try {
+    log.info('Starting DeltaLake event compaction')
+
+    const storage = createR2Storage(env.EVENTS_BUCKET)
+
+    // Discover active shards by scanning R2 for shard directories
+    const shardIds = new Set<number>()
+    let cursor: string | undefined
+    do {
+      const list = await env.EVENTS_BUCKET.list({
+        prefix: 'events/shard=',
+        delimiter: '/',
+        ...(cursor !== undefined ? { cursor } : {}),
+      })
+
+      for (const prefix of list.delimitedPrefixes || []) {
+        const match = prefix.match(/shard=(\d+)/)
+        if (match && match[1]) {
+          shardIds.add(parseInt(match[1], 10))
+        }
+      }
+
+      cursor = list.truncated ? list.cursor : undefined
+    } while (cursor)
+
+    let totalFilesCompacted = 0
+    let totalFilesCreated = 0
+
+    for (const shardId of shardIds) {
+      try {
+        const table = createEventsTable(storage, { shardId })
+
+        // Compact small files into larger files
+        const compactResult = await compact(table, {
+          targetFileSize: DELTALAKE_TARGET_FILE_SIZE,
+          minFilesForCompaction: 2,
+          strategy: 'greedy',
+        })
+
+        if (!compactResult.skipped) {
+          totalFilesCompacted += compactResult.filesCompacted
+          totalFilesCreated += compactResult.filesCreated
+          log.info('DeltaLake shard compacted', {
+            shardId,
+            filesCompacted: compactResult.filesCompacted,
+            filesCreated: compactResult.filesCreated,
+            version: compactResult.commitVersion,
+          })
+        }
+
+        // Vacuum old files beyond retention period
+        await vacuum(table, { retentionHours: DELTALAKE_VACUUM_RETENTION_HOURS })
+      } catch (err) {
+        logError(log, 'Error compacting DeltaLake shard', err, { shardId })
+      }
+    }
+
+    log.info('DeltaLake event compaction completed', {
+      shardsProcessed: shardIds.size,
+      totalFilesCompacted,
+      totalFilesCreated,
+    })
+  } catch (err) {
+    logError(log, 'Error during DeltaLake event compaction', err)
+  }
+}
+
+/**
+ * Task 2b: DeltaLake CDC Compaction (daily at 2:30 UTC, when USE_DELTALAKE_CDC=true)
+ * Uses native deltalake compact(), vacuum(), and deduplicate() for CDC tables.
+ */
+async function runDeltalakeCDCCompaction(env: Env, log: Logger): Promise<void> {
+  const currentHour = new Date().getUTCHours()
+  if (currentHour !== 2) {
+    return
+  }
+
+  if (!useDeltalakeCDC(env)) {
+    return
+  }
+
+  try {
+    log.info('Starting DeltaLake CDC compaction')
+
+    const storage = createR2Storage(env.EVENTS_BUCKET)
+
+    // Discover namespaces by scanning R2 for cdc prefixes
+    const namespaces = new Set<string>()
+    let cdcCursor: string | undefined
+    do {
+      const list = await env.EVENTS_BUCKET.list({
+        prefix: 'cdc/',
+        delimiter: '/',
+        ...(cdcCursor !== undefined ? { cursor: cdcCursor } : {}),
+      })
+
+      for (const prefix of list.delimitedPrefixes || []) {
+        const parts = prefix.split('/')
+        if (parts.length >= 2 && parts[1]) {
+          namespaces.add(parts[1])
+        }
+      }
+
+      cdcCursor = list.truncated ? list.cursor : undefined
+    } while (cdcCursor)
+
+    let totalCompacted = 0
+    let totalDeduplicated = 0
+
+    for (const ns of namespaces) {
+      // Discover tables for this namespace
+      const tables = new Set<string>()
+      let tableCursor: string | undefined
+      do {
+        const list = await env.EVENTS_BUCKET.list({
+          prefix: `cdc/${ns}/`,
+          delimiter: '/',
+          ...(tableCursor !== undefined ? { cursor: tableCursor } : {}),
+        })
+
+        for (const prefix of list.delimitedPrefixes || []) {
+          const parts = prefix.split('/')
+          if (parts.length >= 3 && parts[2]) {
+            tables.add(parts[2])
+          }
+        }
+
+        tableCursor = list.truncated ? list.cursor : undefined
+      } while (tableCursor)
+
+      for (const table of tables) {
+        try {
+          const deltaTable = createSimpleCDCTable(storage, ns, table)
+
+          // Compact small files
+          const compactResult = await compact(deltaTable, {
+            targetFileSize: DELTALAKE_TARGET_FILE_SIZE,
+            minFilesForCompaction: 2,
+          })
+
+          if (!compactResult.skipped) {
+            totalCompacted++
+            log.info('DeltaLake CDC table compacted', {
+              namespace: ns,
+              table,
+              filesCompacted: compactResult.filesCompacted,
+              version: compactResult.commitVersion,
+            })
+          }
+
+          // Vacuum old files
+          await vacuum(deltaTable, { retentionHours: DELTALAKE_VACUUM_RETENTION_HOURS })
+
+          // Deduplicate by _id keeping latest
+          const dedupResult = await deduplicate(deltaTable, {
+            primaryKey: ['_id'],
+            keepStrategy: 'latest',
+            orderByColumn: '_ts',
+          })
+
+          if (dedupResult.duplicatesRemoved > 0) {
+            totalDeduplicated++
+            log.info('DeltaLake CDC table deduplicated', {
+              namespace: ns,
+              table,
+              duplicatesRemoved: dedupResult.duplicatesRemoved,
+            })
+          }
+        } catch (err) {
+          logError(log, 'Error processing DeltaLake CDC table', err, { namespace: ns, table })
+        }
+      }
+    }
+
+    log.info('DeltaLake CDC compaction completed', {
+      namespacesProcessed: namespaces.size,
+      tablesCompacted: totalCompacted,
+      tablesDeduplicated: totalDeduplicated,
+    })
+  } catch (err) {
+    logError(log, 'Error during DeltaLake CDC compaction', err)
   }
 }
 
@@ -517,8 +729,14 @@ export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: Exec
         // Task 2: CDC Compaction (only at 2:30 UTC)
         await runCDCCompaction(env, log)
 
+        // Task 2b: DeltaLake CDC Compaction (only at 2:30 UTC, when enabled)
+        await runDeltalakeCDCCompaction(env, log)
+
         // Task 3: Event Stream Compaction (hourly)
         await runEventStreamCompaction(env, log)
+
+        // Task 3b: DeltaLake Event Compaction (hourly, when enabled)
+        await runDeltalakeEventCompaction(env, log)
 
         // Task 4: Dead Letter Cleanup (only at 4:30 UTC)
         await cleanupDeadLetters(env, log)

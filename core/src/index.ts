@@ -342,6 +342,51 @@ export {
   ENCRYPTED_MARKER,
 } from './encryption.js'
 
+// === DeltaLake Integration ===
+// R2 storage adapter and factory functions for @dotdo/deltalake
+
+export {
+  R2StorageBackend,
+  createR2Storage,
+  FileNotFoundError,
+  VersionMismatchError,
+} from './deltalake-storage.js'
+
+export type {
+  EventsTableOptions,
+  CDCTableOptions,
+  EventDeltaRecord,
+  CDCDeltaRecord,
+} from './deltalake-factory.js'
+
+export {
+  createEventsTable,
+  createCDCTable,
+  createSimpleCDCTable,
+  getEventsTablePath,
+  getCDCTablePath,
+  parseShardFromPath,
+  parseCDCPathComponents,
+} from './deltalake-factory.js'
+
+export type {
+  EventsDoOperation,
+  EventsDoCDCRecord,
+} from './cdc-deltalake.js'
+
+export {
+  mapOperationToDeltalake,
+  mapOperationFromDeltalake,
+  convertToDeltalakeCDC,
+  convertFromDeltalakeCDC,
+  convertBatchToDeltalakeCDC,
+  convertBatchFromDeltalakeCDC,
+  serializeCDCRecord,
+  deserializeCDCRecord,
+  resetSequenceState,
+  setSequenceState,
+} from './cdc-deltalake.js'
+
 // === Configuration ===
 // Centralized configuration constants for tuning and defaults
 export { coreConfig } from './config.js'

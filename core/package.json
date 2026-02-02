@@ -57,6 +57,7 @@
   },
   "homepage": "https://events.do",
   "dependencies": {
+    "@dotdo/deltalake": "file:../../deltalake",
     "@dotdo/hyparquet-writer": "github:dot-do/hyparquet-writer",
     "hyparquet": "^1.24.1",
     "picomatch": "^4.0.3"
