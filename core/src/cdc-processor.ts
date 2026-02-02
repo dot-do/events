@@ -42,7 +42,7 @@ export interface DocumentState {
   doc: Record<string, unknown>
   version: number
   lastUpdated: string
-  bookmark?: string
+  bookmark?: string | undefined
   deleted: boolean
 }
 
@@ -63,7 +63,7 @@ export interface DeltaRef {
  */
 export interface ProcessorManifest {
   collection: string
-  schema?: Record<string, string>
+  schema?: Record<string, string> | undefined
   deltaSequence: number
   deltas: DeltaRef[]
   lastFlushAt: string | null
@@ -92,9 +92,9 @@ export interface ProcessorState {
  */
 export interface CDCProcessorOptions {
   /** Number of pending events before auto-flush (default: Infinity - no auto-flush) */
-  flushThreshold?: number
+  flushThreshold?: number | undefined
   /** Debounce time in ms before flush (default: 5000) */
-  debounceMs?: number
+  debounceMs?: number | undefined
 }
 
 /**
@@ -500,7 +500,7 @@ export class CDCProcessorDO extends DurableObject<Env> {
   /**
    * Flush pending deltas to R2
    */
-  async flush(force?: boolean): Promise<{ flushed: boolean; deltaPath?: string; eventCount?: number }> {
+  async flush(force?: boolean): Promise<{ flushed: boolean; deltaPath?: string | undefined; eventCount?: number | undefined }> {
     this.ensureInitialized()
 
     // If force, cancel any pending alarm
@@ -514,7 +514,7 @@ export class CDCProcessorDO extends DurableObject<Env> {
   /**
    * Internal flush implementation
    */
-  private async flushInternal(): Promise<{ flushed: boolean; deltaPath?: string; eventCount?: number }> {
+  private async flushInternal(): Promise<{ flushed: boolean; deltaPath?: string | undefined; eventCount?: number | undefined }> {
     const pendingDeltas = this.loadPendingDeltas()
     if (pendingDeltas.length === 0) {
       return { flushed: false }

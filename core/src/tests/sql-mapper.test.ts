@@ -8,6 +8,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   SqlTypeError,
+  JsonValidationError,
   getString,
   getNumber,
   getBoolean,
@@ -16,7 +17,20 @@ import {
   getOptionalBoolean,
   getJson,
   getOptionalJson,
+  getValidatedJson,
+  getValidatedOptionalJson,
+  isObject,
+  isArray,
+  isArrayOf,
+  isString,
+  isNumber,
+  isBoolean,
+  isNull,
+  createObjectValidator,
+  nullable,
+  optional,
   type SqlRow,
+  type JsonValidator,
 } from '../sql-mapper.js'
 
 describe('SqlTypeError', () => {
@@ -587,5 +601,531 @@ describe('integration scenarios', () => {
     expect(getOptionalNumber(row, 'missing_num')).toBeNull()
     expect(getOptionalBoolean(row, 'missing_bool')).toBeNull()
     expect(getOptionalJson(row, 'missing_json')).toBeNull()
+  })
+})
+
+// ============================================================================
+// JsonValidationError Tests
+// ============================================================================
+
+describe('JsonValidationError', () => {
+  it('creates error with correct message', () => {
+    const error = new JsonValidationError('data', 'expected object with name field', { id: 1 })
+
+    expect(error.name).toBe('JsonValidationError')
+    expect(error.key).toBe('data')
+    expect(error.validationError).toBe('expected object with name field')
+    expect(error.actualValue).toEqual({ id: 1 })
+    expect(error.message).toContain("Column 'data' JSON validation failed")
+    expect(error.message).toContain('expected object with name field')
+  })
+
+  it('serializes complex values in error message', () => {
+    const error = new JsonValidationError('field', 'type mismatch', { nested: { array: [1, 2, 3] } })
+
+    expect(error.message).toContain('{"nested":{"array":[1,2,3]}}')
+  })
+})
+
+// ============================================================================
+// Type Guard Utility Tests
+// ============================================================================
+
+describe('isObject', () => {
+  it('returns true for plain objects', () => {
+    expect(isObject({})).toBe(true)
+    expect(isObject({ name: 'Alice' })).toBe(true)
+    expect(isObject({ nested: { deep: true } })).toBe(true)
+  })
+
+  it('returns false for arrays', () => {
+    expect(isObject([])).toBe(false)
+    expect(isObject([1, 2, 3])).toBe(false)
+  })
+
+  it('returns false for null', () => {
+    expect(isObject(null)).toBe(false)
+  })
+
+  it('returns false for primitives', () => {
+    expect(isObject('string')).toBe(false)
+    expect(isObject(123)).toBe(false)
+    expect(isObject(true)).toBe(false)
+    expect(isObject(undefined)).toBe(false)
+  })
+})
+
+describe('isArray', () => {
+  it('returns true for arrays', () => {
+    expect(isArray([])).toBe(true)
+    expect(isArray([1, 2, 3])).toBe(true)
+    expect(isArray(['a', 'b'])).toBe(true)
+  })
+
+  it('returns false for objects', () => {
+    expect(isArray({})).toBe(false)
+    expect(isArray({ length: 3 })).toBe(false)
+  })
+
+  it('returns false for primitives', () => {
+    expect(isArray('string')).toBe(false)
+    expect(isArray(123)).toBe(false)
+    expect(isArray(null)).toBe(false)
+  })
+})
+
+describe('isArrayOf', () => {
+  it('returns true for array of matching items', () => {
+    expect(isArrayOf([1, 2, 3], isNumber)).toBe(true)
+    expect(isArrayOf(['a', 'b'], isString)).toBe(true)
+    expect(isArrayOf([true, false], isBoolean)).toBe(true)
+  })
+
+  it('returns true for empty array', () => {
+    expect(isArrayOf([], isNumber)).toBe(true)
+    expect(isArrayOf([], isString)).toBe(true)
+  })
+
+  it('returns false for mixed array', () => {
+    expect(isArrayOf([1, 'two', 3], isNumber)).toBe(false)
+    expect(isArrayOf(['a', 2, 'c'], isString)).toBe(false)
+  })
+
+  it('returns false for non-array', () => {
+    expect(isArrayOf({}, isNumber)).toBe(false)
+    expect(isArrayOf('string', isString)).toBe(false)
+  })
+})
+
+describe('isString', () => {
+  it('returns true for strings', () => {
+    expect(isString('')).toBe(true)
+    expect(isString('hello')).toBe(true)
+  })
+
+  it('returns false for non-strings', () => {
+    expect(isString(123)).toBe(false)
+    expect(isString(null)).toBe(false)
+    expect(isString(undefined)).toBe(false)
+  })
+})
+
+describe('isNumber', () => {
+  it('returns true for numbers', () => {
+    expect(isNumber(0)).toBe(true)
+    expect(isNumber(42)).toBe(true)
+    expect(isNumber(-10.5)).toBe(true)
+    expect(isNumber(Infinity)).toBe(true)
+  })
+
+  it('returns false for NaN', () => {
+    expect(isNumber(NaN)).toBe(false)
+  })
+
+  it('returns false for non-numbers', () => {
+    expect(isNumber('42')).toBe(false)
+    expect(isNumber(null)).toBe(false)
+  })
+})
+
+describe('isBoolean', () => {
+  it('returns true for booleans', () => {
+    expect(isBoolean(true)).toBe(true)
+    expect(isBoolean(false)).toBe(true)
+  })
+
+  it('returns false for non-booleans', () => {
+    expect(isBoolean(1)).toBe(false)
+    expect(isBoolean(0)).toBe(false)
+    expect(isBoolean('true')).toBe(false)
+  })
+})
+
+describe('isNull', () => {
+  it('returns true for null', () => {
+    expect(isNull(null)).toBe(true)
+  })
+
+  it('returns false for non-null', () => {
+    expect(isNull(undefined)).toBe(false)
+    expect(isNull(0)).toBe(false)
+    expect(isNull('')).toBe(false)
+  })
+})
+
+describe('createObjectValidator', () => {
+  interface User {
+    name: string
+    age: number
+  }
+
+  const isUser = createObjectValidator<User>({
+    name: isString,
+    age: isNumber,
+  })
+
+  it('validates matching objects', () => {
+    expect(isUser({ name: 'Alice', age: 30 })).toBe(true)
+  })
+
+  it('validates objects with extra fields', () => {
+    expect(isUser({ name: 'Alice', age: 30, email: 'alice@test.com' })).toBe(true)
+  })
+
+  it('rejects objects missing required fields', () => {
+    expect(isUser({ name: 'Alice' })).toBe(false)
+    expect(isUser({ age: 30 })).toBe(false)
+    expect(isUser({})).toBe(false)
+  })
+
+  it('rejects objects with wrong field types', () => {
+    expect(isUser({ name: 'Alice', age: '30' })).toBe(false)
+    expect(isUser({ name: 123, age: 30 })).toBe(false)
+  })
+
+  it('rejects non-objects', () => {
+    expect(isUser(null)).toBe(false)
+    expect(isUser([])).toBe(false)
+    expect(isUser('string')).toBe(false)
+  })
+})
+
+describe('nullable', () => {
+  const nullableString = nullable(isString)
+
+  it('accepts null', () => {
+    expect(nullableString(null)).toBe(true)
+  })
+
+  it('accepts valid type', () => {
+    expect(nullableString('hello')).toBe(true)
+  })
+
+  it('rejects other types', () => {
+    expect(nullableString(undefined)).toBe(false)
+    expect(nullableString(123)).toBe(false)
+  })
+})
+
+describe('optional', () => {
+  const optionalNumber = optional(isNumber)
+
+  it('accepts undefined', () => {
+    expect(optionalNumber(undefined)).toBe(true)
+  })
+
+  it('accepts valid type', () => {
+    expect(optionalNumber(42)).toBe(true)
+  })
+
+  it('rejects other types', () => {
+    expect(optionalNumber(null)).toBe(false)
+    expect(optionalNumber('42')).toBe(false)
+  })
+})
+
+// ============================================================================
+// Validated JSON Accessor Tests
+// ============================================================================
+
+describe('getValidatedJson', () => {
+  interface User {
+    name: string
+    age: number
+  }
+
+  const isUser: JsonValidator<User> = (v): v is User =>
+    isObject(v) && typeof v.name === 'string' && typeof v.age === 'number'
+
+  it('parses and validates matching JSON', () => {
+    const row: SqlRow = { data: '{"name":"Alice","age":30}' }
+
+    const result = getValidatedJson(row, 'data', isUser)
+
+    expect(result).toEqual({ name: 'Alice', age: 30 })
+  })
+
+  it('throws JsonValidationError for non-matching structure', () => {
+    const row: SqlRow = { data: '{"name":"Alice"}' } // missing age
+
+    expect(() => getValidatedJson(row, 'data', isUser)).toThrow(JsonValidationError)
+    expect(() => getValidatedJson(row, 'data', isUser)).toThrow('JSON validation failed')
+  })
+
+  it('throws JsonValidationError for wrong field types', () => {
+    const row: SqlRow = { data: '{"name":"Alice","age":"thirty"}' }
+
+    expect(() => getValidatedJson(row, 'data', isUser)).toThrow(JsonValidationError)
+  })
+
+  it('throws SqlTypeError for non-string column', () => {
+    const row: SqlRow = { data: { name: 'Alice', age: 30 } }
+
+    expect(() => getValidatedJson(row, 'data', isUser)).toThrow(SqlTypeError)
+  })
+
+  it('throws SyntaxError for invalid JSON with context', () => {
+    const row: SqlRow = { data: '{invalid json}' }
+
+    expect(() => getValidatedJson(row, 'data', isUser)).toThrow(SyntaxError)
+    expect(() => getValidatedJson(row, 'data', isUser)).toThrow("Column 'data' contains invalid JSON")
+  })
+
+  it('validates primitive JSON values', () => {
+    const row: SqlRow = { num: '42', str: '"hello"', bool: 'true' }
+
+    expect(getValidatedJson(row, 'num', isNumber)).toBe(42)
+    expect(getValidatedJson(row, 'str', isString)).toBe('hello')
+    expect(getValidatedJson(row, 'bool', isBoolean)).toBe(true)
+  })
+
+  it('validates arrays with isArrayOf', () => {
+    const row: SqlRow = { numbers: '[1, 2, 3, 4]' }
+    const isNumberArray: JsonValidator<number[]> = (v): v is number[] => isArrayOf(v, isNumber)
+
+    expect(getValidatedJson(row, 'numbers', isNumberArray)).toEqual([1, 2, 3, 4])
+  })
+
+  it('throws for arrays when expecting object', () => {
+    const row: SqlRow = { data: '[1, 2, 3]' }
+
+    expect(() => getValidatedJson(row, 'data', isUser)).toThrow(JsonValidationError)
+  })
+
+  it('works with createObjectValidator', () => {
+    interface Config {
+      host: string
+      port: number
+    }
+
+    const isConfig = createObjectValidator<Config>({
+      host: isString,
+      port: isNumber,
+    })
+
+    const row: SqlRow = { config: '{"host":"localhost","port":8080}' }
+
+    expect(getValidatedJson(row, 'config', isConfig)).toEqual({ host: 'localhost', port: 8080 })
+  })
+})
+
+describe('getValidatedOptionalJson', () => {
+  interface User {
+    name: string
+  }
+
+  const isUser: JsonValidator<User> = (v): v is User => isObject(v) && typeof v.name === 'string'
+
+  it('returns null for null value', () => {
+    const row: SqlRow = { data: null }
+
+    expect(getValidatedOptionalJson(row, 'data', isUser)).toBeNull()
+  })
+
+  it('returns null for undefined/missing column', () => {
+    const row: SqlRow = {}
+
+    expect(getValidatedOptionalJson(row, 'data', isUser)).toBeNull()
+  })
+
+  it('parses and validates matching JSON', () => {
+    const row: SqlRow = { data: '{"name":"Alice"}' }
+
+    expect(getValidatedOptionalJson(row, 'data', isUser)).toEqual({ name: 'Alice' })
+  })
+
+  it('throws JsonValidationError for non-matching structure', () => {
+    const row: SqlRow = { data: '{"id":1}' } // missing name
+
+    expect(() => getValidatedOptionalJson(row, 'data', isUser)).toThrow(JsonValidationError)
+  })
+
+  it('throws SqlTypeError for non-string value', () => {
+    const row: SqlRow = { data: 123 }
+
+    expect(() => getValidatedOptionalJson(row, 'data', isUser)).toThrow(SqlTypeError)
+    expect(() => getValidatedOptionalJson(row, 'data', isUser)).toThrow('string (JSON) | null')
+  })
+
+  it('throws SyntaxError for invalid JSON with context', () => {
+    const row: SqlRow = { data: '{bad' }
+
+    expect(() => getValidatedOptionalJson(row, 'data', isUser)).toThrow(SyntaxError)
+    expect(() => getValidatedOptionalJson(row, 'data', isUser)).toThrow("Column 'data' contains invalid JSON")
+  })
+})
+
+// ============================================================================
+// Validation Edge Cases
+// ============================================================================
+
+describe('validation edge cases', () => {
+  it('handles deeply nested objects', () => {
+    interface DeepObject {
+      level1: {
+        level2: {
+          level3: {
+            value: string
+          }
+        }
+      }
+    }
+
+    const isDeepObject: JsonValidator<DeepObject> = (v): v is DeepObject =>
+      isObject(v) &&
+      isObject(v.level1) &&
+      isObject((v.level1 as Record<string, unknown>).level2) &&
+      isObject(((v.level1 as Record<string, unknown>).level2 as Record<string, unknown>).level3) &&
+      typeof ((((v.level1 as Record<string, unknown>).level2 as Record<string, unknown>).level3 as Record<string, unknown>).value) === 'string'
+
+    const row: SqlRow = { deep: '{"level1":{"level2":{"level3":{"value":"found"}}}}' }
+
+    const result = getValidatedJson(row, 'deep', isDeepObject)
+    expect(result.level1.level2.level3.value).toBe('found')
+  })
+
+  it('handles empty objects', () => {
+    const isEmptyObj: JsonValidator<object> = (v): v is object => isObject(v)
+    const row: SqlRow = { data: '{}' }
+
+    expect(getValidatedJson(row, 'data', isEmptyObj)).toEqual({})
+  })
+
+  it('handles empty arrays', () => {
+    const isEmptyArray: JsonValidator<unknown[]> = (v): v is unknown[] => isArray(v)
+    const row: SqlRow = { data: '[]' }
+
+    expect(getValidatedJson(row, 'data', isEmptyArray)).toEqual([])
+  })
+
+  it('handles JSON with unicode characters', () => {
+    interface Message {
+      text: string
+    }
+
+    const isMessage: JsonValidator<Message> = (v): v is Message =>
+      isObject(v) && typeof v.text === 'string'
+
+    const row: SqlRow = { data: '{"text":"Hello \\u4e16\\u754c \\ud83d\\ude00"}' }
+
+    const result = getValidatedJson(row, 'data', isMessage)
+    expect(result.text).toContain('\u4e16\u754c')
+  })
+
+  it('handles JSON with escaped characters', () => {
+    interface Data {
+      path: string
+    }
+
+    const isData: JsonValidator<Data> = (v): v is Data => isObject(v) && typeof v.path === 'string'
+
+    const row: SqlRow = { data: '{"path":"C:\\\\Users\\\\test\\\\file.txt"}' }
+
+    const result = getValidatedJson(row, 'data', isData)
+    expect(result.path).toBe('C:\\Users\\test\\file.txt')
+  })
+
+  it('handles JSON with special number values as strings', () => {
+    // Note: JSON doesn't support Infinity or NaN natively
+    const row: SqlRow = { data: '{"large":1e308,"small":1e-308}' }
+
+    interface Numbers {
+      large: number
+      small: number
+    }
+
+    const isNumbers: JsonValidator<Numbers> = (v): v is Numbers =>
+      isObject(v) && typeof v.large === 'number' && typeof v.small === 'number'
+
+    const result = getValidatedJson(row, 'data', isNumbers)
+    expect(result.large).toBe(1e308)
+    expect(result.small).toBe(1e-308)
+  })
+
+  it('rejects JSON primitive when object expected', () => {
+    const isObj: JsonValidator<object> = (v): v is object => isObject(v)
+    const row: SqlRow = { data: '"just a string"' }
+
+    expect(() => getValidatedJson(row, 'data', isObj)).toThrow(JsonValidationError)
+  })
+
+  it('rejects null JSON value when object expected', () => {
+    const isObj: JsonValidator<object> = (v): v is object => isObject(v)
+    const row: SqlRow = { data: 'null' }
+
+    expect(() => getValidatedJson(row, 'data', isObj)).toThrow(JsonValidationError)
+  })
+
+  it('handles whitespace in JSON', () => {
+    const isObj: JsonValidator<{ a: number }> = (v): v is { a: number } =>
+      isObject(v) && typeof v.a === 'number'
+
+    const row: SqlRow = { data: '  {  "a"  :  1  }  ' }
+
+    expect(getValidatedJson(row, 'data', isObj)).toEqual({ a: 1 })
+  })
+})
+
+describe('integration with validated JSON', () => {
+  it('handles CDC event row with validation', () => {
+    interface CDCDoc {
+      name: string
+      email: string
+    }
+
+    const isCDCDoc: JsonValidator<CDCDoc> = (v): v is CDCDoc =>
+      isObject(v) && typeof v.name === 'string' && typeof v.email === 'string'
+
+    const row: SqlRow = {
+      id: 'evt-123',
+      type: 'collection.insert',
+      doc: '{"name":"Alice","email":"alice@test.com"}',
+      prev: null,
+    }
+
+    const doc = getValidatedJson(row, 'doc', isCDCDoc)
+    expect(doc.name).toBe('Alice')
+    expect(doc.email).toBe('alice@test.com')
+
+    const prev = getValidatedOptionalJson(row, 'prev', isCDCDoc)
+    expect(prev).toBeNull()
+  })
+
+  it('catches malformed CDC document early', () => {
+    interface CDCDoc {
+      name: string
+      email: string
+    }
+
+    const isCDCDoc: JsonValidator<CDCDoc> = (v): v is CDCDoc =>
+      isObject(v) && typeof v.name === 'string' && typeof v.email === 'string'
+
+    // Corrupted data - email is a number
+    const row: SqlRow = {
+      id: 'evt-123',
+      doc: '{"name":"Alice","email":12345}',
+    }
+
+    expect(() => getValidatedJson(row, 'doc', isCDCDoc)).toThrow(JsonValidationError)
+  })
+
+  it('works with complex metadata validation', () => {
+    interface Metadata {
+      role: string
+      permissions: string[]
+    }
+
+    const isMetadata: JsonValidator<Metadata> = (v): v is Metadata =>
+      isObject(v) &&
+      typeof v.role === 'string' &&
+      isArrayOf(v.permissions, isString)
+
+    const row: SqlRow = {
+      metadata: '{"role":"admin","permissions":["read","write","delete"]}',
+    }
+
+    const meta = getValidatedJson(row, 'metadata', isMetadata)
+    expect(meta.role).toBe('admin')
+    expect(meta.permissions).toEqual(['read', 'write', 'delete'])
   })
 })

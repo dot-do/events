@@ -1095,6 +1095,40 @@ describe('SubscriptionDO', () => {
       const status = await sub.getSubscriptionStatus('nonexistent')
       expect(status.subscription).toBeNull()
     })
+
+    // Regression test for events-2dm: totalDelivered should use deliveredRow, not pendingRow
+    it('correctly calculates totalDelivered from delivered deliveries', async () => {
+      const subResult = await sub.subscribe({ workerId: 'w1', pattern: '**', rpcMethod: 'handle' })
+      if (!subResult.ok) return
+
+      // Create and mark a delivery as delivered
+      const delResult = await sub.createDelivery({
+        subscriptionId: subResult.subscriptionId,
+        eventId: 'evt-001',
+        eventType: 'test.event',
+        eventPayload: { data: 'test' },
+      })
+      if (!delResult.ok) return
+
+      await sub.markDelivered(delResult.deliveryId, 100, '{"ok":true}')
+
+      // Create a second delivery and mark it as delivered too
+      const delResult2 = await sub.createDelivery({
+        subscriptionId: subResult.subscriptionId,
+        eventId: 'evt-002',
+        eventType: 'test.event2',
+        eventPayload: { data: 'test2' },
+      })
+      if (!delResult2.ok) return
+
+      await sub.markDelivered(delResult2.deliveryId, 150, '{"ok":true}')
+
+      // Now check the stats - totalDelivered should be 2
+      const status = await sub.getSubscriptionStatus(subResult.subscriptionId)
+      expect(status.stats.totalDelivered).toBe(2)
+      expect(status.stats.pendingDeliveries).toBe(0)
+      expect(status.stats.failedDeliveries).toBe(0)
+    })
   })
 
   // --------------------------------------------------------------------------

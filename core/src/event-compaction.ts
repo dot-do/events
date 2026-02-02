@@ -26,15 +26,15 @@ import { readParquetRecords, mergeParquetRecords, writeCompactedParquet } from '
  */
 export interface EventCompactionOptions {
   /** Maximum bytes per compacted file (default: 100MB) */
-  maxBytes?: number
+  maxBytes?: number | undefined
   /** Maximum events per compacted file (default: 1M) */
-  maxEvents?: number
+  maxEvents?: number | undefined
   /** Prefixes to compact (default: ['events']) */
-  prefixes?: string[]
+  prefixes?: string[] | undefined
   /** Days to look back (default: 7) */
-  daysBack?: number
+  daysBack?: number | undefined
   /** Dry run mode - list files but don't compact (default: false) */
-  dryRun?: boolean
+  dryRun?: boolean | undefined
 }
 
 /**
@@ -58,9 +58,9 @@ export interface DayCompactionResult {
   /** Total bytes in output */
   totalBytes: number
   /** Any errors encountered */
-  errors?: string[]
+  errors?: string[] | undefined
   /** Whether this was a dry run */
-  dryRun?: boolean
+  dryRun?: boolean | undefined
 }
 
 /**
@@ -82,7 +82,7 @@ export interface EventCompactionResult {
   /** Total records processed */
   totalRecords: number
   /** Global errors */
-  errors?: string[]
+  errors?: string[] | undefined
 }
 
 // ============================================================================
@@ -229,7 +229,7 @@ async function compactDay(
     do {
       const listed = await bucket.list({
         prefix: hourPrefix,
-        cursor,
+        ...(cursor !== undefined ? { cursor } : {}),
         limit: 1000,
       })
 
@@ -248,7 +248,7 @@ async function compactDay(
   do {
     const listed = await bucket.list({
       prefix: `${dayPath}/`,
-      cursor,
+      ...(cursor !== undefined ? { cursor } : {}),
       limit: 1000,
       delimiter: '/',
     })

@@ -88,8 +88,53 @@ function createMockSqlStorage() {
         const alias = countMatch[1]
         const tableName = countMatch[2]
         const table = tables.get(tableName)
+        // Handle WHERE clause for count
+        const whereCollectionMatch = query.match(/WHERE\s+collection\s*=\s*\?/i)
+        if (whereCollectionMatch && params.length >= 1) {
+          const collection = params[0] as string
+          let count = 0
+          if (table) {
+            for (const [key, row] of table) {
+              if ((row.collection as string) === collection) {
+                // Handle deleted filter
+                if (query.includes('deleted = 0')) {
+                  if ((row.deleted as number) === 0) count++
+                } else {
+                  count++
+                }
+              }
+            }
+          }
+          return [{ [alias]: count }]
+        }
         const count = table ? table.size : 0
         return [{ [alias]: count }]
+      }
+
+      // Handle MAX(ts) queries
+      const maxMatch = query.match(/SELECT\s+MAX\s*\(\s*(\w+)\s*\)\s*(?:as|AS)\s+(\w+)\s+FROM\s+(\w+)/i)
+      if (maxMatch) {
+        const field = maxMatch[1]
+        const alias = maxMatch[2]
+        const tableName = maxMatch[3]
+        const table = tables.get(tableName)
+        if (!table || table.size === 0) {
+          return [{ [alias]: null }]
+        }
+        // Handle WHERE clause for max
+        const whereCollectionMatch = query.match(/WHERE\s+collection\s*=\s*\?/i)
+        let maxVal: string | null = null
+        for (const [key, row] of table) {
+          if (whereCollectionMatch && params.length >= 1) {
+            const collection = params[0] as string
+            if ((row.collection as string) !== collection) continue
+          }
+          const val = row[field] as string | undefined
+          if (val && (!maxVal || val > maxVal)) {
+            maxVal = val
+          }
+        }
+        return [{ [alias]: maxVal }]
       }
 
       // Parse table name from query
@@ -113,7 +158,15 @@ function createMockSqlStorage() {
         const collection = params[0] as string
         const rows: Record<string, unknown>[] = []
         for (const [key, row] of table) {
-          if (key.startsWith(`${collection}:`)) {
+          // For manifests table, key IS the collection name
+          if (tableName === 'manifests') {
+            if (key === collection) {
+              rows.push(row)
+            }
+          } else if (key.startsWith(`${collection}:`)) {
+            rows.push(row)
+          } else if ((row.collection as string) === collection) {
+            // Also check the collection field directly
             rows.push(row)
           }
         }
@@ -144,10 +197,49 @@ function createMockSqlStorage() {
       if (!colsMatch) return []
       const columns = colsMatch[1].split(',').map(c => c.trim())
 
+      // Parse values - handle both ? placeholders and literal values
+      const valuesMatch = query.match(/VALUES\s*\(([^)]+)\)/i)
+      if (!valuesMatch) return []
+      const valuesStr = valuesMatch[1]
+      // Split by comma but respect quoted strings
+      const valueTokens: string[] = []
+      let current = ''
+      let inQuote = false
+      for (let i = 0; i < valuesStr.length; i++) {
+        const char = valuesStr[i]
+        if (char === "'" && valuesStr[i - 1] !== '\\') {
+          inQuote = !inQuote
+          current += char
+        } else if (char === ',' && !inQuote) {
+          valueTokens.push(current.trim())
+          current = ''
+        } else {
+          current += char
+        }
+      }
+      if (current.trim()) {
+        valueTokens.push(current.trim())
+      }
+
       // Build row
       const row: Record<string, unknown> = {}
+      let paramIdx = 0
       columns.forEach((col, i) => {
-        row[col] = params[i]
+        const token = valueTokens[i]?.trim() || '?'
+        if (token === '?') {
+          row[col] = params[paramIdx]
+          paramIdx++
+        } else if (token === 'NULL') {
+          row[col] = null
+        } else if (token.startsWith("'") && token.endsWith("'")) {
+          // String literal
+          row[col] = token.slice(1, -1)
+        } else if (!isNaN(Number(token))) {
+          // Number literal
+          row[col] = Number(token)
+        } else {
+          row[col] = token
+        }
       })
 
       // Determine primary key based on table and add auto-increment id for pending_deltas
@@ -165,6 +257,44 @@ function createMockSqlStorage() {
       }
 
       table.set(key, row)
+      return []
+    }
+
+    // UPDATE
+    if (trimmed.startsWith('UPDATE')) {
+      const tableMatch = query.match(/UPDATE\s+(\w+)/i)
+      if (!tableMatch) return []
+      const tableName = tableMatch[1]
+      const table = tables.get(tableName)
+      if (!table) return []
+
+      // Handle manifests UPDATE
+      if (tableName === 'manifests') {
+        // Parse SET clause
+        const setMatch = query.match(/SET\s+(.+?)\s+WHERE/i)
+        if (!setMatch) return []
+        const assignments = setMatch[1].split(',').map(a => a.trim())
+
+        // Get collection from WHERE clause
+        const whereMatch = query.match(/WHERE\s+collection\s*=\s*\?/i)
+        if (!whereMatch) return []
+        const collectionIdx = params.length - 1 // Last param is the WHERE value
+        const collection = params[collectionIdx] as string
+
+        const row = table.get(collection)
+        if (row) {
+          // Update fields
+          let paramIdx = 0
+          for (const assignment of assignments) {
+            const colMatch = assignment.match(/(\w+)\s*=\s*\?/)
+            if (colMatch) {
+              const col = colMatch[1]
+              row[col] = params[paramIdx]
+              paramIdx++
+            }
+          }
+        }
+      }
       return []
     }
 

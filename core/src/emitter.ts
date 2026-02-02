@@ -32,7 +32,7 @@ interface CircuitBreakerState {
   /** Number of consecutive failures */
   consecutiveFailures: number
   /** Timestamp when circuit breaker opened (ISO string) */
-  openedAt?: string
+  openedAt?: string | undefined
   /** Whether circuit breaker is currently open */
   isOpen: boolean
 }

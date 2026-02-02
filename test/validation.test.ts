@@ -15,12 +15,30 @@ import { describe, it, expect } from 'vitest'
 
 const MAX_EVENT_SIZE = 10 * 1024 // 10KB per event
 const MAX_BATCH_SIZE = 1000 // Max events per batch
-const MAX_TYPE_LENGTH = 256
+const MAX_TYPE_LENGTH = 128
+
+/**
+ * Regex for valid event type characters.
+ * Allows: alphanumeric (a-z, A-Z, 0-9), dots (.), underscores (_), hyphens (-)
+ * This prevents injection attacks and parsing issues.
+ */
+const EVENT_TYPE_PATTERN = /^[a-zA-Z0-9._-]+$/
+
+/**
+ * Validate event type follows strict character allowlist.
+ * Only allows: alphanumeric, dots, underscores, hyphens.
+ * Max length: 128 characters.
+ */
+function isValidEventType(type: unknown): type is string {
+  if (typeof type !== 'string') return false
+  if (type.length === 0 || type.length > MAX_TYPE_LENGTH) return false
+  return EVENT_TYPE_PATTERN.test(type)
+}
 
 function validateEvent(event: unknown): event is { type: string; ts: string } {
   if (typeof event !== 'object' || event === null) return false
   const e = event as Record<string, unknown>
-  if (typeof e.type !== 'string' || e.type.length === 0 || e.type.length > MAX_TYPE_LENGTH) return false
+  if (!isValidEventType(e.type)) return false
   if (typeof e.ts !== 'string' || isNaN(Date.parse(e.ts))) return false
   return true
 }
@@ -46,6 +64,133 @@ function escapeSql(value: string): string {
 // Tests
 // ============================================================================
 
+describe('isValidEventType', () => {
+  describe('valid event types', () => {
+    it('accepts simple alphanumeric type', () => {
+      expect(isValidEventType('test')).toBe(true)
+      expect(isValidEventType('Test123')).toBe(true)
+    })
+
+    it('accepts type with dots', () => {
+      expect(isValidEventType('rpc.call')).toBe(true)
+      expect(isValidEventType('collection.insert')).toBe(true)
+      expect(isValidEventType('user.profile.updated')).toBe(true)
+    })
+
+    it('accepts type with underscores', () => {
+      expect(isValidEventType('user_created')).toBe(true)
+      expect(isValidEventType('order_status_changed')).toBe(true)
+    })
+
+    it('accepts type with hyphens', () => {
+      expect(isValidEventType('user-created')).toBe(true)
+      expect(isValidEventType('order-status-changed')).toBe(true)
+    })
+
+    it('accepts type with mixed allowed characters', () => {
+      expect(isValidEventType('user.profile_updated-v2')).toBe(true)
+      expect(isValidEventType('api.v1.user-created_2024')).toBe(true)
+    })
+
+    it('accepts single character type', () => {
+      expect(isValidEventType('x')).toBe(true)
+      expect(isValidEventType('1')).toBe(true)
+    })
+
+    it('accepts type at max length (128 chars)', () => {
+      const maxLengthType = 'a'.repeat(128)
+      expect(isValidEventType(maxLengthType)).toBe(true)
+    })
+  })
+
+  describe('invalid event types - special characters', () => {
+    it('rejects type with spaces', () => {
+      expect(isValidEventType('user created')).toBe(false)
+      expect(isValidEventType(' test')).toBe(false)
+      expect(isValidEventType('test ')).toBe(false)
+    })
+
+    it('rejects type with quotes', () => {
+      expect(isValidEventType("test'event")).toBe(false)
+      expect(isValidEventType('test"event')).toBe(false)
+      expect(isValidEventType('test`event')).toBe(false)
+    })
+
+    it('rejects type with SQL injection characters', () => {
+      expect(isValidEventType("'; DROP TABLE events; --")).toBe(false)
+      expect(isValidEventType('test; DELETE')).toBe(false)
+      expect(isValidEventType('test=1')).toBe(false)
+    })
+
+    it('rejects type with brackets', () => {
+      expect(isValidEventType('test()')).toBe(false)
+      expect(isValidEventType('test[]')).toBe(false)
+      expect(isValidEventType('test{}')).toBe(false)
+      expect(isValidEventType('test<>')).toBe(false)
+    })
+
+    it('rejects type with slashes', () => {
+      expect(isValidEventType('user/created')).toBe(false)
+      expect(isValidEventType('user\\created')).toBe(false)
+    })
+
+    it('rejects type with special characters', () => {
+      expect(isValidEventType('test@event')).toBe(false)
+      expect(isValidEventType('test#event')).toBe(false)
+      expect(isValidEventType('test$event')).toBe(false)
+      expect(isValidEventType('test%event')).toBe(false)
+      expect(isValidEventType('test^event')).toBe(false)
+      expect(isValidEventType('test&event')).toBe(false)
+      expect(isValidEventType('test*event')).toBe(false)
+      expect(isValidEventType('test+event')).toBe(false)
+      expect(isValidEventType('test|event')).toBe(false)
+      expect(isValidEventType('test!event')).toBe(false)
+      expect(isValidEventType('test~event')).toBe(false)
+      expect(isValidEventType('test:event')).toBe(false)
+    })
+
+    it('rejects type with newlines or control characters', () => {
+      expect(isValidEventType('test\nevent')).toBe(false)
+      expect(isValidEventType('test\revent')).toBe(false)
+      expect(isValidEventType('test\tevent')).toBe(false)
+      expect(isValidEventType('test\x00event')).toBe(false)
+    })
+
+    it('rejects type with unicode characters', () => {
+      expect(isValidEventType('test\u2019event')).toBe(false) // unicode quote
+      expect(isValidEventType('test\u00e9vent')).toBe(false) // accented e
+      expect(isValidEventType('test\u4e2d\u6587')).toBe(false) // Chinese characters
+    })
+  })
+
+  describe('invalid event types - length', () => {
+    it('rejects empty string', () => {
+      expect(isValidEventType('')).toBe(false)
+    })
+
+    it('rejects type exceeding 128 chars', () => {
+      const tooLongType = 'a'.repeat(129)
+      expect(isValidEventType(tooLongType)).toBe(false)
+    })
+
+    it('rejects very long type', () => {
+      const veryLongType = 'a'.repeat(1000)
+      expect(isValidEventType(veryLongType)).toBe(false)
+    })
+  })
+
+  describe('invalid event types - wrong types', () => {
+    it('rejects non-string types', () => {
+      expect(isValidEventType(123)).toBe(false)
+      expect(isValidEventType(null)).toBe(false)
+      expect(isValidEventType(undefined)).toBe(false)
+      expect(isValidEventType(true)).toBe(false)
+      expect(isValidEventType({})).toBe(false)
+      expect(isValidEventType([])).toBe(false)
+    })
+  })
+})
+
 describe('validateEvent', () => {
   describe('valid events', () => {
     it('accepts a minimal valid event', () => {
@@ -65,8 +210,8 @@ describe('validateEvent', () => {
       expect(validateEvent({ type: 'x', ts: '2024-01-01T00:00:00Z' })).toBe(true)
     })
 
-    it('accepts event with max-length type (256 chars)', () => {
-      const longType = 'a'.repeat(256)
+    it('accepts event with max-length type (128 chars)', () => {
+      const longType = 'a'.repeat(128)
       expect(validateEvent({ type: longType, ts: '2024-01-01T00:00:00Z' })).toBe(true)
     })
 
@@ -119,9 +264,16 @@ describe('validateEvent', () => {
       expect(validateEvent({ type: '', ts: '2024-01-01T00:00:00Z' })).toBe(false)
     })
 
-    it('rejects type exceeding 256 chars', () => {
-      const tooLongType = 'a'.repeat(257)
+    it('rejects type exceeding 128 chars', () => {
+      const tooLongType = 'a'.repeat(129)
       expect(validateEvent({ type: tooLongType, ts: '2024-01-01T00:00:00Z' })).toBe(false)
+    })
+
+    it('rejects type with invalid characters', () => {
+      expect(validateEvent({ type: "test'event", ts: '2024-01-01T00:00:00Z' })).toBe(false)
+      expect(validateEvent({ type: 'test event', ts: '2024-01-01T00:00:00Z' })).toBe(false)
+      expect(validateEvent({ type: 'test/event', ts: '2024-01-01T00:00:00Z' })).toBe(false)
+      expect(validateEvent({ type: 'test;event', ts: '2024-01-01T00:00:00Z' })).toBe(false)
     })
 
     it('rejects non-string ts', () => {

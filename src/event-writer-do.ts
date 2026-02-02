@@ -55,9 +55,9 @@ export interface IngestResult {
   ok: boolean
   buffered: number
   shard: number
-  flushed?: WriteResult | null
+  flushed?: WriteResult | null | undefined
   /** If overloaded, suggests trying this shard instead */
-  tryNextShard?: number
+  tryNextShard?: number | undefined
 }
 
 export interface StatsResult {

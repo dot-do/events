@@ -56,6 +56,13 @@ Built on [ducklytics](https://github.com/dotdo/duckdb/tree/main/packages/ducklyt
 - **PITR** - Point-in-time recovery with SQLite bookmark capture
 - **R2 Lakehouse** - Stream events to R2 for DuckDB queries
 - **Time Travel** - Reconstruct any document's history
+- **Subscriptions** - Pattern-based event routing to workers with retry and dead letter queue
+
+## Documentation
+
+- [Getting Started](./docs/GETTING_STARTED.md) - Installation and basic setup
+- [Subscriptions](./docs/SUBSCRIPTIONS.md) - Event subscriptions and webhook delivery
+- [Operations](./docs/OPERATIONS.md) - Monitoring and maintenance
 
 ## Quick Start
 

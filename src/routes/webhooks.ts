@@ -12,6 +12,9 @@ import { ingestWithOverflow } from '../event-writer-do'
 import type { EventRecord } from '../event-writer'
 import { corsHeaders } from '../utils'
 import { checkRateLimit, type RateLimitEnv } from '../middleware/rate-limit'
+import { logger } from '../logger'
+
+const log = logger.child({ component: 'Webhooks' })
 
 /** More lenient rate limits for server-to-server webhook traffic */
 const WEBHOOK_RATE_LIMIT_REQUESTS_PER_MINUTE = 10000
@@ -62,9 +65,9 @@ async function sendWebhookEvent(
   // The DO handles batching and persistence with alarm-based retries.
   const result2 = await ingestWithOverflow(env, [record], 'webhook')
   if (!result2.ok) {
-    console.error(`[webhook] Failed to ingest event to EventWriterDO, shard ${result2.shard}`)
+    log.error('Failed to ingest event to EventWriterDO', { shard: result2.shard })
   } else {
-    console.log(`[webhook] Ingested to shard ${result2.shard}, buffered: ${result2.buffered}`)
+    log.info('Ingested webhook event', { shard: result2.shard, buffered: result2.buffered })
   }
 }
 

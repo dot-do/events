@@ -166,11 +166,15 @@ function createMockR2Bucket(initialFiles: Record<string, ArrayBuffer> = {}) {
       }
     }),
 
-    put: vi.fn(async (key: string, data: ArrayBuffer): Promise<MockR2PutResult> => {
-      files.set(key, data)
+    put: vi.fn(async (key: string, data: ArrayBuffer | string): Promise<MockR2PutResult> => {
+      // Convert string to ArrayBuffer if needed
+      const buffer = typeof data === 'string'
+        ? new TextEncoder().encode(data).buffer
+        : data
+      files.set(key, buffer)
       return {
         key,
-        size: data.byteLength,
+        size: buffer.byteLength,
       }
     }),
 

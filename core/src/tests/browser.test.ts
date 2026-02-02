@@ -1157,4 +1157,442 @@ describe('Browser SDK', () => {
       await vi.advanceTimersByTimeAsync(5000)
     })
   })
+
+  describe('StorageEncryption', () => {
+    // Mock Web Crypto API
+    let mockSubtle: {
+      generateKey: ReturnType<typeof vi.fn>
+      importKey: ReturnType<typeof vi.fn>
+      exportKey: ReturnType<typeof vi.fn>
+      encrypt: ReturnType<typeof vi.fn>
+      decrypt: ReturnType<typeof vi.fn>
+    }
+    let mockCrypto: {
+      subtle: typeof mockSubtle
+      getRandomValues: ReturnType<typeof vi.fn>
+    }
+    let mockKey: CryptoKey
+
+    beforeEach(() => {
+      // Create a mock CryptoKey
+      mockKey = {
+        type: 'secret',
+        extractable: true,
+        algorithm: { name: 'AES-GCM', length: 256 },
+        usages: ['encrypt', 'decrypt']
+      } as CryptoKey
+
+      mockSubtle = {
+        generateKey: vi.fn().mockResolvedValue(mockKey),
+        importKey: vi.fn().mockResolvedValue(mockKey),
+        exportKey: vi.fn().mockResolvedValue(new ArrayBuffer(32)),
+        encrypt: vi.fn().mockImplementation(async (_algo, _key, data: ArrayBuffer) => {
+          // Simple mock: just return the data with some padding
+          const result = new Uint8Array(data.byteLength + 16)
+          result.set(new Uint8Array(data))
+          return result.buffer
+        }),
+        decrypt: vi.fn().mockImplementation(async (_algo, _key, data: ArrayBuffer) => {
+          // Simple mock: return the data without padding
+          const arr = new Uint8Array(data)
+          return arr.slice(0, arr.length - 16).buffer
+        })
+      }
+
+      mockCrypto = {
+        subtle: mockSubtle,
+        getRandomValues: vi.fn((arr: Uint8Array) => {
+          // Fill with predictable values for testing
+          for (let i = 0; i < arr.length; i++) {
+            arr[i] = i
+          }
+          return arr
+        })
+      }
+
+      vi.stubGlobal('crypto', mockCrypto)
+    })
+
+    it('should check if Web Crypto API is supported', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+      expect(enc.isSupported()).toBe(true)
+    })
+
+    it('should report not supported when crypto is unavailable', async () => {
+      vi.stubGlobal('crypto', undefined)
+      vi.resetModules()
+
+      // Re-stub other globals after reset
+      vi.stubGlobal('fetch', mockFetch)
+      vi.stubGlobal('localStorage', mockLocalStorage)
+      vi.stubGlobal('sessionStorage', mockSessionStorage)
+      vi.stubGlobal('document', createMockDocument())
+      vi.stubGlobal('navigator', createMockNavigator())
+      vi.stubGlobal('location', createMockLocation())
+      vi.stubGlobal('addEventListener', vi.fn())
+      vi.stubGlobal('window', {})
+
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+      expect(enc.isSupported()).toBe(false)
+    })
+
+    it('should generate a new key when not provided', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+
+      await enc.initialize()
+
+      expect(mockSubtle.generateKey).toHaveBeenCalledWith(
+        { name: 'AES-GCM', length: 256 },
+        true,
+        ['encrypt', 'decrypt']
+      )
+      expect(enc.isReady()).toBe(true)
+    })
+
+    it('should import a provided key', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      // Base64 encoded 32-byte key
+      const providedKey = btoa(String.fromCharCode(...new Array(32).fill(0)))
+      const enc = new StorageEncryption({ enabled: true, key: providedKey })
+
+      await enc.initialize()
+
+      expect(mockSubtle.importKey).toHaveBeenCalled()
+      expect(mockSubtle.generateKey).not.toHaveBeenCalled()
+      expect(enc.isReady()).toBe(true)
+    })
+
+    it('should store generated key in localStorage by default', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+
+      await enc.initialize()
+
+      expect(mockLocalStorage.setItem).toHaveBeenCalledWith(
+        'events_enc_key',
+        expect.any(String)
+      )
+    })
+
+    it('should store generated key in sessionStorage when configured', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true, keyStorage: 'sessionStorage' })
+
+      await enc.initialize()
+
+      expect(mockSessionStorage.setItem).toHaveBeenCalledWith(
+        'events_enc_key',
+        expect.any(String)
+      )
+    })
+
+    it('should load existing key from localStorage', async () => {
+      // Pre-set a key in localStorage
+      const existingKey = btoa(String.fromCharCode(...new Array(32).fill(42)))
+      ;(mockLocalStorage.getItem as ReturnType<typeof vi.fn>).mockImplementation(
+        (key: string) => key === 'events_enc_key' ? existingKey : null
+      )
+
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+
+      await enc.initialize()
+
+      expect(mockSubtle.importKey).toHaveBeenCalled()
+      expect(mockSubtle.generateKey).not.toHaveBeenCalled()
+    })
+
+    it('should encrypt data with prefix', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+      await enc.initialize()
+
+      const plaintext = 'test data'
+      const encrypted = await enc.encrypt(plaintext)
+
+      expect(encrypted.startsWith('enc:')).toBe(true)
+      expect(mockSubtle.encrypt).toHaveBeenCalled()
+    })
+
+    it('should decrypt data correctly', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+      await enc.initialize()
+
+      // Mock decrypt to return known data
+      const expectedText = 'decrypted text'
+      const encoder = new TextEncoder()
+      mockSubtle.decrypt.mockResolvedValueOnce(encoder.encode(expectedText).buffer)
+
+      // Create a mock encrypted value
+      const mockEncrypted = 'enc:' + btoa(String.fromCharCode(...new Array(50).fill(0)))
+      const decrypted = await enc.decrypt(mockEncrypted)
+
+      expect(decrypted).toBe(expectedText)
+    })
+
+    it('should detect encrypted values', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+
+      expect(enc.isEncrypted('enc:somedata')).toBe(true)
+      expect(enc.isEncrypted('plaintext')).toBe(false)
+    })
+
+    it('should export the key', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+      await enc.initialize()
+
+      const exported = await enc.exportKey()
+
+      expect(exported).toBeDefined()
+      expect(typeof exported).toBe('string')
+      expect(mockSubtle.exportKey).toHaveBeenCalledWith('raw', mockKey)
+    })
+
+    it('should return null when exporting key before initialization', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+
+      const exported = await enc.exportKey()
+
+      expect(exported).toBeNull()
+    })
+
+    it('should throw when encrypting before initialization', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+
+      await expect(enc.encrypt('test')).rejects.toThrow('Encryption not initialized')
+    })
+
+    it('should throw when decrypting before initialization', async () => {
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+
+      await expect(enc.decrypt('enc:test')).rejects.toThrow('Encryption not initialized')
+    })
+
+    it('should throw when Web Crypto API is not supported', async () => {
+      vi.stubGlobal('crypto', { subtle: undefined, getRandomValues: undefined })
+      vi.resetModules()
+
+      // Re-stub other globals after reset
+      vi.stubGlobal('fetch', mockFetch)
+      vi.stubGlobal('localStorage', mockLocalStorage)
+      vi.stubGlobal('sessionStorage', mockSessionStorage)
+      vi.stubGlobal('document', createMockDocument())
+      vi.stubGlobal('navigator', createMockNavigator())
+      vi.stubGlobal('location', createMockLocation())
+      vi.stubGlobal('addEventListener', vi.fn())
+      vi.stubGlobal('window', {})
+
+      const { StorageEncryption } = await import('../browser.js')
+      const enc = new StorageEncryption({ enabled: true })
+
+      await expect(enc.initialize()).rejects.toThrow('Web Crypto API not supported')
+    })
+  })
+
+  describe('EventsSDK with encryption', () => {
+    let mockSubtle: {
+      generateKey: ReturnType<typeof vi.fn>
+      importKey: ReturnType<typeof vi.fn>
+      exportKey: ReturnType<typeof vi.fn>
+      encrypt: ReturnType<typeof vi.fn>
+      decrypt: ReturnType<typeof vi.fn>
+    }
+    let mockCrypto: {
+      subtle: typeof mockSubtle
+      getRandomValues: ReturnType<typeof vi.fn>
+    }
+    let mockKey: CryptoKey
+
+    beforeEach(() => {
+      mockKey = {
+        type: 'secret',
+        extractable: true,
+        algorithm: { name: 'AES-GCM', length: 256 },
+        usages: ['encrypt', 'decrypt']
+      } as CryptoKey
+
+      mockSubtle = {
+        generateKey: vi.fn().mockResolvedValue(mockKey),
+        importKey: vi.fn().mockResolvedValue(mockKey),
+        exportKey: vi.fn().mockResolvedValue(new ArrayBuffer(32)),
+        encrypt: vi.fn().mockImplementation(async (_algo, _key, data: ArrayBuffer) => {
+          const result = new Uint8Array(data.byteLength + 16)
+          result.set(new Uint8Array(data))
+          return result.buffer
+        }),
+        decrypt: vi.fn().mockImplementation(async (_algo, _key, data: ArrayBuffer) => {
+          const arr = new Uint8Array(data)
+          return arr.slice(0, arr.length - 16).buffer
+        })
+      }
+
+      mockCrypto = {
+        subtle: mockSubtle,
+        getRandomValues: vi.fn((arr: Uint8Array) => {
+          for (let i = 0; i < arr.length; i++) {
+            arr[i] = i
+          }
+          return arr
+        })
+      }
+
+      vi.stubGlobal('crypto', mockCrypto)
+    })
+
+    it('should initialize with encryption enabled', async () => {
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK({
+        encryption: { enabled: true }
+      })
+
+      await sdk.waitForEncryption()
+
+      expect(sdk.encryptionEnabled).toBe(true)
+    })
+
+    it('should report encryption disabled when not configured', async () => {
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK()
+
+      expect(sdk.encryptionEnabled).toBe(false)
+    })
+
+    it('should export encryption key', async () => {
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK({
+        encryption: { enabled: true }
+      })
+
+      await sdk.waitForEncryption()
+      const key = await sdk.exportEncryptionKey()
+
+      expect(key).toBeDefined()
+      expect(typeof key).toBe('string')
+    })
+
+    it('should return null when exporting key without encryption', async () => {
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK()
+
+      const key = await sdk.exportEncryptionKey()
+
+      expect(key).toBeNull()
+    })
+
+    it('should persist events with encryption asynchronously', async () => {
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK({
+        encryption: { enabled: true }
+      })
+
+      await sdk.waitForEncryption()
+
+      const events = [
+        { type: 'track' as const, event: 'test', ts: '2024-01-01T00:00:00Z', anonymousId: 'a', sessionId: 's', url: '', path: '', referrer: '', ua: '' }
+      ]
+      await sdk.persistEventsEncrypted(events)
+
+      // Should have encrypted and stored
+      expect(mockSubtle.encrypt).toHaveBeenCalled()
+      expect(mockLocalStorage.setItem).toHaveBeenCalledWith(
+        'events_failed',
+        expect.stringContaining('enc:')
+      )
+    })
+
+    it('should recover encrypted events', async () => {
+      // Set up encrypted data in localStorage
+      const encoder = new TextEncoder()
+      const eventData = JSON.stringify([
+        { type: 'track', event: 'recovered', ts: '2024-01-01T00:00:00Z', anonymousId: 'a', sessionId: 's', url: '', path: '', referrer: '', ua: '' }
+      ])
+      mockSubtle.decrypt.mockResolvedValueOnce(encoder.encode(eventData).buffer)
+
+      ;(mockLocalStorage.getItem as ReturnType<typeof vi.fn>).mockImplementation(
+        (key: string) => {
+          if (key === 'events_failed') return 'enc:' + btoa(String.fromCharCode(...new Array(50).fill(0)))
+          return null
+        }
+      )
+
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK({
+        encryption: { enabled: true }
+      })
+
+      await sdk.waitForEncryption()
+      const recovered = await sdk.recoverEncryptedEvents()
+
+      expect(recovered).toHaveLength(1)
+      expect(recovered[0].event).toBe('recovered')
+      expect(sdk.queuedCount).toBe(1)
+    })
+
+    it('should fall back to unencrypted storage when encryption fails', async () => {
+      mockSubtle.encrypt.mockRejectedValueOnce(new Error('Encryption failed'))
+
+      const { EventsSDK } = await import('../browser.js')
+      const onError = vi.fn()
+      const sdk = new EventsSDK({
+        encryption: { enabled: true },
+        onError
+      })
+
+      await sdk.waitForEncryption()
+
+      const events = [
+        { type: 'track' as const, event: 'test', ts: '2024-01-01T00:00:00Z', anonymousId: 'a', sessionId: 's', url: '', path: '', referrer: '', ua: '' }
+      ]
+      await sdk.persistEventsEncrypted(events)
+
+      // Should have called onError and stored unencrypted
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('Encryption failed')
+        }),
+        events
+      )
+    })
+
+    it('should call onError when encryption initialization fails', async () => {
+      mockSubtle.generateKey.mockRejectedValueOnce(new Error('Key generation failed'))
+
+      const { EventsSDK } = await import('../browser.js')
+      const onError = vi.fn()
+      const sdk = new EventsSDK({
+        encryption: { enabled: true },
+        onError
+      })
+
+      await sdk.waitForEncryption()
+
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('Encryption initialization failed')
+        }),
+        []
+      )
+      // Should still work without encryption
+      expect(sdk.encryptionEnabled).toBe(false)
+    })
+
+    it('initAsync should wait for encryption to be ready', async () => {
+      const { initAsync } = await import('../browser.js')
+
+      const sdk = await initAsync({
+        encryption: { enabled: true }
+      })
+
+      expect(sdk.encryptionEnabled).toBe(true)
+    })
+  })
 })

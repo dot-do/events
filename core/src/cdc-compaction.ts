@@ -16,6 +16,12 @@ import { readParquetRecords, writeCompactedParquet } from './compaction.js'
 import { readDeltaFile } from './cdc-delta.js'
 import type { DeltaRecord } from './cdc-delta.js'
 import { validateNamespaceOrCollection, buildSafeR2Path } from './r2-path.js'
+import {
+  DEFAULT_COMPACTION_PARALLELISM,
+  DEFAULT_COMPACTION_CHUNK_SIZE,
+  MIN_DELTAS_FOR_PARALLEL,
+  MAX_COMPACTION_PARALLELISM,
+} from './config.js'
 
 // ============================================================================
 // Types
@@ -30,7 +36,7 @@ export interface CompactionDeltaRecord {
   /** Document ID (primary key) */
   id: string
   /** Document data (required for insert/update, undefined for delete) */
-  doc?: Record<string, unknown>
+  doc?: Record<string, unknown> | undefined
   /** Timestamp of the change */
   ts: number
   /** Sequence number for ordering */
@@ -42,9 +48,62 @@ export interface CompactionDeltaRecord {
  */
 export interface CompactionOptions {
   /** Archive delta files to processed/ folder after compaction */
-  archiveDeltas?: boolean
+  archiveDeltas?: boolean | undefined
   /** Delete delta files after compaction */
-  deleteDeltas?: boolean
+  deleteDeltas?: boolean | undefined
+}
+
+/**
+ * Options for parallel compaction operation
+ */
+export interface ParallelCompactionOptions extends CompactionOptions {
+  /**
+   * Number of parallel workers to use for processing delta files.
+   * Default: 4, Max: 16
+   */
+  parallelism?: number | undefined
+  /**
+   * Number of delta files to process per parallel chunk.
+   * Default: 10
+   */
+  chunkSize?: number | undefined
+  /**
+   * Callback for progress updates during parallel processing.
+   * Called after each chunk completes.
+   */
+  onProgress?: ((progress: ParallelCompactionProgress) => void) | undefined
+}
+
+/**
+ * Progress information for parallel compaction
+ */
+export interface ParallelCompactionProgress {
+  /** Total number of chunks being processed */
+  totalChunks: number
+  /** Number of chunks completed */
+  completedChunks: number
+  /** Total delta files to process */
+  totalDeltas: number
+  /** Number of delta files processed */
+  processedDeltas: number
+  /** Percentage complete (0-100) */
+  percentComplete: number
+  /** Any errors encountered so far */
+  errors: string[]
+}
+
+/**
+ * Result of a chunk processing operation (internal)
+ */
+interface ChunkResult {
+  /** State map for this chunk */
+  state: Map<string, Record<string, unknown>>
+  /** Files processed in this chunk */
+  processedFiles: string[]
+  /** Highest delta sequence in this chunk */
+  lastSequence: number
+  /** Any errors encountered */
+  errors: string[]
 }
 
 /**
@@ -54,17 +113,17 @@ export interface CompactionResult {
   /** Whether compaction succeeded */
   success: boolean
   /** Path to the output data.parquet file */
-  dataFile?: string
+  dataFile?: string | undefined
   /** Number of records in the compacted file */
   recordCount: number
   /** Size of the compacted file in bytes */
-  fileSizeBytes?: number
+  fileSizeBytes?: number | undefined
   /** Number of delta files processed */
   deltasProcessed: number
   /** Paths of processed delta files */
   processedFiles: string[]
   /** Any errors encountered (non-fatal) */
-  errors?: string[]
+  errors?: string[] | undefined
 }
 
 /**
@@ -362,4 +421,318 @@ export function writeDataParquet(state: Map<string, Record<string, unknown>>): A
 
   // Use writeCompactedParquet from compaction.js
   return writeCompactedParquet(records)
+}
+
+// ============================================================================
+// Parallel Compaction
+// ============================================================================
+
+/**
+ * Splits an array into chunks of specified size
+ *
+ * @param array - Array to split
+ * @param chunkSize - Maximum size of each chunk
+ * @returns Array of chunks
+ */
+function chunkArray<T>(array: T[], chunkSize: number): T[][] {
+  const chunks: T[][] = []
+  for (let i = 0; i < array.length; i += chunkSize) {
+    chunks.push(array.slice(i, i + chunkSize))
+  }
+  return chunks
+}
+
+/**
+ * Processes a single chunk of delta files and returns the resulting state
+ *
+ * @param bucket - R2 bucket containing CDC data
+ * @param deltaFiles - Delta files in this chunk
+ * @returns ChunkResult with state and metadata
+ */
+async function processChunk(
+  bucket: R2Bucket,
+  deltaFiles: R2Object[]
+): Promise<ChunkResult> {
+  const state = new Map<string, Record<string, unknown>>()
+  const processedFiles: string[] = []
+  const errors: string[] = []
+  let lastSequence = 0
+
+  for (const deltaFile of deltaFiles) {
+    const obj = await bucket.get(deltaFile.key)
+    if (!obj) continue
+
+    try {
+      const buffer = await obj.arrayBuffer()
+      const deltaRecords = await readDeltaFile(buffer)
+      const seq = extractSequenceNumber(deltaFile.key)
+
+      // Convert DeltaRecords to CompactionDeltaRecords
+      const deltas: CompactionDeltaRecord[] = deltaRecords.map((dr, i) =>
+        deltaRecordToCompactionRecord(dr, seq * 1000 + i)
+      )
+
+      // Apply deltas to this chunk's state
+      for (const delta of deltas) {
+        switch (delta.op) {
+          case 'insert':
+          case 'update':
+            if (delta.doc) {
+              state.set(delta.id, delta.doc)
+            }
+            break
+          case 'delete':
+            state.set(delta.id, { __deleted__: true })
+            break
+        }
+      }
+
+      processedFiles.push(deltaFile.key)
+
+      if (seq > lastSequence) {
+        lastSequence = seq
+      }
+    } catch (e) {
+      errors.push(`Failed to read delta file ${deltaFile.key}: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  return {
+    state,
+    processedFiles,
+    lastSequence,
+    errors,
+  }
+}
+
+/**
+ * Merges multiple chunk states into a single state, respecting delta ordering
+ *
+ * States are merged in order (first chunk to last), so later chunks
+ * will overwrite earlier chunks for the same keys. This maintains
+ * the correct last-write-wins semantics.
+ *
+ * @param baseState - Initial state (from existing data.parquet)
+ * @param chunkResults - Array of chunk results in sequence order
+ * @returns Merged state map
+ */
+export function mergeChunkStates(
+  baseState: Map<string, Record<string, unknown>>,
+  chunkResults: ChunkResult[]
+): Map<string, Record<string, unknown>> {
+  // Start with a copy of the base state
+  const mergedState = new Map(baseState)
+
+  // Apply each chunk's state in order
+  for (const chunk of chunkResults) {
+    for (const [id, doc] of chunk.state) {
+      if ('__deleted__' in doc && doc.__deleted__ === true) {
+        // Handle deletion
+        mergedState.delete(id)
+      } else {
+        mergedState.set(id, doc)
+      }
+    }
+  }
+
+  return mergedState
+}
+
+/**
+ * Compacts CDC delta files into a single data.parquet file using parallel processing
+ *
+ * This function processes delta files in parallel chunks for better performance
+ * with large datasets. Files are grouped into chunks that are processed concurrently,
+ * then the results are merged in sequence order to maintain correctness.
+ *
+ * When to use parallel compaction:
+ * - Large number of delta files (>100)
+ * - Delta files contain many records
+ * - Need to minimize compaction time
+ *
+ * @param bucket - R2 bucket containing CDC data
+ * @param ns - Namespace (e.g., DO class name or worker name)
+ * @param collection - Collection name
+ * @param options - Parallel compaction options
+ * @returns Compaction result with stats
+ *
+ * @example
+ * ```typescript
+ * const result = await compactCollectionParallel(bucket, 'myworker', 'users', {
+ *   parallelism: 8,
+ *   chunkSize: 20,
+ *   deleteDeltas: true,
+ *   onProgress: (p) => console.log(`${p.percentComplete}% complete`)
+ * })
+ * console.log(`Compacted ${result.recordCount} records from ${result.deltasProcessed} deltas`)
+ * ```
+ */
+export async function compactCollectionParallel(
+  bucket: R2Bucket,
+  ns: string,
+  collection: string,
+  options: ParallelCompactionOptions = {}
+): Promise<CompactionResult> {
+  // Validate namespace and collection to prevent path traversal
+  const safeNs = validateNamespaceOrCollection(ns, 'namespace')
+  const safeCollection = validateNamespaceOrCollection(collection, 'collection')
+
+  // Normalize parallelism options
+  const parallelism = Math.min(
+    Math.max(1, options.parallelism ?? DEFAULT_COMPACTION_PARALLELISM),
+    MAX_COMPACTION_PARALLELISM
+  )
+  const chunkSize = Math.max(1, options.chunkSize ?? DEFAULT_COMPACTION_CHUNK_SIZE)
+
+  // Build paths
+  const deltasPath = buildSafeR2Path(safeNs, safeCollection, 'deltas') + '/'
+  const dataPath = buildSafeR2Path(safeNs, safeCollection, 'data.parquet')
+  const manifestPath = buildSafeR2Path(safeNs, safeCollection, 'manifest.json')
+  const processedPath = buildSafeR2Path(safeNs, safeCollection, 'processed') + '/'
+
+  const allErrors: string[] = []
+  const allProcessedFiles: string[] = []
+
+  // 1. List all delta files (Parquet format)
+  const deltasList = await bucket.list({ prefix: deltasPath })
+  const deltaFiles = deltasList.objects
+    .filter((obj) => obj.key.endsWith('.parquet'))
+    .sort((a, b) => a.key.localeCompare(b.key))
+
+  // If there are few deltas, fall back to sequential processing
+  if (deltaFiles.length < MIN_DELTAS_FOR_PARALLEL) {
+    return compactCollection(bucket, ns, collection, options)
+  }
+
+  // 2. Load existing data.parquet if it exists
+  let baseState = new Map<string, Record<string, unknown>>()
+  const existingData = await bucket.get(dataPath)
+  if (existingData) {
+    const buffer = await existingData.arrayBuffer()
+    const records = await readParquetRecords(buffer)
+    for (const record of records) {
+      const id = record.id as string
+      const doc = { ...record }
+      delete doc.id
+      baseState.set(id, doc)
+    }
+  }
+
+  // 3. Split delta files into chunks
+  const chunks = chunkArray(deltaFiles, chunkSize)
+  const totalChunks = chunks.length
+
+  // Progress tracking
+  let completedChunks = 0
+  let processedDeltas = 0
+
+  const reportProgress = () => {
+    if (options.onProgress) {
+      options.onProgress({
+        totalChunks,
+        completedChunks,
+        totalDeltas: deltaFiles.length,
+        processedDeltas,
+        percentComplete: Math.round((processedDeltas / deltaFiles.length) * 100),
+        errors: [...allErrors],
+      })
+    }
+  }
+
+  // 4. Process chunks in parallel with controlled concurrency
+  const chunkResults: ChunkResult[] = new Array(chunks.length)
+
+  // Process in batches of `parallelism` chunks at a time
+  for (let batchStart = 0; batchStart < chunks.length; batchStart += parallelism) {
+    const batchEnd = Math.min(batchStart + parallelism, chunks.length)
+    const batchChunks = chunks.slice(batchStart, batchEnd)
+    const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, i) => batchStart + i)
+
+    // Process this batch of chunks in parallel
+    const batchPromises = batchChunks.map(async (chunk, i) => {
+      const result = await processChunk(bucket, chunk)
+      return { index: batchIndices[i], result }
+    })
+
+    const batchResults = await Promise.all(batchPromises)
+
+    // Store results in order and update progress
+    for (const { index, result } of batchResults) {
+      chunkResults[index] = result
+      completedChunks++
+      processedDeltas += result.processedFiles.length
+      allErrors.push(...result.errors)
+      allProcessedFiles.push(...result.processedFiles)
+      reportProgress()
+    }
+  }
+
+  // 5. Merge all chunk states in order
+  const finalState = mergeChunkStates(baseState, chunkResults)
+
+  // Get the highest sequence number
+  const lastDeltaSequence = Math.max(0, ...chunkResults.map((r) => r.lastSequence))
+
+  // 6. Write the compacted data.parquet
+  const parquetBuffer = writeDataParquet(finalState)
+  await bucket.put(dataPath, parquetBuffer)
+
+  // 7. Handle delta cleanup based on options
+  if (options.archiveDeltas) {
+    // Archive in parallel batches for efficiency
+    const archiveChunks = chunkArray(allProcessedFiles, parallelism * 2)
+    for (const archiveChunk of archiveChunks) {
+      await Promise.all(
+        archiveChunk.map(async (filePath) => {
+          const obj = await bucket.get(filePath)
+          if (obj) {
+            const content = await obj.arrayBuffer()
+            const filename = filePath.split('/').pop()
+            await bucket.put(`${processedPath}${filename}`, content)
+            await bucket.delete(filePath)
+          }
+        })
+      )
+    }
+  } else if (options.deleteDeltas) {
+    if (allProcessedFiles.length > 0) {
+      await bucket.delete(allProcessedFiles)
+    }
+  }
+
+  // 8. Load existing manifest or create new one
+  let manifest: CollectionManifest
+  const existingManifest = await bucket.get(manifestPath)
+  if (existingManifest) {
+    manifest = (await existingManifest.json()) as CollectionManifest
+    manifest.compactionCount += 1
+  } else {
+    manifest = {
+      dataFile: dataPath,
+      recordCount: 0,
+      fileSizeBytes: 0,
+      compactionCount: 1,
+    }
+  }
+
+  // 9. Update manifest with new stats
+  manifest.dataFile = dataPath
+  manifest.recordCount = finalState.size
+  manifest.fileSizeBytes = parquetBuffer.byteLength
+  manifest.lastCompactionAt = new Date().toISOString()
+  if (lastDeltaSequence > 0) {
+    manifest.lastDeltaSequence = lastDeltaSequence
+  }
+
+  await bucket.put(manifestPath, JSON.stringify(manifest))
+
+  return {
+    success: true,
+    dataFile: dataPath,
+    recordCount: finalState.size,
+    fileSizeBytes: parquetBuffer.byteLength,
+    deltasProcessed: allProcessedFiles.length,
+    processedFiles: allProcessedFiles,
+    errors: allErrors.length > 0 ? allErrors : undefined,
+  }
 }

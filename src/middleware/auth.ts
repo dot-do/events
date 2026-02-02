@@ -13,6 +13,60 @@ import { corsHeaders, authCorsHeaders } from '../utils'
 
 export type { AuthUser, AuthRequest }
 
+/**
+ * Timing-safe string comparison to prevent timing attacks.
+ * Uses HMAC-based comparison which is constant-time by design.
+ *
+ * The approach: Generate a random key, compute HMAC of both strings,
+ * and compare the resulting digests. HMAC comparison is inherently
+ * timing-safe because the crypto.subtle.verify function is constant-time.
+ *
+ * Returns true if the strings are equal, false otherwise.
+ * Handles edge cases like null/undefined and different lengths safely.
+ */
+export async function timingSafeEqual(a: string | null | undefined, b: string | null | undefined): Promise<boolean> {
+  // Handle null/undefined cases - always return false to indicate auth failure
+  // We still perform a dummy comparison to maintain constant time behavior
+  const aVal = a ?? ''
+  const bVal = b ?? ''
+
+  // If either was null/undefined, we'll do the comparison but return false
+  const wasNullish = a == null || b == null
+
+  const encoder = new TextEncoder()
+  const aBytes = encoder.encode(aVal)
+  const bBytes = encoder.encode(bVal)
+
+  // Generate a random key for HMAC - this ensures timing cannot leak through key reuse
+  const keyData = crypto.getRandomValues(new Uint8Array(32))
+  const key = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+
+  // Compute HMAC of both values
+  const [aHmac, bHmac] = await Promise.all([
+    crypto.subtle.sign('HMAC', key, aBytes),
+    crypto.subtle.sign('HMAC', key, bBytes),
+  ])
+
+  // Compare the HMACs byte-by-byte in constant time
+  // Using XOR accumulator - if any byte differs, result will be non-zero
+  const aView = new Uint8Array(aHmac)
+  const bView = new Uint8Array(bHmac)
+
+  let diff = 0
+  for (let i = 0; i < aView.length; i++) {
+    diff |= aView[i] ^ bView[i]
+  }
+
+  // Return false if either original value was nullish, or if HMACs differ
+  return !wasNullish && diff === 0
+}
+
 /** Minimal env shape needed by auth middleware */
 export interface AuthEnv {
   AUTH_TOKEN?: string
@@ -31,14 +85,20 @@ export interface OAuthResult {
  *
  * Returns null on success (auth passed), or a 401 Response on failure.
  * If AUTH_TOKEN is not configured, all requests are allowed through.
+ *
+ * Uses timing-safe comparison to prevent timing attacks.
  */
-export function requireBearerToken(request: Request, env: AuthEnv): Response | null {
+export async function requireBearerToken(request: Request, env: AuthEnv): Promise<Response | null> {
   if (!env.AUTH_TOKEN) {
     return null // No token configured - allow all
   }
 
   const auth = request.headers.get('Authorization')
-  if (auth !== `Bearer ${env.AUTH_TOKEN}`) {
+  const expectedAuth = `Bearer ${env.AUTH_TOKEN}`
+
+  // Use timing-safe comparison to prevent timing attacks
+  const isValid = await timingSafeEqual(auth, expectedAuth)
+  if (!isValid) {
     return Response.json(
       { error: 'Unauthorized' },
       { status: 401, headers: corsHeaders() },

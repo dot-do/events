@@ -12,6 +12,7 @@ import type { CDCProcessorDO } from '../core/src/cdc-processor'
 import type { SchemaRegistryDO } from '../core/src/schema-registry'
 import type { EventWriterDO } from './event-writer-do'
 import type { ShardCoordinatorDO } from './shard-coordinator-do'
+import type { SubscriptionShardCoordinatorDO } from './subscription-shard-coordinator-do'
 import type { RateLimiterDO } from './middleware/rate-limiter-do'
 import type { WebhookEnv } from './webhook-handler'
 import type { EventBatch } from '@dotdo/events'
@@ -29,8 +30,10 @@ export interface Env extends WebhookEnv {
   SUBSCRIPTIONS: DurableObjectNamespace<SubscriptionDO>
   CDC_PROCESSOR: DurableObjectNamespace<CDCProcessorDO>
   EVENT_WRITER: DurableObjectNamespace<EventWriterDO>
-  /** Shard coordinator for dynamic sharding (optional - falls back to static shards if not bound) */
+  /** Shard coordinator for EventWriterDO dynamic sharding (optional - falls back to static shards if not bound) */
   SHARD_COORDINATOR?: DurableObjectNamespace<ShardCoordinatorDO>
+  /** Shard coordinator for SubscriptionDO dynamic sharding (optional - falls back to static shards if not bound) */
+  SUBSCRIPTION_SHARD_COORDINATOR?: DurableObjectNamespace<SubscriptionShardCoordinatorDO>
   RATE_LIMITER: DurableObjectNamespace<RateLimiterDO>
   /** Schema registry for event validation (optional - validation disabled if not bound) */
   SCHEMA_REGISTRY?: DurableObjectNamespace<SchemaRegistryDO>
@@ -57,4 +60,24 @@ export interface Env extends WebhookEnv {
   DEFAULT_NAMESPACE?: string
   /** Enable schema validation at ingest time (default: false if SCHEMA_REGISTRY not bound) */
   ENABLE_SCHEMA_VALIDATION?: string
+
+  // ============================================================================
+  // End-to-End Encryption Configuration
+  // ============================================================================
+
+  /** JSON-encoded encryption key store for E2E payload encryption */
+  ENCRYPTION_KEYS?: string
+  /** JSON-encoded namespace encryption configs: { "namespace": EncryptionConfig } */
+  NAMESPACE_ENCRYPTION_CONFIGS?: string
+  /** Default encryption config (JSON) - applied when namespace has no specific config */
+  DEFAULT_ENCRYPTION_CONFIG?: string
+  /** Enable encryption for all events (default: false) */
+  ENABLE_ENCRYPTION?: string
+
+  /** Max request body size in bytes for ingest endpoint (default: 1048576 = 1MB) */
+  MAX_INGEST_BODY_SIZE?: string
+  /** Max request body size in bytes for webhook endpoint (default: 1048576 = 1MB) */
+  MAX_WEBHOOK_BODY_SIZE?: string
+  /** Max request body size in bytes for query endpoint (default: 65536 = 64KB) */
+  MAX_QUERY_BODY_SIZE?: string
 }

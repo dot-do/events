@@ -5,7 +5,11 @@
 import type { DurableEvent } from '@dotdo/events'
 import type { Env } from '../env'
 import { readParquetRecords } from '../../core/src/compaction'
+import { matchPattern } from '../../core/src/pattern-matcher'
 import { authCorsHeaders } from '../utils'
+import { logger, logError } from '../logger'
+
+const log = logger.child({ component: 'EventsRoutes' })
 
 // ============================================================================
 // Recent Events (Debug)
@@ -66,7 +70,7 @@ export async function handleRecent(request: Request, env: Env): Promise<Response
           events.push(event)
         }
       } catch (err) {
-        console.error(`[recent] Error reading parquet ${obj.key}:`, err)
+        logError(log, 'Error reading parquet file', err, { key: obj.key })
       }
     }
 
@@ -289,7 +293,7 @@ export async function handleEventsQuery(request: Request, env: Env): Promise<Res
               return { file, events }
             }
           } catch (err) {
-            console.error(`[events] Error reading ${file.key}:`, err)
+            logError(log, 'Error reading events file', err, { key: file.key })
             return { file, events: [] as Record<string, unknown>[] }
           }
         })
@@ -395,9 +399,9 @@ export async function handleEventsQuery(request: Request, env: Env): Promise<Res
  * Check if an event passes all filter criteria
  */
 function passesFilters(record: Record<string, unknown>, params: EventsQueryParams): boolean {
-  // Type filter (glob pattern)
+  // Type filter (glob pattern) - uses shared pattern matcher
   if (params.type && typeof record.type === 'string') {
-    if (!matchGlob(params.type, record.type)) return false
+    if (!matchPattern(params.type, record.type)) return false
   }
 
   // Provider filter
@@ -507,15 +511,5 @@ export function convertBigInts(obj: unknown): unknown {
   return obj
 }
 
-/**
- * Simple glob matching for event type filtering
- * Supports * (any chars) and ** (any path segments)
- */
-function matchGlob(pattern: string, value: string): boolean {
-  const regex = pattern
-    .replace(/\./g, '\\.')
-    .replace(/\*\*/g, '{{DOUBLESTAR}}')
-    .replace(/\*/g, '[^.]*')
-    .replace(/{{DOUBLESTAR}}/g, '.*')
-  return new RegExp(`^${regex}$`).test(value)
-}
+// Note: Pattern matching now uses the shared matchPattern() from pattern-matcher.ts
+// This provides consistent glob-style matching with * (single segment) and ** (multiple segments)

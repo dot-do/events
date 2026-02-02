@@ -13,6 +13,9 @@
 import type { Env } from '../env'
 import type { JsonSchema, SchemaRegistration, ValidationError, NamespaceConfig } from '../../core/src/schema-registry'
 import { corsHeaders } from '../utils'
+import { logger, logError } from '../logger'
+
+const log = logger.child({ component: 'SchemaRoutes' })
 
 /**
  * Type for validation results returned by the schema registry
@@ -108,7 +111,7 @@ export async function handleRegisterSchema(request: Request, env: Env): Promise<
       { status: 201, headers: corsHeaders() }
     )
   } catch (err) {
-    console.error('[schema] Registration error:', err)
+    logError(log, 'Registration error', err)
     return Response.json(
       { error: 'Failed to register schema' },
       { status: 500, headers: corsHeaders() }
@@ -154,7 +157,7 @@ export async function handleListSchemas(request: Request, env: Env): Promise<Res
       { headers: corsHeaders() }
     )
   } catch (err) {
-    console.error('[schema] List error:', err)
+    logError(log, 'List error', err)
     return Response.json(
       { error: 'Failed to list schemas' },
       { status: 500, headers: corsHeaders() }
@@ -190,7 +193,7 @@ export async function handleGetSchema(request: Request, env: Env, params: { name
 
     return Response.json(schema, { headers: corsHeaders() })
   } catch (err) {
-    console.error('[schema] Get error:', err)
+    logError(log, 'Get error', err)
     return Response.json(
       { error: 'Failed to get schema' },
       { status: 500, headers: corsHeaders() }
@@ -222,7 +225,7 @@ export async function handleGetSchemaHistory(request: Request, env: Env, params:
       { headers: corsHeaders() }
     )
   } catch (err) {
-    console.error('[schema] History error:', err)
+    logError(log, 'History error', err)
     return Response.json(
       { error: 'Failed to get schema history' },
       { status: 500, headers: corsHeaders() }
@@ -265,7 +268,7 @@ export async function handleDeleteSchema(request: Request, env: Env, params: { n
       { headers: corsHeaders() }
     )
   } catch (err) {
-    console.error('[schema] Delete error:', err)
+    logError(log, 'Delete error', err)
     return Response.json(
       { error: 'Failed to delete schema' },
       { status: 500, headers: corsHeaders() }
@@ -319,7 +322,7 @@ export async function handleConfigureNamespace(request: Request, env: Env, param
       { headers: corsHeaders() }
     )
   } catch (err) {
-    console.error('[schema] Configure namespace error:', err)
+    logError(log, 'Configure namespace error', err)
     return Response.json(
       { error: 'Failed to configure namespace' },
       { status: 500, headers: corsHeaders() }
@@ -364,7 +367,7 @@ export async function handleGetNamespaceConfig(request: Request, env: Env, param
       { headers: corsHeaders() }
     )
   } catch (err) {
-    console.error('[schema] Get namespace config error:', err)
+    logError(log, 'Get namespace config error', err)
     return Response.json(
       { error: 'Failed to get namespace config' },
       { status: 500, headers: corsHeaders() }
@@ -426,7 +429,7 @@ export async function handleValidateEvents(request: Request, env: Env): Promise<
       { headers: corsHeaders() }
     )
   } catch (err) {
-    console.error('[schema] Validation error:', err)
+    logError(log, 'Validation error', err)
     return Response.json(
       { error: 'Failed to validate events' },
       { status: 500, headers: corsHeaders() }

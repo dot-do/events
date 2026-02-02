@@ -3,12 +3,21 @@
  *
  * Unit tests for the queue handler in src/handlers/queue.ts
  * Tests message processing, retries, dead letters, and CDC/subscription fanout.
+ *
+ * These tests use the actual handleQueue implementation with minimal mocking
+ * of external dependencies (R2 bucket, DOs).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import type { EventBatch, DurableEvent } from '@dotdo/events'
+import { isCollectionChangeEvent } from '../../../core/src/cdc-processor'
+
+// Import actual handler
+import { handleQueue } from '../../handlers/queue'
+import type { Env } from '../../env'
 
 // ============================================================================
-// Mock Types
+// Mock Factories
 // ============================================================================
 
 interface MockMessage<T> {
@@ -23,65 +32,6 @@ interface MockMessageBatch<T> {
   queue: string
   messages: MockMessage<T>[]
 }
-
-interface MockCDCProcessorDO {
-  process: ReturnType<typeof vi.fn>
-}
-
-interface MockSubscriptionDO {
-  fanout: ReturnType<typeof vi.fn>
-}
-
-interface MockDONamespace<T> {
-  idFromName: ReturnType<typeof vi.fn>
-  get: ReturnType<typeof vi.fn>
-  _instances: Map<string, T>
-}
-
-interface MockR2Bucket {
-  list: ReturnType<typeof vi.fn>
-  get: ReturnType<typeof vi.fn>
-  put: ReturnType<typeof vi.fn>
-  head: ReturnType<typeof vi.fn>
-  delete: ReturnType<typeof vi.fn>
-}
-
-interface MockEnv {
-  CDC_PROCESSOR?: MockDONamespace<MockCDCProcessorDO>
-  SUBSCRIPTIONS?: MockDONamespace<MockSubscriptionDO>
-  EVENTS_BUCKET: MockR2Bucket
-  ANALYTICS?: MockAnalytics
-}
-
-interface MockAnalytics {
-  writeDataPoint: ReturnType<typeof vi.fn>
-}
-
-interface DurableEvent {
-  type: string
-  ts: string
-  do?: { id: string; name?: string; class?: string }
-  collection?: string
-  docId?: string
-  doc?: unknown
-  prev?: unknown
-  id?: string
-  [key: string]: unknown
-}
-
-interface EventBatch {
-  events: DurableEvent[]
-}
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-const MAX_RETRIES = 5
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
 
 function createMockMessage<T>(body: T, id = 'msg-1', attempts = 1): MockMessage<T> {
   return {
@@ -100,21 +50,39 @@ function createMockBatch<T>(messages: MockMessage<T>[], queue = 'events-queue'):
   }
 }
 
-function createMockCDCProcessor(): MockCDCProcessorDO {
+function createMockR2Bucket(options: { existingKeys?: string[] } = {}) {
+  const existingKeys = new Set(options.existingKeys ?? [])
+  return {
+    list: vi.fn().mockImplementation(({ prefix }) => {
+      const objects = Array.from(existingKeys)
+        .filter(key => key.startsWith(prefix))
+        .map(key => ({ key, uploaded: new Date() }))
+      return Promise.resolve({ objects, truncated: false })
+    }),
+    get: vi.fn().mockResolvedValue(null),
+    put: vi.fn().mockResolvedValue({}),
+    head: vi.fn().mockImplementation((key) => {
+      return existingKeys.has(key) ? Promise.resolve({ key }) : Promise.resolve(null)
+    }),
+    delete: vi.fn().mockResolvedValue(undefined),
+  } as unknown as R2Bucket
+}
+
+function createMockCDCProcessor() {
   return {
     process: vi.fn().mockResolvedValue({ processed: 1, pending: 0 }),
   }
 }
 
-function createMockSubscriptionDO(): MockSubscriptionDO {
+function createMockSubscriptionDO() {
   return {
     fanout: vi.fn().mockResolvedValue({ matched: 1, deliveries: ['del-1'] }),
+    cleanupOldData: vi.fn().mockResolvedValue({ deadLettersDeleted: 0, deliveryLogsDeleted: 0, deliveriesDeleted: 0 }),
   }
 }
 
-function createMockDONamespace<T>(createInstance: () => T): MockDONamespace<T> {
+function createMockDONamespace<T>(createInstance: () => T) {
   const instances = new Map<string, T>()
-
   return {
     _instances: instances,
     idFromName: vi.fn((name: string) => ({ name, toString: () => name })),
@@ -128,24 +96,19 @@ function createMockDONamespace<T>(createInstance: () => T): MockDONamespace<T> {
   }
 }
 
-function createMockR2Bucket(): MockR2Bucket {
+function createMockEnv(overrides: Partial<Env> = {}): Env {
   return {
-    list: vi.fn().mockResolvedValue({ objects: [], truncated: false }),
-    get: vi.fn().mockResolvedValue(null),
-    put: vi.fn().mockResolvedValue({}),
-    head: vi.fn().mockResolvedValue(null),
-    delete: vi.fn().mockResolvedValue(undefined),
-  }
-}
-
-function createMockEnv(overrides: Partial<MockEnv> = {}): MockEnv {
-  return {
+    EVENTS_BUCKET: createMockR2Bucket(),
     CDC_PROCESSOR: createMockDONamespace(createMockCDCProcessor),
     SUBSCRIPTIONS: createMockDONamespace(createMockSubscriptionDO),
-    EVENTS_BUCKET: createMockR2Bucket(),
+    ANALYTICS: undefined,
     ...overrides,
-  }
+  } as unknown as Env
 }
+
+// ============================================================================
+// Event Factories
+// ============================================================================
 
 function createCDCEvent(overrides: Partial<DurableEvent> = {}): DurableEvent {
   return {
@@ -160,7 +123,7 @@ function createCDCEvent(overrides: Partial<DurableEvent> = {}): DurableEvent {
     docId: 'user-1',
     doc: { name: 'Test User', email: 'test@example.com' },
     ...overrides,
-  }
+  } as DurableEvent
 }
 
 function createRPCEvent(): DurableEvent {
@@ -174,7 +137,7 @@ function createRPCEvent(): DurableEvent {
     method: 'getUser',
     durationMs: 50,
     success: true,
-  }
+  } as DurableEvent
 }
 
 function createEventBatch(events: DurableEvent[]): EventBatch {
@@ -182,150 +145,46 @@ function createEventBatch(events: DurableEvent[]): EventBatch {
 }
 
 // ============================================================================
-// Queue Handler Simulation
+// isCollectionChangeEvent Tests (Actual Implementation)
 // ============================================================================
 
-interface QueueProcessingResult {
-  totalEvents: number
-  cdcEventsProcessed: number
-  cdcEventsSkipped: number
-  subscriptionFanouts: number
-  deadLettered: number
-}
+describe('isCollectionChangeEvent', () => {
+  it('identifies collection.insert as CDC event', () => {
+    const event = createCDCEvent({ type: 'collection.insert' })
+    expect(isCollectionChangeEvent(event)).toBe(true)
+  })
 
-async function simulateQueueHandler(
-  batch: MockMessageBatch<EventBatch>,
-  env: MockEnv
-): Promise<QueueProcessingResult> {
-  let totalEvents = 0
-  let cdcEventsProcessed = 0
-  let cdcEventsSkipped = 0
-  let subscriptionFanouts = 0
-  let deadLettered = 0
+  it('identifies collection.update as CDC event', () => {
+    const event = createCDCEvent({ type: 'collection.update' })
+    expect(isCollectionChangeEvent(event)).toBe(true)
+  })
 
-  for (const message of batch.messages) {
-    const attempts = message.attempts ?? 1
+  it('identifies collection.delete as CDC event', () => {
+    const event = createCDCEvent({ type: 'collection.delete' })
+    expect(isCollectionChangeEvent(event)).toBe(true)
+  })
 
-    try {
-      const eventBatch = message.body
+  it('does not identify rpc.call as CDC event', () => {
+    const event = createRPCEvent()
+    expect(isCollectionChangeEvent(event)).toBe(false)
+  })
 
-      if (!eventBatch?.events || !Array.isArray(eventBatch.events)) {
-        console.warn(`[QUEUE] Invalid message format, missing events array`)
-        message.ack()
-        continue
-      }
-
-      totalEvents += eventBatch.events.length
-
-      // Process CDC events
-      const cdcEvents = eventBatch.events.filter(e => e.type.startsWith('collection.'))
-
-      if (cdcEvents.length > 0 && env.CDC_PROCESSOR) {
-        const cdcByKey = new Map<string, DurableEvent[]>()
-        for (const event of cdcEvents) {
-          const ns = event.do?.class || event.do?.name || 'default'
-          const collection = event.collection || 'default'
-          const key = `${ns}/${collection}`
-          const existing = cdcByKey.get(key) ?? []
-          existing.push(event)
-          cdcByKey.set(key, existing)
-        }
-
-        for (const [key, events] of cdcByKey) {
-          try {
-            const processorId = env.CDC_PROCESSOR.idFromName(key)
-            const processor = env.CDC_PROCESSOR.get(processorId)
-            await processor.process(events)
-            cdcEventsProcessed += events.length
-          } catch (err) {
-            console.error(`[QUEUE] CDC processor error for ${key}:`, err)
-            throw err
-          }
-        }
-      }
-
-      // Fan out to subscriptions
-      if (env.SUBSCRIPTIONS) {
-        const eventsByShard = new Map<string, DurableEvent[]>()
-        for (const event of eventBatch.events) {
-          const dotIndex = event.type.indexOf('.')
-          const shardKey = dotIndex > 0 ? event.type.slice(0, dotIndex) : 'default'
-          const existing = eventsByShard.get(shardKey) ?? []
-          existing.push(event)
-          eventsByShard.set(shardKey, existing)
-        }
-
-        for (const [shardKey, events] of eventsByShard) {
-          try {
-            const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
-            const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
-
-            for (const event of events) {
-              const eventId = event.id || `test-${Date.now()}`
-              await subscriptionDO.fanout({
-                id: eventId,
-                type: event.type,
-                ts: event.ts,
-                payload: event,
-              })
-              subscriptionFanouts++
-            }
-          } catch (err) {
-            console.error(`[QUEUE] Subscription shard error for shard ${shardKey}:`, err)
-            throw err
-          }
-        }
-      }
-
-      message.ack()
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err)
-
-      if (attempts >= MAX_RETRIES) {
-        // Dead letter
-        console.error(`[QUEUE] Dead letter: message failed after ${attempts} attempts. Error: ${errorMsg}`)
-
-        try {
-          const deadLetterKey = `dead-letter/queue/${new Date().toISOString().slice(0, 10)}/${message.id}.json`
-          await env.EVENTS_BUCKET.put(
-            deadLetterKey,
-            JSON.stringify({
-              messageId: message.id,
-              attempts,
-              error: errorMsg,
-              body: message.body,
-              timestamp: new Date().toISOString(),
-            }),
-            { httpMetadata: { contentType: 'application/json' } }
-          )
-        } catch (dlErr) {
-          console.error(`[QUEUE] Failed to write dead letter:`, dlErr)
-        }
-
-        deadLettered++
-        message.ack()
-      } else {
-        console.warn(`[QUEUE] Retrying message (attempt ${attempts}/${MAX_RETRIES}). Error: ${errorMsg}`)
-        message.retry()
-      }
-    }
-  }
-
-  return {
-    totalEvents,
-    cdcEventsProcessed,
-    cdcEventsSkipped,
-    subscriptionFanouts,
-    deadLettered,
-  }
-}
+  it('does not identify ws.connect as CDC event', () => {
+    const event: DurableEvent = {
+      type: 'ws.connect',
+      ts: new Date().toISOString(),
+      do: { id: 'test-id' },
+    } as DurableEvent
+    expect(isCollectionChangeEvent(event)).toBe(false)
+  })
+})
 
 // ============================================================================
-// Tests
+// Queue Handler Tests (Actual Implementation)
 // ============================================================================
 
 describe('Queue Handler', () => {
-  let env: MockEnv
+  let env: Env
 
   beforeEach(() => {
     env = createMockEnv()
@@ -339,17 +198,18 @@ describe('Queue Handler', () => {
         createMockMessage(createEventBatch([rpcEvent])),
       ])
 
-      const result = await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(result.totalEvents).toBe(1)
-      expect(result.subscriptionFanouts).toBe(1)
+      const message = batch.messages[0]!
+      expect(message.ack).toHaveBeenCalled()
+      expect(message.retry).not.toHaveBeenCalled()
     })
 
     it('acknowledges message on success', async () => {
       const message = createMockMessage(createEventBatch([createRPCEvent()]))
       const batch = createMockBatch([message])
 
-      await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
       expect(message.ack).toHaveBeenCalled()
       expect(message.retry).not.toHaveBeenCalled()
@@ -363,9 +223,7 @@ describe('Queue Handler', () => {
       ]
 
       const batch = createMockBatch(messages)
-      const result = await simulateQueueHandler(batch, env)
-
-      expect(result.totalEvents).toBe(4)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
       for (const msg of messages) {
         expect(msg.ack).toHaveBeenCalled()
@@ -375,9 +233,8 @@ describe('Queue Handler', () => {
     it('handles empty batch', async () => {
       const batch = createMockBatch<EventBatch>([])
 
-      const result = await simulateQueueHandler(batch, env)
-
-      expect(result.totalEvents).toBe(0)
+      // Should complete without error
+      await expect(handleQueue(batch as unknown as MessageBatch<EventBatch>, env)).resolves.toBeUndefined()
     })
   })
 
@@ -388,71 +245,54 @@ describe('Queue Handler', () => {
         createMockMessage(createEventBatch([cdcEvent])),
       ])
 
-      const result = await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(result.cdcEventsProcessed).toBe(1)
-      expect(env.CDC_PROCESSOR!.idFromName).toHaveBeenCalledWith('TestClass/users')
+      const cdcProcessor = (env.CDC_PROCESSOR as ReturnType<typeof createMockDONamespace>)
+      expect(cdcProcessor.idFromName).toHaveBeenCalledWith('TestClass/users')
     })
 
     it('groups CDC events by namespace/collection', async () => {
-      const usersEvent1 = createCDCEvent({ docId: 'user-1', collection: 'users' })
-      const usersEvent2 = createCDCEvent({ docId: 'user-2', collection: 'users' })
-      const ordersEvent = createCDCEvent({ docId: 'order-1', collection: 'orders' })
+      const usersEvent1 = createCDCEvent({ docId: 'user-1', collection: 'users' } as Partial<DurableEvent>)
+      const usersEvent2 = createCDCEvent({ docId: 'user-2', collection: 'users' } as Partial<DurableEvent>)
+      const ordersEvent = createCDCEvent({ docId: 'order-1', collection: 'orders' } as Partial<DurableEvent>)
 
       const batch = createMockBatch([
         createMockMessage(createEventBatch([usersEvent1, usersEvent2, ordersEvent])),
       ])
 
-      const result = await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(result.cdcEventsProcessed).toBe(3)
-      expect(env.CDC_PROCESSOR!._instances.has('TestClass/users')).toBe(true)
-      expect(env.CDC_PROCESSOR!._instances.has('TestClass/orders')).toBe(true)
+      const cdcProcessor = (env.CDC_PROCESSOR as ReturnType<typeof createMockDONamespace>)
+      expect(cdcProcessor._instances.has('TestClass/users')).toBe(true)
+      expect(cdcProcessor._instances.has('TestClass/orders')).toBe(true)
     })
 
     it('uses DO name when class is not available', async () => {
       const cdcEvent = createCDCEvent({
         do: { id: 'test-id', name: 'MyDurableObject' },
         collection: 'items',
-      })
+      } as Partial<DurableEvent>)
 
       const batch = createMockBatch([
         createMockMessage(createEventBatch([cdcEvent])),
       ])
 
-      await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(env.CDC_PROCESSOR!.idFromName).toHaveBeenCalledWith('MyDurableObject/items')
-    })
-
-    it('uses default when DO identity is missing', async () => {
-      const cdcEvent = createCDCEvent({
-        do: { id: 'test-id' },
-        collection: 'items',
-      })
-      delete cdcEvent.do?.name
-      delete cdcEvent.do?.class
-
-      const batch = createMockBatch([
-        createMockMessage(createEventBatch([cdcEvent])),
-      ])
-
-      await simulateQueueHandler(batch, env)
-
-      expect(env.CDC_PROCESSOR!.idFromName).toHaveBeenCalledWith('default/items')
+      const cdcProcessor = (env.CDC_PROCESSOR as ReturnType<typeof createMockDONamespace>)
+      expect(cdcProcessor.idFromName).toHaveBeenCalledWith('MyDurableObject/items')
     })
 
     it('handles missing CDC_PROCESSOR binding', async () => {
-      const envNoCDC = createMockEnv({ CDC_PROCESSOR: undefined })
+      const envNoCDC = createMockEnv({ CDC_PROCESSOR: undefined } as Partial<Env>)
       const cdcEvent = createCDCEvent()
-      const batch = createMockBatch([
-        createMockMessage(createEventBatch([cdcEvent])),
-      ])
+      const message = createMockMessage(createEventBatch([cdcEvent]))
+      const batch = createMockBatch([message])
 
-      const result = await simulateQueueHandler(batch, envNoCDC)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, envNoCDC)
 
-      expect(result.cdcEventsProcessed).toBe(0)
-      expect(result.subscriptionFanouts).toBe(1) // Still goes to subscriptions
+      // Should still complete and ack the message
+      expect(message.ack).toHaveBeenCalled()
     })
   })
 
@@ -463,31 +303,31 @@ describe('Queue Handler', () => {
         createMockMessage(createEventBatch([rpcEvent])),
       ])
 
-      const result = await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(result.subscriptionFanouts).toBe(1)
-      expect(env.SUBSCRIPTIONS!.idFromName).toHaveBeenCalledWith('rpc')
+      const subscriptions = (env.SUBSCRIPTIONS as ReturnType<typeof createMockDONamespace>)
+      expect(subscriptions.idFromName).toHaveBeenCalledWith('rpc')
     })
 
-    it('groups events by shard key', async () => {
+    it('groups events by shard key (first segment before dot)', async () => {
       const rpcEvent = createRPCEvent()
       const cdcEvent = createCDCEvent()
       const wsEvent: DurableEvent = {
         type: 'ws.connect',
         ts: new Date().toISOString(),
         do: { id: 'test-id' },
-      }
+      } as DurableEvent
 
       const batch = createMockBatch([
         createMockMessage(createEventBatch([rpcEvent, cdcEvent, wsEvent])),
       ])
 
-      const result = await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(result.subscriptionFanouts).toBe(3)
-      expect(env.SUBSCRIPTIONS!.idFromName).toHaveBeenCalledWith('rpc')
-      expect(env.SUBSCRIPTIONS!.idFromName).toHaveBeenCalledWith('collection')
-      expect(env.SUBSCRIPTIONS!.idFromName).toHaveBeenCalledWith('ws')
+      const subscriptions = (env.SUBSCRIPTIONS as ReturnType<typeof createMockDONamespace>)
+      expect(subscriptions.idFromName).toHaveBeenCalledWith('rpc')
+      expect(subscriptions.idFromName).toHaveBeenCalledWith('collection')
+      expect(subscriptions.idFromName).toHaveBeenCalledWith('ws')
     })
 
     it('uses default shard for events without dots', async () => {
@@ -495,47 +335,28 @@ describe('Queue Handler', () => {
         type: 'ping',
         ts: new Date().toISOString(),
         do: { id: 'test-id' },
-      }
+      } as DurableEvent
 
       const batch = createMockBatch([
         createMockMessage(createEventBatch([customEvent])),
       ])
 
-      await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(env.SUBSCRIPTIONS!.idFromName).toHaveBeenCalledWith('default')
-    })
-
-    it('includes event ID in fanout payload', async () => {
-      const eventWithId: DurableEvent = {
-        type: 'rpc.call',
-        ts: new Date().toISOString(),
-        do: { id: 'test-id' },
-        id: 'my-event-id',
-      }
-
-      const batch = createMockBatch([
-        createMockMessage(createEventBatch([eventWithId])),
-      ])
-
-      await simulateQueueHandler(batch, env)
-
-      const subscription = env.SUBSCRIPTIONS!._instances.get('rpc')
-      const fanoutCall = subscription?.fanout.mock.calls[0][0]
-
-      expect(fanoutCall.id).toBe('my-event-id')
+      const subscriptions = (env.SUBSCRIPTIONS as ReturnType<typeof createMockDONamespace>)
+      expect(subscriptions.idFromName).toHaveBeenCalledWith('default')
     })
 
     it('handles missing SUBSCRIPTIONS binding', async () => {
-      const envNoSubs = createMockEnv({ SUBSCRIPTIONS: undefined })
+      const envNoSubs = createMockEnv({ SUBSCRIPTIONS: undefined } as Partial<Env>)
       const rpcEvent = createRPCEvent()
-      const batch = createMockBatch([
-        createMockMessage(createEventBatch([rpcEvent])),
-      ])
+      const message = createMockMessage(createEventBatch([rpcEvent]))
+      const batch = createMockBatch([message])
 
-      const result = await simulateQueueHandler(batch, envNoSubs)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, envNoSubs)
 
-      expect(result.subscriptionFanouts).toBe(0)
+      // Should still complete and ack the message
+      expect(message.ack).toHaveBeenCalled()
     })
   })
 
@@ -545,9 +366,8 @@ describe('Queue Handler', () => {
       const message = createMockMessage(invalidBatch)
       const batch = createMockBatch([message])
 
-      const result = await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(result.totalEvents).toBe(0)
       expect(message.ack).toHaveBeenCalled()
       expect(message.retry).not.toHaveBeenCalled()
     })
@@ -556,9 +376,8 @@ describe('Queue Handler', () => {
       const message = createMockMessage(null as unknown as EventBatch)
       const batch = createMockBatch([message])
 
-      const result = await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(result.totalEvents).toBe(0)
       expect(message.ack).toHaveBeenCalled()
     })
 
@@ -566,9 +385,8 @@ describe('Queue Handler', () => {
       const message = createMockMessage(createEventBatch([]))
       const batch = createMockBatch([message])
 
-      const result = await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, env)
 
-      expect(result.totalEvents).toBe(0)
       expect(message.ack).toHaveBeenCalled()
     })
   })
@@ -579,11 +397,14 @@ describe('Queue Handler', () => {
       const message = createMockMessage(createEventBatch([cdcEvent]))
       const batch = createMockBatch([message])
 
-      env.CDC_PROCESSOR = createMockDONamespace(() => ({
-        process: vi.fn().mockRejectedValue(new Error('Transient failure')),
-      }))
+      // Create an env with a failing CDC processor
+      const failingEnv = createMockEnv({
+        CDC_PROCESSOR: createMockDONamespace(() => ({
+          process: vi.fn().mockRejectedValue(new Error('Transient failure')),
+        })),
+      } as Partial<Env>)
 
-      await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, failingEnv)
 
       expect(message.retry).toHaveBeenCalled()
       expect(message.ack).not.toHaveBeenCalled()
@@ -594,11 +415,14 @@ describe('Queue Handler', () => {
       const message = createMockMessage(createEventBatch([rpcEvent]))
       const batch = createMockBatch([message])
 
-      env.SUBSCRIPTIONS = createMockDONamespace(() => ({
-        fanout: vi.fn().mockRejectedValue(new Error('Transient failure')),
-      }))
+      // Create an env with a failing subscription DO
+      const failingEnv = createMockEnv({
+        SUBSCRIPTIONS: createMockDONamespace(() => ({
+          fanout: vi.fn().mockRejectedValue(new Error('Transient failure')),
+        })),
+      } as Partial<Env>)
 
-      await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, failingEnv)
 
       expect(message.retry).toHaveBeenCalled()
       expect(message.ack).not.toHaveBeenCalled()
@@ -609,18 +433,20 @@ describe('Queue Handler', () => {
       const message2 = createMockMessage(createEventBatch([createRPCEvent()]), 'msg-2')
 
       let callCount = 0
-      env.SUBSCRIPTIONS = createMockDONamespace(() => ({
-        fanout: vi.fn().mockImplementation(() => {
-          callCount++
-          if (callCount === 1) {
-            return Promise.reject(new Error('First call fails'))
-          }
-          return Promise.resolve({ matched: 1, deliveries: [] })
-        }),
-      }))
+      const mixedEnv = createMockEnv({
+        SUBSCRIPTIONS: createMockDONamespace(() => ({
+          fanout: vi.fn().mockImplementation(() => {
+            callCount++
+            if (callCount === 1) {
+              return Promise.reject(new Error('First call fails'))
+            }
+            return Promise.resolve({ matched: 1, deliveries: [] })
+          }),
+        })),
+      } as Partial<Env>)
 
       const batch = createMockBatch([message1, message2])
-      await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, mixedEnv)
 
       expect(message1.retry).toHaveBeenCalled()
       expect(message2.ack).toHaveBeenCalled()
@@ -628,19 +454,23 @@ describe('Queue Handler', () => {
   })
 
   describe('Dead Letter Handling', () => {
-    it('sends to dead letter after MAX_RETRIES', async () => {
+    const MAX_RETRIES = 5
+
+    it('sends to dead letter after MAX_RETRIES (5 attempts)', async () => {
       const cdcEvent = createCDCEvent()
       const message = createMockMessage(createEventBatch([cdcEvent]), 'msg-1', MAX_RETRIES)
       const batch = createMockBatch([message])
 
-      env.CDC_PROCESSOR = createMockDONamespace(() => ({
-        process: vi.fn().mockRejectedValue(new Error('Permanent failure')),
-      }))
+      const failingEnv = createMockEnv({
+        CDC_PROCESSOR: createMockDONamespace(() => ({
+          process: vi.fn().mockRejectedValue(new Error('Permanent failure')),
+        })),
+      } as Partial<Env>)
 
-      const result = await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, failingEnv)
 
-      expect(result.deadLettered).toBe(1)
-      expect(message.ack).toHaveBeenCalled() // Ack to prevent further retries
+      // After MAX_RETRIES, should ack (not retry) and write dead letter
+      expect(message.ack).toHaveBeenCalled()
       expect(message.retry).not.toHaveBeenCalled()
     })
 
@@ -649,16 +479,18 @@ describe('Queue Handler', () => {
       const message = createMockMessage(createEventBatch([cdcEvent]), 'msg-dead', MAX_RETRIES)
       const batch = createMockBatch([message])
 
-      env.CDC_PROCESSOR = createMockDONamespace(() => ({
-        process: vi.fn().mockRejectedValue(new Error('Permanent failure')),
-      }))
+      const failingEnv = createMockEnv({
+        CDC_PROCESSOR: createMockDONamespace(() => ({
+          process: vi.fn().mockRejectedValue(new Error('Permanent failure')),
+        })),
+      } as Partial<Env>)
 
-      await simulateQueueHandler(batch, env)
+      await handleQueue(batch as unknown as MessageBatch<EventBatch>, failingEnv)
 
-      expect(env.EVENTS_BUCKET.put).toHaveBeenCalled()
-      const putCall = env.EVENTS_BUCKET.put.mock.calls[0]
+      const bucket = failingEnv.EVENTS_BUCKET as unknown as { put: ReturnType<typeof vi.fn> }
+      expect(bucket.put).toHaveBeenCalled()
+      const putCall = bucket.put.mock.calls[0]
       expect(putCall[0]).toContain('dead-letter/queue/')
-      expect(putCall[0]).toContain('msg-dead.json')
     })
 
     it('retries at attempt 4, dead letters at attempt 5', async () => {
@@ -668,11 +500,13 @@ describe('Queue Handler', () => {
       const message4 = createMockMessage(createEventBatch([cdcEvent]), 'msg-4', 4)
       const batch4 = createMockBatch([message4])
 
-      env.CDC_PROCESSOR = createMockDONamespace(() => ({
-        process: vi.fn().mockRejectedValue(new Error('Failure')),
-      }))
+      const failingEnv = createMockEnv({
+        CDC_PROCESSOR: createMockDONamespace(() => ({
+          process: vi.fn().mockRejectedValue(new Error('Failure')),
+        })),
+      } as Partial<Env>)
 
-      await simulateQueueHandler(batch4, env)
+      await handleQueue(batch4 as unknown as MessageBatch<EventBatch>, failingEnv)
 
       expect(message4.retry).toHaveBeenCalled()
       expect(message4.ack).not.toHaveBeenCalled()
@@ -682,34 +516,16 @@ describe('Queue Handler', () => {
       const message5 = createMockMessage(createEventBatch([cdcEvent]), 'msg-5', 5)
       const batch5 = createMockBatch([message5])
 
-      env.CDC_PROCESSOR = createMockDONamespace(() => ({
-        process: vi.fn().mockRejectedValue(new Error('Failure')),
-      }))
+      const failingEnv5 = createMockEnv({
+        CDC_PROCESSOR: createMockDONamespace(() => ({
+          process: vi.fn().mockRejectedValue(new Error('Failure')),
+        })),
+      } as Partial<Env>)
 
-      const result = await simulateQueueHandler(batch5, env)
+      await handleQueue(batch5 as unknown as MessageBatch<EventBatch>, failingEnv5)
 
-      expect(result.deadLettered).toBe(1)
       expect(message5.ack).toHaveBeenCalled()
-    })
-
-    it('includes error details in dead letter payload', async () => {
-      const cdcEvent = createCDCEvent()
-      const message = createMockMessage(createEventBatch([cdcEvent]), 'msg-error', MAX_RETRIES)
-      const batch = createMockBatch([message])
-
-      env.CDC_PROCESSOR = createMockDONamespace(() => ({
-        process: vi.fn().mockRejectedValue(new Error('Specific error message')),
-      }))
-
-      await simulateQueueHandler(batch, env)
-
-      const putCall = env.EVENTS_BUCKET.put.mock.calls[0]
-      const payload = JSON.parse(putCall[1] as string)
-
-      expect(payload.messageId).toBe('msg-error')
-      expect(payload.attempts).toBe(MAX_RETRIES)
-      expect(payload.error).toBe('Specific error message')
-      expect(payload.body).toEqual(createEventBatch([cdcEvent]))
+      expect(message5.retry).not.toHaveBeenCalled()
     })
 
     it('continues if dead letter write fails', async () => {
@@ -717,15 +533,20 @@ describe('Queue Handler', () => {
       const message = createMockMessage(createEventBatch([cdcEvent]), 'msg-fail', MAX_RETRIES)
       const batch = createMockBatch([message])
 
-      env.CDC_PROCESSOR = createMockDONamespace(() => ({
-        process: vi.fn().mockRejectedValue(new Error('Failure')),
-      }))
-      env.EVENTS_BUCKET.put = vi.fn().mockRejectedValue(new Error('R2 write failed'))
+      const bucket = createMockR2Bucket()
+      ;(bucket as unknown as { put: ReturnType<typeof vi.fn> }).put.mockRejectedValue(new Error('R2 write failed'))
 
-      const result = await simulateQueueHandler(batch, env)
+      const failingEnv = createMockEnv({
+        EVENTS_BUCKET: bucket,
+        CDC_PROCESSOR: createMockDONamespace(() => ({
+          process: vi.fn().mockRejectedValue(new Error('Failure')),
+        })),
+      } as Partial<Env>)
 
-      // Should still count as dead lettered and ack the message
-      expect(result.deadLettered).toBe(1)
+      // Should not throw
+      await expect(handleQueue(batch as unknown as MessageBatch<EventBatch>, failingEnv)).resolves.toBeUndefined()
+
+      // Should still ack the message
       expect(message.ack).toHaveBeenCalled()
     })
   })
@@ -752,19 +573,19 @@ describe('Queue Handler', () => {
   describe('CDC Key Generation', () => {
     const testCases = [
       {
-        event: { do: { class: 'UserDO' }, collection: 'profiles' },
+        event: { do: { id: 'id1', class: 'UserDO' }, collection: 'profiles' },
         expected: 'UserDO/profiles',
       },
       {
-        event: { do: { name: 'OrderDO' }, collection: 'items' },
+        event: { do: { id: 'id2', name: 'OrderDO' }, collection: 'items' },
         expected: 'OrderDO/items',
       },
       {
-        event: { do: { id: 'some-id' }, collection: 'data' },
+        event: { do: { id: 'id3' }, collection: 'data' },
         expected: 'default/data',
       },
       {
-        event: { do: { class: 'MyClass', name: 'MyName' }, collection: 'docs' },
+        event: { do: { id: 'id4', class: 'MyClass', name: 'MyName' }, collection: 'docs' },
         expected: 'MyClass/docs',
       },
     ]

@@ -73,7 +73,22 @@ export type IngestMiddleware = (
 
 export const MAX_EVENT_SIZE = 10 * 1024 // 10KB per event
 export const MAX_BATCH_SIZE = 1000 // Max events per batch
-export const MAX_TYPE_LENGTH = 256
+export const MAX_TYPE_LENGTH = 128
+
+/**
+ * Regex for valid event type characters.
+ * Allows: alphanumeric (a-z, A-Z, 0-9), dots (.), underscores (_), hyphens (-)
+ * This prevents injection attacks and parsing issues.
+ */
+export const EVENT_TYPE_PATTERN = /^[a-zA-Z0-9._-]+$/
+
+// Request body size limits
+/** Default max body size for ingest endpoint (1MB) */
+export const DEFAULT_MAX_BODY_SIZE = 1 * 1024 * 1024
+/** Max body size for webhook requests (1MB) */
+export const MAX_WEBHOOK_BODY_SIZE = 1 * 1024 * 1024
+/** Max body size for query requests (64KB) */
+export const MAX_QUERY_BODY_SIZE = 64 * 1024
 
 // ============================================================================
 // Schema Validation Types

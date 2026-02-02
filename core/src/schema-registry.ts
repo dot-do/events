@@ -9,6 +9,19 @@
  * - Validate events against registered schemas
  * - Optional validation per namespace/event-type
  * - Schema versioning support
+ *
+ * ## Sharding Strategy
+ *
+ * SchemaRegistryDO is sharded by namespace. Each namespace gets its own
+ * DO instance via `env.SCHEMA_REGISTRY.idFromName(namespace)`. This ensures:
+ * - Schema operations for one namespace don't contend with another
+ * - Each namespace's schemas are stored in isolated SQLite databases
+ * - Natural horizontal scaling as namespaces are added
+ *
+ * Cross-namespace schema lookups (e.g., fallback to 'default' namespace)
+ * require the caller to make separate RPC calls to different DO instances.
+ * The validateEvent method handles this internally by returning whether a
+ * schema was found, allowing callers to implement fallback logic.
  */
 
 import { DurableObject } from 'cloudflare:workers'
@@ -22,6 +35,14 @@ import {
   type SqlRow,
 } from './sql-mapper.js'
 import { ulid } from './ulid.js'
+import {
+  getCachedSafeRegex,
+  safeRegexTest,
+  validateSchemaPattern,
+  MAX_PATTERN_LENGTH,
+  MAX_INPUT_LENGTH,
+} from './safe-regex.js'
+import { matchPattern } from './pattern-matcher.js'
 
 // ============================================================================
 // Types
@@ -195,14 +216,34 @@ export function validateAgainstSchema(
       })
     }
     if (schema.pattern !== undefined) {
-      const regex = new RegExp(schema.pattern)
-      if (!regex.test(value)) {
+      // Use safe regex to prevent ReDoS attacks
+      const regex = getCachedSafeRegex(schema.pattern)
+      if (!regex) {
+        // Pattern is unsafe or invalid - treat as validation error
         errors.push({
           path,
-          message: `String must match pattern: ${schema.pattern}`,
+          message: `Invalid or unsafe pattern: ${schema.pattern.slice(0, 50)}${schema.pattern.length > 50 ? '...' : ''}`,
           keyword: 'pattern',
-          params: { pattern: schema.pattern },
+          params: { pattern: schema.pattern, error: 'pattern_unsafe' },
         })
+      } else {
+        // Execute regex with safety measures
+        const result = safeRegexTest(regex, value, { maxInputLength: MAX_INPUT_LENGTH })
+        if (result.error) {
+          errors.push({
+            path,
+            message: `Pattern validation error: ${result.error}`,
+            keyword: 'pattern',
+            params: { pattern: schema.pattern, error: result.error },
+          })
+        } else if (!result.matched) {
+          errors.push({
+            path,
+            message: `String must match pattern: ${schema.pattern}`,
+            keyword: 'pattern',
+            params: { pattern: schema.pattern },
+          })
+        }
       }
     }
     if (schema.format !== undefined) {
@@ -549,6 +590,63 @@ export class SchemaRegistryDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------
 
   /**
+   * Validate all patterns in a JSON schema for safety (ReDoS prevention)
+   * Returns an error message if any pattern is unsafe, null otherwise
+   */
+  private validateSchemaPatterns(schema: JsonSchema, path = ''): string | null {
+    // Check pattern at current level
+    if (schema.pattern !== undefined) {
+      const result = validateSchemaPattern(schema.pattern)
+      if (!result.valid) {
+        return `Unsafe pattern at ${path || 'root'}: ${result.error}`
+      }
+    }
+
+    // Check nested properties
+    if (schema.properties) {
+      for (const [prop, propSchema] of Object.entries(schema.properties)) {
+        const propPath = path ? `${path}.properties.${prop}` : `properties.${prop}`
+        const error = this.validateSchemaPatterns(propSchema, propPath)
+        if (error) return error
+      }
+    }
+
+    // Check additionalProperties if it's a schema
+    if (typeof schema.additionalProperties === 'object') {
+      const error = this.validateSchemaPatterns(
+        schema.additionalProperties,
+        path ? `${path}.additionalProperties` : 'additionalProperties'
+      )
+      if (error) return error
+    }
+
+    // Check items
+    if (schema.items) {
+      const error = this.validateSchemaPatterns(
+        schema.items,
+        path ? `${path}.items` : 'items'
+      )
+      if (error) return error
+    }
+
+    // Check oneOf/anyOf/allOf
+    for (const keyword of ['oneOf', 'anyOf', 'allOf'] as const) {
+      const schemas = schema[keyword]
+      if (schemas) {
+        for (let i = 0; i < schemas.length; i++) {
+          const error = this.validateSchemaPatterns(
+            schemas[i],
+            path ? `${path}.${keyword}[${i}]` : `${keyword}[${i}]`
+          )
+          if (error) return error
+        }
+      }
+    }
+
+    return null
+  }
+
+  /**
    * Register or update a schema for an event type
    */
   async registerSchema(params: {
@@ -563,6 +661,11 @@ export class SchemaRegistryDO extends DurableObject<Env> {
     const now = Date.now()
 
     try {
+      // Validate all patterns in the schema for safety (ReDoS prevention)
+      const patternError = this.validateSchemaPatterns(params.schema)
+      if (patternError) {
+        return { ok: false, error: patternError }
+      }
       // Check for existing schema
       const existing = this.sql
         .exec(
@@ -931,8 +1034,28 @@ export class SchemaRegistryDO extends DurableObject<Env> {
   }
 
   /**
-   * Find a matching schema for an event type
+   * Find a matching schema for an event type within this DO's namespace
    * Supports exact matches and wildcard patterns
+   *
+   * IMPORTANT: This method only searches within the current DO instance's
+   * namespace. Since SchemaRegistryDO is sharded by namespace (each namespace
+   * gets its own DO instance via idFromName), cross-namespace fallback must
+   * be handled by the caller.
+   *
+   * For example, to implement fallback to 'default' namespace:
+   * ```typescript
+   * // Try specific namespace first
+   * const registryId = env.SCHEMA_REGISTRY.idFromName(namespace)
+   * const registry = env.SCHEMA_REGISTRY.get(registryId)
+   * const result = await registry.validateEvent(event, namespace)
+   *
+   * // If no schema found and not default namespace, try default
+   * if (!result.schemaFound && namespace !== 'default') {
+   *   const defaultId = env.SCHEMA_REGISTRY.idFromName('default')
+   *   const defaultRegistry = env.SCHEMA_REGISTRY.get(defaultId)
+   *   result = await defaultRegistry.validateEvent(event, 'default')
+   * }
+   * ```
    */
   private async findMatchingSchema(
     eventType: string,
@@ -945,72 +1068,25 @@ export class SchemaRegistryDO extends DurableObject<Env> {
     }
 
     // Try wildcard patterns
-    // Get all schemas for namespace and check patterns
+    // Get all schemas for this namespace and check patterns
     const schemas = await this.listSchemas({ namespace })
 
     for (const schema of schemas) {
-      if (this.matchesPattern(eventType, schema.eventType)) {
+      if (matchPattern(schema.eventType, eventType)) {
         return schema
       }
     }
 
-    // Try default namespace if not already checking default
-    if (namespace !== 'default') {
-      return this.findMatchingSchema(eventType, 'default')
-    }
+    // Note: Cross-namespace fallback removed. Each namespace has its own DO
+    // instance (sharded via idFromName), so searching 'default' namespace here
+    // would just search this same DO's database again. Callers must implement
+    // fallback by making separate RPC calls to the 'default' namespace DO.
 
     return null
   }
 
-  /**
-   * Check if event type matches a pattern
-   * Supports wildcards: * (single segment), ** (multiple segments)
-   */
-  private matchesPattern(eventType: string, pattern: string): boolean {
-    // No wildcards = exact match only
-    if (!pattern.includes('*')) {
-      return eventType === pattern
-    }
-
-    const eventParts = eventType.split('.')
-    const patternParts = pattern.split('.')
-
-    let eventIdx = 0
-    let patternIdx = 0
-
-    while (patternIdx < patternParts.length) {
-      const p = patternParts[patternIdx]
-
-      if (p === '**') {
-        // ** matches zero or more segments
-        if (patternIdx === patternParts.length - 1) {
-          return true
-        }
-        // Try matching remaining pattern
-        for (let i = eventIdx; i <= eventParts.length; i++) {
-          const remaining = eventParts.slice(i).join('.')
-          const remainingPattern = patternParts.slice(patternIdx + 1).join('.')
-          if (this.matchesPattern(remaining, remainingPattern)) {
-            return true
-          }
-        }
-        return false
-      } else if (eventIdx >= eventParts.length) {
-        return false
-      } else if (p === '*') {
-        // * matches exactly one segment
-        eventIdx++
-        patternIdx++
-      } else if (p === eventParts[eventIdx]) {
-        eventIdx++
-        patternIdx++
-      } else {
-        return false
-      }
-    }
-
-    return eventIdx === eventParts.length && patternIdx === patternParts.length
-  }
+  // Note: Pattern matching now uses the shared matchPattern() from pattern-matcher.ts
+  // This provides consistent glob-style matching with * (single segment) and ** (multiple segments)
 
   /**
    * Convert database row to SchemaRegistration object

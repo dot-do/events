@@ -920,8 +920,8 @@ pnpm deploy
 
 - Read the [API Reference](/core/README.md) for detailed documentation
 - Learn about [Operations](/docs/OPERATIONS.md) for monitoring and maintenance
+- Configure [Subscriptions](/docs/SUBSCRIPTIONS.md) for event-driven workflows
 - Set up [R2 Lakehouse](/docs/LAKEHOUSE.md) for analytics (coming soon)
-- Configure [Subscriptions](/docs/SUBSCRIPTIONS.md) for event-driven workflows (coming soon)
 
 ## Support
 

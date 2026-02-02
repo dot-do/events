@@ -29,6 +29,32 @@ export class SqlTypeError extends Error {
   }
 }
 
+/**
+ * Error thrown when parsed JSON fails runtime validation
+ */
+export class JsonValidationError extends Error {
+  constructor(
+    public readonly key: string,
+    public readonly validationError: string,
+    public readonly actualValue: unknown
+  ) {
+    super(`Column '${key}' JSON validation failed: ${validationError}. Value: ${JSON.stringify(actualValue)}`)
+    this.name = 'JsonValidationError'
+  }
+}
+
+/**
+ * Type guard function signature for validating parsed JSON
+ */
+export type JsonValidator<T> = (value: unknown) => value is T
+
+/**
+ * JSON validation result type - either success with typed value or failure with error message
+ */
+export type JsonValidationResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: string }
+
 // ============================================================================
 // Required Value Accessors
 // ============================================================================
@@ -168,7 +194,9 @@ export function getOptionalBoolean(row: SqlRow, key: string): boolean | null {
 /**
  * Get a JSON-parsed value from a string column.
  * Parses the string value as JSON and returns the typed result.
- * Throws SqlTypeError if the value is not a string, or SyntaxError if parsing fails.
+ *
+ * WARNING: Without a validator, this function does NOT verify that the parsed
+ * JSON matches type T. For type-safe parsing, use getValidatedJson instead.
  *
  * @param row - The SQL row object
  * @param key - The column name
@@ -188,7 +216,9 @@ export function getJson<T>(row: SqlRow, key: string): T {
  * Get an optional JSON-parsed value from a string column.
  * Returns null if the value is null or undefined.
  * Parses the string value as JSON and returns the typed result.
- * Throws SqlTypeError if the value is not null, undefined, or string.
+ *
+ * WARNING: Without a validator, this function does NOT verify that the parsed
+ * JSON matches type T. For type-safe parsing, use getValidatedOptionalJson instead.
  *
  * @param row - The SQL row object
  * @param key - The column name
@@ -205,4 +235,192 @@ export function getOptionalJson<T>(row: SqlRow, key: string): T | null {
     throw new SqlTypeError(key, 'string (JSON) | null', value)
   }
   return JSON.parse(value) as T
+}
+
+// ============================================================================
+// Validated JSON Value Accessors
+// ============================================================================
+
+/**
+ * Get a JSON-parsed and validated value from a string column.
+ * Parses the string value as JSON and validates it using the provided validator.
+ *
+ * @param row - The SQL row object
+ * @param key - The column name
+ * @param validator - Type guard function to validate the parsed JSON
+ * @returns The validated parsed JSON value
+ * @throws SqlTypeError if value is not a string
+ * @throws SyntaxError if JSON parsing fails
+ * @throws JsonValidationError if the parsed value fails validation
+ *
+ * @example
+ * const isUser = (v: unknown): v is User =>
+ *   isObject(v) && typeof v.name === 'string' && typeof v.age === 'number'
+ * const user = getValidatedJson(row, 'user_data', isUser)
+ */
+export function getValidatedJson<T>(row: SqlRow, key: string, validator: JsonValidator<T>): T {
+  const value = row[key]
+  if (typeof value !== 'string') {
+    throw new SqlTypeError(key, 'string (JSON)', value)
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      throw new SyntaxError(`Column '${key}' contains invalid JSON: ${e.message}`)
+    }
+    throw e
+  }
+
+  if (!validator(parsed)) {
+    throw new JsonValidationError(key, 'value does not match expected type', parsed)
+  }
+
+  return parsed
+}
+
+/**
+ * Get an optional JSON-parsed and validated value from a string column.
+ * Returns null if the value is null or undefined.
+ * Parses the string value as JSON and validates it using the provided validator.
+ *
+ * @param row - The SQL row object
+ * @param key - The column name
+ * @param validator - Type guard function to validate the parsed JSON
+ * @returns The validated parsed JSON value or null
+ * @throws SqlTypeError if value is not null, undefined, or string
+ * @throws SyntaxError if JSON parsing fails
+ * @throws JsonValidationError if the parsed value fails validation
+ *
+ * @example
+ * const isUser = (v: unknown): v is User =>
+ *   isObject(v) && typeof v.name === 'string'
+ * const user = getValidatedOptionalJson(row, 'user_data', isUser)
+ */
+export function getValidatedOptionalJson<T>(
+  row: SqlRow,
+  key: string,
+  validator: JsonValidator<T>
+): T | null {
+  const value = row[key]
+  if (value === null || value === undefined) {
+    return null
+  }
+  if (typeof value !== 'string') {
+    throw new SqlTypeError(key, 'string (JSON) | null', value)
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      throw new SyntaxError(`Column '${key}' contains invalid JSON: ${e.message}`)
+    }
+    throw e
+  }
+
+  if (!validator(parsed)) {
+    throw new JsonValidationError(key, 'value does not match expected type', parsed)
+  }
+
+  return parsed
+}
+
+// ============================================================================
+// Type Guard Utilities
+// ============================================================================
+
+/**
+ * Check if value is a non-null object (not an array)
+ */
+export function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Check if value is an array
+ */
+export function isArray(value: unknown): value is unknown[] {
+  return Array.isArray(value)
+}
+
+/**
+ * Check if value is an array where all elements pass the validator
+ */
+export function isArrayOf<T>(value: unknown, itemValidator: JsonValidator<T>): value is T[] {
+  return Array.isArray(value) && value.every(itemValidator)
+}
+
+/**
+ * Check if value is a string
+ */
+export function isString(value: unknown): value is string {
+  return typeof value === 'string'
+}
+
+/**
+ * Check if value is a number (and not NaN)
+ */
+export function isNumber(value: unknown): value is number {
+  return typeof value === 'number' && !Number.isNaN(value)
+}
+
+/**
+ * Check if value is a boolean
+ */
+export function isBoolean(value: unknown): value is boolean {
+  return typeof value === 'boolean'
+}
+
+/**
+ * Check if value is null
+ */
+export function isNull(value: unknown): value is null {
+  return value === null
+}
+
+/**
+ * Create a validator for an object with specific required fields
+ *
+ * @example
+ * const isUser = createObjectValidator({
+ *   name: isString,
+ *   age: isNumber,
+ * })
+ */
+export function createObjectValidator<T extends Record<string, unknown>>(
+  fieldValidators: { [K in keyof T]: JsonValidator<T[K]> }
+): JsonValidator<T> {
+  return (value: unknown): value is T => {
+    if (!isObject(value)) {
+      return false
+    }
+    for (const [field, validator] of Object.entries(fieldValidators)) {
+      if (!(validator as JsonValidator<unknown>)(value[field])) {
+        return false
+      }
+    }
+    return true
+  }
+}
+
+/**
+ * Create a validator that allows a value or null
+ */
+export function nullable<T>(validator: JsonValidator<T>): JsonValidator<T | null> {
+  return (value: unknown): value is T | null => {
+    return value === null || validator(value)
+  }
+}
+
+/**
+ * Create a validator that allows a value or undefined
+ */
+export function optional<T>(validator: JsonValidator<T>): JsonValidator<T | undefined> {
+  return (value: unknown): value is T | undefined => {
+    return value === undefined || validator(value)
+  }
 }

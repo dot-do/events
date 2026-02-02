@@ -24,18 +24,18 @@ export interface EventRecord {
   // Core fields (typed columns with statistics)
   ts: string              // ISO timestamp
   type: string            // Event type (e.g., "webhook.github.push")
-  source?: string         // Event source (e.g., "github", "stripe", "tail")
+  source?: string | undefined         // Event source (e.g., "github", "stripe", "tail")
 
   // Optional typed fields
-  provider?: string       // Webhook provider
-  eventType?: string      // Original event type from provider
-  verified?: boolean      // Signature verification status
-  scriptName?: string     // Worker name (for tail events)
-  outcome?: string        // ok, exception, etc. (for tail events)
-  method?: string         // HTTP method
-  url?: string            // Request URL
-  statusCode?: number     // HTTP status
-  durationMs?: number     // Request duration
+  provider?: string | undefined       // Webhook provider
+  eventType?: string | undefined      // Original event type from provider
+  verified?: boolean | undefined      // Signature verification status
+  scriptName?: string | undefined     // Worker name (for tail events)
+  outcome?: string | undefined        // ok, exception, etc. (for tail events)
+  method?: string | undefined         // HTTP method
+  url?: string | undefined            // Request URL
+  statusCode?: number | undefined     // HTTP status
+  durationMs?: number | undefined     // Request duration
 
   // Full payload (stored as VARIANT)
   payload?: unknown

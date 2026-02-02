@@ -90,7 +90,7 @@ export interface BatchDeliveryResult {
     deliveryId: string
     eventId: string
     success: boolean
-    error?: string
+    error?: string | undefined
   }>
 }
 
@@ -101,13 +101,13 @@ export interface PendingBatch {
   deliveryIds: string[]
   eventCount: number
   windowStart: number
-  windowEnd?: number
+  windowEnd?: number | undefined
   status: 'pending' | 'delivered' | 'failed' | 'dead'
   attemptCount: number
-  nextAttemptAt?: number
-  lastError?: string
+  nextAttemptAt?: number | undefined
+  lastError?: string | undefined
   createdAt: number
-  deliveredAt?: number
+  deliveredAt?: number | undefined
 }
 
 export interface Delivery {

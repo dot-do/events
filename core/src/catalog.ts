@@ -40,10 +40,10 @@ export interface TableSchema {
 export interface FieldChange {
   field: string
   changeType: 'added' | 'removed' | 'modified'
-  oldType?: SchemaField['type']
-  newType?: SchemaField['type']
-  oldNullable?: boolean
-  newNullable?: boolean
+  oldType?: SchemaField['type'] | undefined
+  newType?: SchemaField['type'] | undefined
+  oldNullable?: boolean | undefined
+  newNullable?: boolean | undefined
 }
 
 /** Represents a schema change event */
@@ -54,7 +54,7 @@ export interface SchemaChange {
   changes: FieldChange[]
   timestamp: string
   /** Optional: what triggered this change (e.g., snapshot commit, manual evolution) */
-  trigger?: 'snapshot' | 'manual' | 'auto-detect'
+  trigger?: 'snapshot' | 'manual' | 'auto-detect' | undefined
 }
 
 /** Represents a version of a schema with its history */
@@ -63,14 +63,14 @@ export interface SchemaVersion {
   fields: SchemaField[]
   createdAt: string
   /** The change that created this version (null for initial version) */
-  change?: SchemaChange
+  change?: SchemaChange | undefined
 }
 
 export interface SchemaField {
   name: string
   type: 'string' | 'int32' | 'int64' | 'float' | 'double' | 'boolean' | 'timestamp' | 'json'
-  nullable?: boolean
-  doc?: string
+  nullable?: boolean | undefined
+  doc?: string | undefined
 }
 
 export interface PartitionSpec {
@@ -82,7 +82,7 @@ export interface PartitionField {
   sourceId: number
   name: string
   transform: 'identity' | 'year' | 'month' | 'day' | 'hour' | 'bucket' | 'truncate'
-  transformArg?: number
+  transformArg?: number | undefined
 }
 
 export interface DataFile {
@@ -90,16 +90,16 @@ export interface DataFile {
   format: 'parquet' | 'jsonl'
   recordCount: number
   fileSizeBytes: number
-  columnStats?: Record<string, ColumnStats>
-  partitionValues?: Record<string, string>
+  columnStats?: Record<string, ColumnStats> | undefined
+  partitionValues?: Record<string, string> | undefined
   createdAt: string
 }
 
 export interface ColumnStats {
-  nullCount?: number
-  minValue?: string | number
-  maxValue?: string | number
-  distinctCount?: number
+  nullCount?: number | undefined
+  minValue?: string | number | undefined
+  maxValue?: string | number | undefined
+  distinctCount?: number | undefined
 }
 
 export interface Manifest {
@@ -108,12 +108,12 @@ export interface Manifest {
   addedFiles: number
   deletedFiles: number
   existingFiles: number
-  partitionSummary?: Record<string, { min: string; max: string }>
+  partitionSummary?: Record<string, { min: string; max: string }> | undefined
 }
 
 export interface Snapshot {
   snapshotId: string
-  parentSnapshotId?: string
+  parentSnapshotId?: string | undefined
   timestampMs: number
   operation: 'append' | 'overwrite' | 'delete' | 'replace'
   manifestList: string[]
@@ -126,7 +126,7 @@ export interface Snapshot {
     totalFiles: number
   }
   // PITR integration
-  cdcBookmark?: string
+  cdcBookmark?: string | undefined
 }
 
 export interface TableMetadata {
@@ -138,7 +138,7 @@ export interface TableMetadata {
   schemas: TableSchema[]
   currentSpecId: number
   partitionSpecs: PartitionSpec[]
-  currentSnapshotId?: string
+  currentSnapshotId?: string | undefined
   snapshots: Snapshot[]
   snapshotLog: { timestampMs: number; snapshotId: string }[]
   properties: Record<string, string>

@@ -1,0 +1,66 @@
+{
+  "name": "@dotdo/events-cli",
+  "version": "0.1.0",
+  "description": "CLI for scaffolding and developing events.do projects",
+  "type": "module",
+  "bin": {
+    "events": "./dist/cli.js",
+    "events-cli": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "templates",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
+  },
+  "keywords": [
+    "events.do",
+    "cli",
+    "cloudflare",
+    "workers",
+    "durable-objects",
+    "scaffolding"
+  ],
+  "author": {
+    "name": "Platform.do",
+    "email": "npm@platform.do",
+    "url": "https://platform.do"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dot-do/events.git",
+    "directory": "packages/events-cli"
+  },
+  "homepage": "https://events.do",
+  "dependencies": {
+    "commander": "^12.1.0",
+    "picocolors": "^1.1.1",
+    "prompts": "^2.4.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/prompts": "^2.4.9",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

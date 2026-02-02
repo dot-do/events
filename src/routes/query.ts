@@ -8,6 +8,9 @@
 import type { Env } from '../env'
 import { authCorsHeaders } from '../utils'
 import type { TenantContext } from '../middleware/tenant'
+import { PayloadTooLargeError } from '../../core/src/errors'
+import { MAX_QUERY_BODY_SIZE } from '../middleware/ingest/types'
+import { readBodyWithLimit } from '../middleware/ingest/validate'
 
 // ============================================================================
 // Query Builder
@@ -60,7 +63,7 @@ function escapeSql(value: string): string {
 }
 
 function validateQueryRequest(query: unknown): query is QueryRequest {
-  if (typeof query !== 'object' || query === null) return false
+  if (typeof query !== 'object' || query === null || Array.isArray(query)) return false
   const q = query as Record<string, unknown>
 
   // Validate dateRange if present
@@ -105,10 +108,43 @@ function validateQueryRequest(query: unknown): query is QueryRequest {
  * @param tenant - Optional tenant context (if provided, queries are scoped to this tenant's namespace)
  */
 export async function handleQuery(request: Request, env: Env, tenant?: TenantContext): Promise<Response> {
+  // Get max body size from env or use default (64KB for query requests)
+  const maxSize = env.MAX_QUERY_BODY_SIZE
+    ? parseInt(env.MAX_QUERY_BODY_SIZE, 10) || MAX_QUERY_BODY_SIZE
+    : MAX_QUERY_BODY_SIZE
+
+  // Check Content-Length header first (fast rejection)
+  const contentLength = request.headers.get('content-length')
+  if (contentLength) {
+    const length = parseInt(contentLength, 10)
+    if (!isNaN(length) && length > maxSize) {
+      return Response.json(
+        {
+          error: `Request body too large: ${length} bytes exceeds ${maxSize} byte limit`,
+          code: 'PAYLOAD_TOO_LARGE',
+          details: { maxSize, contentLength: length }
+        },
+        { status: 413, headers: authCorsHeaders(request, env) }
+      )
+    }
+  }
+
+  // Read body with size limit and parse JSON
   let queryBody: unknown
   try {
-    queryBody = await request.json()
-  } catch {
+    const bodyText = await readBodyWithLimit(request, maxSize)
+    queryBody = JSON.parse(bodyText)
+  } catch (error) {
+    if (error instanceof PayloadTooLargeError) {
+      return Response.json(
+        {
+          error: error.message,
+          code: 'PAYLOAD_TOO_LARGE',
+          details: error.details
+        },
+        { status: 413, headers: authCorsHeaders(request, env) }
+      )
+    }
     return Response.json({ error: 'Invalid JSON' }, { status: 400, headers: authCorsHeaders(request, env) })
   }
 

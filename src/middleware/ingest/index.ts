@@ -38,6 +38,10 @@ export {
   MAX_EVENT_SIZE,
   MAX_BATCH_SIZE,
   MAX_TYPE_LENGTH,
+  EVENT_TYPE_PATTERN,
+  DEFAULT_MAX_BODY_SIZE,
+  MAX_WEBHOOK_BODY_SIZE,
+  MAX_QUERY_BODY_SIZE,
 } from './types'
 
 // Composition utilities
@@ -50,12 +54,17 @@ export {
 
 // Validation middleware
 export {
+  isValidEventType,
   validateEvent,
   validateBatch,
   validateEventSize,
   parseJsonMiddleware,
   validateBatchMiddleware,
   validateEventsMiddleware,
+  // Body size limit utilities
+  getMaxBodySize,
+  checkContentLength,
+  readBodyWithLimit,
 } from './validate'
 
 // Deduplication middleware
@@ -79,3 +88,15 @@ export {
   executeDirectFanout,
   executeQueueFanout,
 } from './fanout'
+
+// Encryption middleware
+export {
+  encryptionMiddleware,
+  loadKeyStore,
+  loadEncryptionConfig,
+  decryptEvent,
+  decryptEventBatch,
+  validateClientEncryption,
+  type EncryptionEnv,
+  type EncryptedIngestContext,
+} from './encryption'

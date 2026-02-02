@@ -10,14 +10,24 @@
     "deploy:compactor": "wrangler deploy -c wrangler.compactor.jsonc",
     "deploy:tail": "wrangler deploy -c wrangler.tail.jsonc",
     "test": "cd core && vitest run",
+    "test:cli": "cd packages/events-cli && vitest run",
     "test:e2e": "cd e2e && pnpm test",
     "test:e2e:prod": "cd e2e && vitest run -c vitest.real.config.ts",
     "test:webhooks": "cd e2e && vitest run -c vitest.real.config.ts webhooks-e2e.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:cli": "cd packages/events-cli && pnpm build",
+    "benchmark": "npx tsx benchmarks/cdc-benchmark.ts && npx tsx benchmarks/subscription-benchmark.ts && npx tsx benchmarks/query-benchmark.ts",
+    "benchmark:ingest": "npx tsx benchmarks/ingest-benchmark.ts",
+    "benchmark:cdc": "npx tsx benchmarks/cdc-benchmark.ts",
+    "benchmark:subscription": "npx tsx benchmarks/subscription-benchmark.ts",
+    "benchmark:query": "npx tsx benchmarks/query-benchmark.ts",
+    "benchmark:parquet": "npx tsx benchmarks/run-benchmark.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.10.15",
     "@cloudflare/workers-types": "^4.20250121.0",
+    "picomatch": "^4.0.3",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vitest": "^2.1.8",
     "wrangler": "^4.0.0"

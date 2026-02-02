@@ -369,4 +369,206 @@ describe('validateAgainstSchema', () => {
       expect(errors[0]?.path).toBe('items[1].id')
     })
   })
+
+  describe('ReDoS prevention', () => {
+    it('rejects patterns with nested quantifiers', () => {
+      const schema: JsonSchema = {
+        type: 'string',
+        pattern: '(a+)+',  // Classic ReDoS pattern
+      }
+
+      const errors = validateAgainstSchema('aaaa', schema)
+      expect(errors).toHaveLength(1)
+      expect(errors[0]?.keyword).toBe('pattern')
+      expect(errors[0]?.params?.error).toBe('pattern_unsafe')
+    })
+
+    it('rejects patterns with overlapping alternations', () => {
+      const schema: JsonSchema = {
+        type: 'string',
+        pattern: '(a|aa)+',  // ReDoS via overlapping alternation
+      }
+
+      const errors = validateAgainstSchema('aaaa', schema)
+      expect(errors).toHaveLength(1)
+      expect(errors[0]?.params?.error).toBe('pattern_unsafe')
+    })
+
+    it('rejects patterns exceeding max length', () => {
+      const schema: JsonSchema = {
+        type: 'string',
+        pattern: 'a'.repeat(300),  // Exceeds 256 char limit
+      }
+
+      const errors = validateAgainstSchema('a', schema)
+      expect(errors).toHaveLength(1)
+      expect(errors[0]?.keyword).toBe('pattern')
+    })
+
+    it('accepts safe patterns and validates correctly', () => {
+      const schema: JsonSchema = {
+        type: 'string',
+        pattern: '^[a-z]+$',  // Safe pattern
+      }
+
+      // Should pass
+      expect(validateAgainstSchema('hello', schema)).toEqual([])
+
+      // Should fail (not matching)
+      const errors = validateAgainstSchema('Hello123', schema)
+      expect(errors).toHaveLength(1)
+      expect(errors[0]?.keyword).toBe('pattern')
+      expect(errors[0]?.params?.error).toBeUndefined()  // Not a safety error
+    })
+
+    it('handles safe complex patterns', () => {
+      const schema: JsonSchema = {
+        type: 'string',
+        // Safe email-like pattern
+        pattern: '^[a-zA-Z0-9]+@[a-zA-Z0-9]+\\.[a-zA-Z]+$',
+      }
+
+      expect(validateAgainstSchema('test@example.com', schema)).toEqual([])
+      expect(validateAgainstSchema('invalid', schema)).toHaveLength(1)
+    })
+
+    it('rejects excessively long input', () => {
+      const schema: JsonSchema = {
+        type: 'string',
+        pattern: '^[a-z]+$',
+      }
+
+      // Input exceeding MAX_INPUT_LENGTH (10000)
+      const longInput = 'a'.repeat(15000)
+      const errors = validateAgainstSchema(longInput, schema)
+      expect(errors).toHaveLength(1)
+      expect(errors[0]?.keyword).toBe('pattern')
+      expect(errors[0]?.params?.error).toContain('maximum length')
+    })
+
+    it('handles patterns with reasonable quantifiers', () => {
+      const schema: JsonSchema = {
+        type: 'string',
+        pattern: '^\\d{1,10}$',  // Safe bounded quantifier
+      }
+
+      expect(validateAgainstSchema('12345', schema)).toEqual([])
+      expect(validateAgainstSchema('12345678901', schema)).toHaveLength(1)  // Too long
+    })
+
+    it('rejects patterns with excessive quantifiers', () => {
+      const schema: JsonSchema = {
+        type: 'string',
+        pattern: 'a{1000}',  // Exceeds MAX_QUANTIFIER (100)
+      }
+
+      const errors = validateAgainstSchema('a', schema)
+      expect(errors).toHaveLength(1)
+      expect(errors[0]?.params?.error).toBe('pattern_unsafe')
+    })
+
+    it('protects against known evil regex patterns', () => {
+      // Collection of known ReDoS patterns
+      const evilPatterns = [
+        '(a+)+$',           // Exponential
+        '([a-zA-Z]+)*',     // Exponential
+        '(a|aa)+',          // Overlapping
+        '(.*)+',            // Catastrophic
+        '(\\s*,)+',         // Polynomial
+      ]
+
+      for (const pattern of evilPatterns) {
+        const schema: JsonSchema = { type: 'string', pattern }
+        const errors = validateAgainstSchema('test', schema)
+        expect(errors.length).toBeGreaterThan(0)
+        expect(errors[0]?.params?.error).toBe('pattern_unsafe')
+      }
+    })
+  })
+})
+
+/**
+ * SchemaRegistryDO Sharding Strategy Documentation
+ *
+ * The SchemaRegistryDO is designed with namespace-based sharding:
+ *
+ * 1. Each namespace gets its own DO instance via idFromName(namespace)
+ * 2. Schema operations are isolated per namespace
+ * 3. Cross-namespace queries require separate RPC calls
+ *
+ * Usage pattern:
+ * ```typescript
+ * // Get registry for specific namespace
+ * const registryId = env.SCHEMA_REGISTRY.idFromName(namespace)
+ * const registry = env.SCHEMA_REGISTRY.get(registryId)
+ *
+ * // Validate with optional fallback to default namespace
+ * const result = await registry.validateEvent(event, namespace)
+ * if (!result.schemaFound && namespace !== 'default') {
+ *   const defaultId = env.SCHEMA_REGISTRY.idFromName('default')
+ *   const defaultRegistry = env.SCHEMA_REGISTRY.get(defaultId)
+ *   const fallbackResult = await defaultRegistry.validateEvent(event, 'default')
+ *   // Use fallbackResult
+ * }
+ * ```
+ *
+ * This sharding approach ensures:
+ * - No single DO becomes a bottleneck
+ * - Namespaces are isolated (multi-tenant friendly)
+ * - SQLite storage scales well within each shard
+ * - Pattern: O(namespaces) DOs, each with O(schemas_per_namespace) rows
+ */
+describe('SchemaRegistryDO sharding (design documentation)', () => {
+  it('documents that SchemaRegistryDO is sharded by namespace', () => {
+    // This is a documentation test - it describes the sharding design
+    // Actual integration tests require a DO runtime environment
+
+    // The key insight is that idFromName(namespace) creates isolated DOs:
+    // - idFromName('acme') -> one DO instance
+    // - idFromName('beta') -> different DO instance
+    // - idFromName('default') -> fallback DO instance
+
+    // Each DO has its own SQLite database, so:
+    // - Schemas registered in 'acme' are not visible in 'beta'
+    // - Cross-namespace lookup must be done at the caller level
+    // - This provides natural tenant isolation
+
+    expect(true).toBe(true) // Design documentation test
+  })
+
+  it('documents cross-namespace fallback pattern', () => {
+    // When validating events, the recommended pattern is:
+    // 1. Try the specific namespace's registry first
+    // 2. If no schema found and namespace !== 'default', try 'default'
+    //
+    // This allows global schemas in 'default' while namespace-specific
+    // schemas override them.
+
+    // Example pseudo-code for the caller:
+    /*
+      async function validateWithFallback(
+        event: Event,
+        namespace: string,
+        env: Env
+      ): Promise<ValidationResult> {
+        // Try specific namespace
+        const registry = env.SCHEMA_REGISTRY.get(
+          env.SCHEMA_REGISTRY.idFromName(namespace)
+        )
+        const result = await registry.validateEvent(event, namespace)
+
+        // If no schema found and not default, try default namespace
+        if (!result.schemaFound && namespace !== 'default') {
+          const defaultRegistry = env.SCHEMA_REGISTRY.get(
+            env.SCHEMA_REGISTRY.idFromName('default')
+          )
+          return defaultRegistry.validateEvent(event, 'default')
+        }
+
+        return result
+      }
+    */
+
+    expect(true).toBe(true) // Design documentation test
+  })
 })

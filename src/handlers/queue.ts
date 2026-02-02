@@ -29,10 +29,9 @@ import {
   getSubDedupCache,
 } from '../../core/src/dedup-cache'
 import { recordQueueMetric, recordCDCMetric, recordSubscriptionMetric, MetricTimer } from '../metrics'
-import { createLogger, logError } from '../logger'
+import { createLogger, logError, generateCorrelationId } from '../logger'
 
 const MAX_RETRIES = 5
-const log = createLogger({ component: 'queue' })
 
 /**
  * Queue consumer handler - processes EventBatch messages for CDC/subscription fanout.
@@ -40,6 +39,10 @@ const log = createLogger({ component: 'queue' })
 export async function handleQueue(batch: MessageBatch<EventBatch>, env: Env): Promise<void> {
   const timer = new MetricTimer()
   const startTime = Date.now()
+
+  // Generate a correlation ID for this batch processing
+  const correlationId = generateCorrelationId()
+  const log = createLogger({ component: 'queue', correlationId })
 
   log.info('Processing batch', { messageCount: batch.messages.length, mode: 'QUEUE fanout' })
 

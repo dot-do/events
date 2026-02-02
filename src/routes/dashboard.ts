@@ -346,7 +346,9 @@ function generateDashboardHTML(origin: string): string {
           try {
             const tablesData = await fetchJSON(\`/catalog/tables?namespace=\${encodeURIComponent(ns)}\`);
             totalTables += (tablesData.tables || []).length;
-          } catch {}
+          } catch (e) {
+            console.warn(\`[dashboard] Failed to fetch tables for namespace \${ns}:\`, e);
+          }
         }
         el.innerHTML = \`
           <div class="stat-row">
@@ -373,7 +375,9 @@ function generateDashboardHTML(origin: string): string {
           for (const t of (data.tables || [])) {
             tables.push({ namespace: ns, name: t });
           }
-        } catch {}
+        } catch (e) {
+          console.warn(\`[dashboard] Failed to fetch CDC tables for namespace \${ns}:\`, e);
+        }
       }
       if (!tables.length) {
         el.innerHTML = '<div class="empty-state">No CDC tables</div>';
@@ -447,7 +451,9 @@ function generateDashboardHTML(origin: string): string {
         const data = await fetchJSON('/me');
         const user = data.user || {};
         document.getElementById('user-info').textContent = user.email || 'Unknown user';
-      } catch {
+      } catch (e) {
+        // User info is optional - display default text on error
+        console.debug('[dashboard] Could not load user info:', e);
         document.getElementById('user-info').textContent = 'Admin';
       }
     }

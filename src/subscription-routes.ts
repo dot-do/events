@@ -12,9 +12,16 @@
  * - GET /subscriptions/:id/dead-letters - Get dead letters
  * - POST /subscriptions/:id/dead-letters/:deadLetterId/retry - Retry dead letter
  * - GET /subscriptions/deliveries/:id/logs - Get delivery logs
+ * - GET /subscriptions/shards - Get subscription shard statistics
+ * - GET /subscriptions/shards/config - Get shard coordinator config
+ * - PUT /subscriptions/shards/config - Update shard coordinator config
+ * - POST /subscriptions/shards/scale - Force scale a prefix
  *
  * Subscriptions are sharded by top-level event type prefix (e.g., "collection",
  * "webhook", "rpc") to distribute load across multiple SubscriptionDO instances.
+ *
+ * Dynamic sharding is supported via SubscriptionShardCoordinatorDO, which
+ * manages automatic scaling of shards based on load.
  *
  * Multi-tenant isolation is supported via namespace-prefixed shard keys.
  * Each tenant's subscriptions are isolated in their own DO instances.
@@ -25,8 +32,19 @@ import { corsHeaders as baseCorsHeaders } from './utils'
 import type { Env } from './env'
 import type { TenantContext } from './middleware/tenant'
 import { MAX_PATTERN_LENGTH } from './config'
+import { logger, logError } from './logger'
+import {
+  getSubscriptionShardCoordinator,
+  getActiveSubscriptionShards,
+  getSubscriptionRoutingShard,
+  getAllSubscriptionShards,
+  KNOWN_BASE_PREFIXES,
+  type SubscriptionShardCoordinatorDO,
+} from './subscription-shard-coordinator-do'
 
-type SubscriptionEnv = Pick<Env, 'SUBSCRIPTIONS'>
+type SubscriptionEnv = Pick<Env, 'SUBSCRIPTIONS'> & {
+  SUBSCRIPTION_SHARD_COORDINATOR?: DurableObjectNamespace<SubscriptionShardCoordinatorDO>
+}
 
 /**
  * CORS headers for cross-origin requests (includes Content-Type for subscription routes)
@@ -41,15 +59,9 @@ function corsHeaders(): HeadersInit {
 /**
  * Well-known shard prefixes for subscription fanout.
  * Used by list-all operations to query across all shards.
+ * Re-exported from coordinator for backwards compatibility.
  */
-export const KNOWN_SUBSCRIPTION_SHARDS = [
-  'collection',
-  'rpc',
-  'do',
-  'ws',
-  'webhook',
-  'default',
-]
+export const KNOWN_SUBSCRIPTION_SHARDS = KNOWN_BASE_PREFIXES
 
 /**
  * Validates a subscription pattern for safety and correctness.
@@ -137,25 +149,39 @@ function getNamespacedShard(baseShard: string, tenant?: TenantContext): string {
 /**
  * Get a SubscriptionDO stub for the given shard key.
  * Supports namespace isolation via tenant context.
+ * With dynamic sharding, the shard key may include a shard index (e.g., "collection:0")
  */
 function getSubscriptionStub(
   env: SubscriptionEnv,
   shard: string = 'default',
   tenant?: TenantContext
 ): DurableObjectStub<SubscriptionDO> {
-  const namespacedShard = getNamespacedShard(shard, tenant)
-  const id = env.SUBSCRIPTIONS.idFromName(namespacedShard)
+  // If shard already has index suffix (from dynamic sharding), use as-is with namespace prefix
+  // Otherwise apply legacy namespace prefix behavior
+  let shardKey: string
+  if (shard.includes(':') && /:\d+$/.test(shard)) {
+    // Dynamic shard key with index (e.g., "collection:0" or "acme:collection:0")
+    // Namespace should already be part of the key if coming from coordinator
+    shardKey = shard
+  } else {
+    // Legacy shard key (e.g., "collection")
+    shardKey = getNamespacedShard(shard, tenant)
+  }
+  const id = env.SUBSCRIPTIONS.idFromName(shardKey)
   return env.SUBSCRIPTIONS.get(id)
 }
 
 /**
  * Get stubs for all known shards (used for list-all and cross-shard queries).
  * When tenant is provided, returns namespace-isolated shards.
+ * With dynamic sharding enabled, queries the coordinator for active shards.
  */
 function getAllSubscriptionStubs(
   env: SubscriptionEnv,
   tenant?: TenantContext
 ): { shard: string; stub: DurableObjectStub<SubscriptionDO> }[] {
+  // For backwards compatibility, return stubs for legacy shard names
+  // The caller should use getAllSubscriptionStubsAsync for dynamic sharding support
   return KNOWN_SUBSCRIPTION_SHARDS.map(baseShard => {
     const shard = getNamespacedShard(baseShard, tenant)
     return {
@@ -163,6 +189,25 @@ function getAllSubscriptionStubs(
       stub: getSubscriptionStub(env, baseShard, tenant),
     }
   })
+}
+
+/**
+ * Get stubs for all active shards with dynamic sharding support.
+ * Uses the shard coordinator if available, otherwise falls back to legacy behavior.
+ */
+async function getAllSubscriptionStubsAsync(
+  env: SubscriptionEnv,
+  tenant?: TenantContext
+): Promise<{ shard: string; stub: DurableObjectStub<SubscriptionDO> }[]> {
+  const namespace = tenant?.isAdmin ? undefined : tenant?.namespace
+
+  // Try to get shards from coordinator
+  const shards = await getAllSubscriptionShards(env as Env, namespace)
+
+  return shards.map(shard => ({
+    shard,
+    stub: getSubscriptionStub(env, shard, tenant),
+  }))
 }
 
 /**
@@ -247,10 +292,14 @@ export async function handleSubscriptionRoutes(
         )
       }
 
-      // Route to the correct shard based on pattern prefix (with namespace isolation)
+      // Route to the correct shard based on pattern prefix (with dynamic sharding support)
       const baseShard = getSubscriptionShard(pattern)
-      const stub = getSubscriptionStub(env, baseShard, tenant)
-      const namespacedShard = getNamespacedShard(baseShard, tenant)
+      const namespace = tenant?.isAdmin ? undefined : tenant?.namespace
+
+      // Use dynamic shard routing if coordinator is available
+      const routingShard = await getSubscriptionRoutingShard(env as Env, baseShard, namespace)
+      const stub = getSubscriptionStub(env, routingShard, tenant)
+
       const result = await stub.subscribe({
         workerId,
         workerBinding: workerBinding as string | undefined,
@@ -261,8 +310,9 @@ export async function handleSubscriptionRoutes(
       })
       return Response.json({
         ...result,
-        shard: namespacedShard,
+        shard: routingShard,
         namespace: tenant?.namespace || null,
+        dynamicSharding: !!env.SUBSCRIPTION_SHARD_COORDINATOR,
       }, {
         status: result.ok ? 200 : 400,
         headers: corsHeaders(),
@@ -562,13 +612,197 @@ export async function handleSubscriptionRoutes(
       return Response.json({ ok: false, error: 'Subscription not found' }, { status: 404, headers: corsHeaders() })
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Shard Management Routes (Dynamic Sharding)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    // GET /subscriptions/shards - Get shard statistics
+    if (path === '/shards' && request.method === 'GET') {
+      const coordinator = getSubscriptionShardCoordinator(env as Env)
+
+      if (!coordinator) {
+        return Response.json({
+          dynamicShardingEnabled: false,
+          message: 'SUBSCRIPTION_SHARD_COORDINATOR binding is not configured. Using static sharding.',
+          fallbackShards: KNOWN_SUBSCRIPTION_SHARDS,
+        }, { headers: corsHeaders() })
+      }
+
+      try {
+        const stats = await coordinator.getStats()
+        return Response.json({
+          dynamicShardingEnabled: true,
+          ...stats,
+        }, { headers: corsHeaders() })
+      } catch (err) {
+        return Response.json({
+          error: 'Failed to get shard stats',
+          message: String(err),
+        }, { status: 500, headers: corsHeaders() })
+      }
+    }
+
+    // GET /subscriptions/shards/config - Get coordinator configuration
+    if (path === '/shards/config' && request.method === 'GET') {
+      const coordinator = getSubscriptionShardCoordinator(env as Env)
+
+      if (!coordinator) {
+        return Response.json({
+          dynamicShardingEnabled: false,
+          error: 'Shard coordinator not available',
+        }, { status: 200, headers: corsHeaders() })
+      }
+
+      try {
+        const config = await coordinator.getConfig()
+        return Response.json({
+          dynamicShardingEnabled: true,
+          config,
+        }, { headers: corsHeaders() })
+      } catch (err) {
+        return Response.json({
+          error: 'Failed to get shard config',
+          message: String(err),
+        }, { status: 500, headers: corsHeaders() })
+      }
+    }
+
+    // PUT /subscriptions/shards/config - Update coordinator configuration
+    if (path === '/shards/config' && request.method === 'PUT') {
+      const coordinator = getSubscriptionShardCoordinator(env as Env)
+
+      if (!coordinator) {
+        return Response.json({
+          error: 'Shard coordinator not available',
+        }, { status: 400, headers: corsHeaders() })
+      }
+
+      let updates: Record<string, unknown>
+      try {
+        updates = await request.json() as Record<string, unknown>
+      } catch {
+        return Response.json({
+          error: 'Invalid JSON body',
+        }, { status: 400, headers: corsHeaders() })
+      }
+
+      // Validate config updates
+      const validKeys = ['minShardsPerPrefix', 'maxShardsPerPrefix', 'scaleUpThreshold', 'scaleDownThreshold', 'cooldownMs', 'metricsWindowMs', 'healthCheckIntervalMs']
+      const invalidKeys = Object.keys(updates).filter(k => !validKeys.includes(k))
+      if (invalidKeys.length > 0) {
+        return Response.json({
+          error: 'Invalid configuration keys',
+          invalidKeys,
+          validKeys,
+        }, { status: 400, headers: corsHeaders() })
+      }
+
+      try {
+        const config = await coordinator.updateConfig(updates)
+        return Response.json({
+          ok: true,
+          config,
+        }, { headers: corsHeaders() })
+      } catch (err) {
+        return Response.json({
+          error: 'Failed to update shard config',
+          message: String(err),
+        }, { status: 500, headers: corsHeaders() })
+      }
+    }
+
+    // POST /subscriptions/shards/scale - Force scale a prefix
+    if (path === '/shards/scale' && request.method === 'POST') {
+      const coordinator = getSubscriptionShardCoordinator(env as Env)
+
+      if (!coordinator) {
+        return Response.json({
+          error: 'Shard coordinator not available',
+        }, { status: 400, headers: corsHeaders() })
+      }
+
+      let body: { prefix?: string; targetCount?: number }
+      try {
+        body = await request.json() as { prefix?: string; targetCount?: number }
+      } catch {
+        return Response.json({
+          error: 'Invalid JSON body',
+        }, { status: 400, headers: corsHeaders() })
+      }
+
+      const { prefix, targetCount } = body
+      if (!prefix || typeof prefix !== 'string') {
+        return Response.json({
+          error: 'Missing required field: prefix (string)',
+        }, { status: 400, headers: corsHeaders() })
+      }
+      if (typeof targetCount !== 'number' || targetCount < 1) {
+        return Response.json({
+          error: 'Invalid targetCount',
+          message: 'targetCount must be a positive integer',
+        }, { status: 400, headers: corsHeaders() })
+      }
+
+      try {
+        const result = await coordinator.forceScale(prefix, targetCount)
+        return Response.json({
+          ok: true,
+          ...result,
+        }, { headers: corsHeaders() })
+      } catch (err) {
+        return Response.json({
+          error: 'Failed to force scale',
+          message: String(err),
+        }, { status: 500, headers: corsHeaders() })
+      }
+    }
+
+    // POST /subscriptions/shards/health-check - Start health checks
+    if (path === '/shards/health-check' && request.method === 'POST') {
+      const coordinator = getSubscriptionShardCoordinator(env as Env)
+
+      if (!coordinator) {
+        return Response.json({
+          error: 'Shard coordinator not available',
+        }, { status: 400, headers: corsHeaders() })
+      }
+
+      try {
+        await coordinator.startHealthChecks()
+        return Response.json({
+          ok: true,
+          message: 'Health checks started',
+        }, { headers: corsHeaders() })
+      } catch (err) {
+        return Response.json({
+          error: 'Failed to start health checks',
+          message: String(err),
+        }, { status: 500, headers: corsHeaders() })
+      }
+    }
+
+    // GET /subscriptions/shards/:prefix - Get shards for a specific prefix
+    const shardPrefixMatch = path.match(/^\/shards\/([a-z]+)$/)
+    if (shardPrefixMatch && request.method === 'GET') {
+      const prefix = shardPrefixMatch[1]!
+      const namespace = tenant?.isAdmin ? undefined : tenant?.namespace
+
+      const shards = await getActiveSubscriptionShards(env as Env, prefix, namespace)
+      return Response.json({
+        prefix,
+        namespace: tenant?.namespace || null,
+        shards,
+        dynamicSharding: !!env.SUBSCRIPTION_SHARD_COORDINATOR,
+      }, { headers: corsHeaders() })
+    }
+
     // Not found
     return Response.json(
       { ok: false, error: 'Unknown subscription endpoint', path },
       { status: 404, headers: corsHeaders() }
     )
   } catch (e) {
-    console.error('Subscription route error:', e)
+    logError(logger.child({ component: 'SubscriptionRoutes' }), 'Subscription route error', e, { path })
     return Response.json(
       { ok: false, error: e instanceof Error ? e.message : 'Unknown error' },
       { status: 500, headers: corsHeaders() }

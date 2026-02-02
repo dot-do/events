@@ -825,3 +825,448 @@ describe('CDC Compaction', () => {
     })
   })
 })
+
+// ============================================================================
+// Tests: Parallel Compaction
+// ============================================================================
+
+import {
+  compactCollectionParallel,
+  mergeChunkStates,
+  type ParallelCompactionProgress,
+} from '../cdc-compaction.js'
+
+describe('Parallel CDC Compaction', () => {
+  describe('mergeChunkStates', () => {
+    it('merges multiple chunk states correctly', () => {
+      const baseState = new Map<string, Record<string, unknown>>([['user-1', { name: 'Original' }]])
+
+      const chunk1 = {
+        state: new Map<string, Record<string, unknown>>([
+          ['user-2', { name: 'From Chunk 1' }],
+          ['user-3', { name: 'Also Chunk 1' }],
+        ]),
+        processedFiles: [],
+        lastSequence: 1,
+        errors: [],
+      }
+
+      const chunk2 = {
+        state: new Map<string, Record<string, unknown>>([
+          ['user-1', { name: 'Updated in Chunk 2' }],
+          ['user-4', { name: 'From Chunk 2' }],
+        ]),
+        processedFiles: [],
+        lastSequence: 2,
+        errors: [],
+      }
+
+      const result = mergeChunkStates(baseState, [chunk1, chunk2])
+
+      expect(result.size).toBe(4)
+      expect(result.get('user-1')).toEqual({ name: 'Updated in Chunk 2' }) // Updated
+      expect(result.get('user-2')).toEqual({ name: 'From Chunk 1' })
+      expect(result.get('user-3')).toEqual({ name: 'Also Chunk 1' })
+      expect(result.get('user-4')).toEqual({ name: 'From Chunk 2' })
+    })
+
+    it('handles deletions marked with __deleted__', () => {
+      const baseState = new Map<string, Record<string, unknown>>([
+        ['user-1', { name: 'Alice' }],
+        ['user-2', { name: 'Bob' }],
+      ])
+
+      const chunk = {
+        state: new Map<string, Record<string, unknown>>([['user-1', { __deleted__: true }]]),
+        processedFiles: [],
+        lastSequence: 1,
+        errors: [],
+      }
+
+      const result = mergeChunkStates(baseState, [chunk])
+
+      expect(result.size).toBe(1)
+      expect(result.has('user-1')).toBe(false)
+      expect(result.get('user-2')).toEqual({ name: 'Bob' })
+    })
+
+    it('handles empty chunk results', () => {
+      const baseState = new Map<string, Record<string, unknown>>([['user-1', { name: 'Alice' }]])
+
+      const result = mergeChunkStates(baseState, [])
+
+      expect(result.size).toBe(1)
+      expect(result.get('user-1')).toEqual({ name: 'Alice' })
+    })
+
+    it('preserves insertion order of chunks', () => {
+      const baseState = new Map<string, Record<string, unknown>>()
+
+      const chunks = [
+        {
+          state: new Map<string, Record<string, unknown>>([['user-1', { v: 1 }]]),
+          processedFiles: [],
+          lastSequence: 1,
+          errors: [],
+        },
+        {
+          state: new Map<string, Record<string, unknown>>([['user-1', { v: 2 }]]),
+          processedFiles: [],
+          lastSequence: 2,
+          errors: [],
+        },
+        {
+          state: new Map<string, Record<string, unknown>>([['user-1', { v: 3 }]]),
+          processedFiles: [],
+          lastSequence: 3,
+          errors: [],
+        },
+      ]
+
+      const result = mergeChunkStates(baseState, chunks)
+
+      // Last chunk should win
+      expect(result.get('user-1')).toEqual({ v: 3 })
+    })
+  })
+
+  describe('compactCollectionParallel', () => {
+    it('processes delta files in parallel', async () => {
+      const bucket = createMockR2Bucket()
+
+      // Create multiple delta files to trigger parallel processing (need >= 5)
+      for (let i = 1; i <= 10; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([
+            createDelta('insert', `user-${i}`, { name: `User ${i}`, batch: i }, i),
+          ])
+        )
+      }
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 4,
+        chunkSize: 3,
+      })
+
+      expect(result.success).toBe(true)
+      expect(result.recordCount).toBe(10)
+      expect(result.deltasProcessed).toBe(10)
+    })
+
+    it('falls back to sequential for small delta counts', async () => {
+      const bucket = createMockR2Bucket()
+
+      // Only 3 delta files (below MIN_DELTAS_FOR_PARALLEL threshold of 5)
+      for (let i = 1; i <= 3; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+        )
+      }
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users')
+
+      expect(result.success).toBe(true)
+      expect(result.recordCount).toBe(3)
+    })
+
+    it('maintains correct ordering when processing in parallel', async () => {
+      const bucket = createMockR2Bucket()
+
+      // Create files where later deltas update earlier records
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { v: 1 }, 1)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 2 }, 2)]))
+      await bucket.put('ns/users/deltas/000003.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 3 }, 3)]))
+      await bucket.put('ns/users/deltas/000004.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 4 }, 4)]))
+      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 5 }, 5)]))
+      await bucket.put('ns/users/deltas/000006.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 6 }, 6)]))
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 3,
+        chunkSize: 2,
+      })
+
+      expect(result.success).toBe(true)
+      expect(result.recordCount).toBe(1)
+
+      const dataFile = await bucket.get('ns/users/data.parquet')
+      const buffer = await dataFile!.arrayBuffer()
+      const records = await readParquetRecords(buffer)
+
+      // Should have the final value from the last delta
+      expect(records[0].v).toBe(6)
+    })
+
+    it('handles deletions correctly in parallel processing', async () => {
+      const bucket = createMockR2Bucket()
+
+      // Create records and then delete some
+      await bucket.put(
+        'ns/users/deltas/000001.parquet',
+        deltasToParquet([
+          createDelta('insert', 'user-1', { name: 'Alice' }, 1),
+          createDelta('insert', 'user-2', { name: 'Bob' }, 2),
+          createDelta('insert', 'user-3', { name: 'Charlie' }, 3),
+        ])
+      )
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-4', { name: 'Dave' }, 4)]))
+      await bucket.put('ns/users/deltas/000003.parquet', deltasToParquet([createDelta('delete', 'user-2', undefined, 5)]))
+      await bucket.put('ns/users/deltas/000004.parquet', deltasToParquet([createDelta('insert', 'user-5', { name: 'Eve' }, 6)]))
+      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('delete', 'user-4', undefined, 7)]))
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 2,
+        chunkSize: 2,
+      })
+
+      expect(result.success).toBe(true)
+      expect(result.recordCount).toBe(3) // user-1, user-3, user-5 remain
+
+      const dataFile = await bucket.get('ns/users/data.parquet')
+      const buffer = await dataFile!.arrayBuffer()
+      const records = await readParquetRecords(buffer)
+
+      const ids = records.map((r) => r.id)
+      expect(ids).toContain('user-1')
+      expect(ids).toContain('user-3')
+      expect(ids).toContain('user-5')
+      expect(ids).not.toContain('user-2')
+      expect(ids).not.toContain('user-4')
+    })
+
+    it('reports progress during processing', async () => {
+      const bucket = createMockR2Bucket()
+
+      // Create enough delta files to trigger parallel processing
+      for (let i = 1; i <= 8; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+        )
+      }
+
+      const progressUpdates: ParallelCompactionProgress[] = []
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 2,
+        chunkSize: 2,
+        onProgress: (progress) => {
+          progressUpdates.push({ ...progress })
+        },
+      })
+
+      expect(result.success).toBe(true)
+      expect(progressUpdates.length).toBeGreaterThan(0)
+
+      // Check that progress increases monotonically
+      let lastPercent = 0
+      for (const update of progressUpdates) {
+        expect(update.percentComplete).toBeGreaterThanOrEqual(lastPercent)
+        lastPercent = update.percentComplete
+      }
+
+      // Final update should be 100%
+      const finalProgress = progressUpdates[progressUpdates.length - 1]
+      expect(finalProgress.percentComplete).toBe(100)
+      expect(finalProgress.processedDeltas).toBe(8)
+    })
+
+    it('clamps parallelism to valid range', async () => {
+      const bucket = createMockR2Bucket()
+
+      for (let i = 1; i <= 6; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+        )
+      }
+
+      // Test with parallelism > MAX (16)
+      const result1 = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 100, // Should be clamped to 16
+      })
+      expect(result1.success).toBe(true)
+
+      // Test with parallelism < 1
+      const result2 = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 0, // Should be clamped to 1
+      })
+      expect(result2.success).toBe(true)
+    })
+
+    it('handles errors gracefully in parallel chunks', async () => {
+      const bucket = createMockR2Bucket()
+
+      // Create some valid delta files
+      for (let i = 1; i <= 4; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+        )
+      }
+
+      // Add an invalid file in the middle
+      await bucket.put('ns/users/deltas/000005.parquet', new TextEncoder().encode('not valid parquet').buffer)
+
+      // Add more valid files
+      for (let i = 6; i <= 8; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+        )
+      }
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 2,
+        chunkSize: 3,
+      })
+
+      // Should succeed with partial results
+      expect(result.success).toBe(true)
+      expect(result.recordCount).toBe(7) // 8 files - 1 invalid
+      expect(result.errors).toBeDefined()
+      expect(result.errors!.some((e) => e.includes('000005'))).toBe(true)
+    })
+
+    it('merges with existing data.parquet', async () => {
+      const bucket = createMockR2Bucket()
+
+      // Set up existing data
+      const existingState = new Map<string, Record<string, unknown>>([
+        ['existing-1', { name: 'Existing 1' }],
+        ['existing-2', { name: 'Existing 2' }],
+      ])
+      await bucket.put('ns/users/data.parquet', writeDataParquet(existingState))
+
+      // Add new delta files
+      for (let i = 1; i <= 6; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+        )
+      }
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 2,
+        chunkSize: 2,
+      })
+
+      expect(result.success).toBe(true)
+      expect(result.recordCount).toBe(8) // 2 existing + 6 new
+
+      const dataFile = await bucket.get('ns/users/data.parquet')
+      const buffer = await dataFile!.arrayBuffer()
+      const records = await readParquetRecords(buffer)
+
+      const ids = records.map((r) => r.id)
+      expect(ids).toContain('existing-1')
+      expect(ids).toContain('existing-2')
+    })
+
+    it('deletes deltas after parallel compaction when requested', async () => {
+      const bucket = createMockR2Bucket()
+
+      for (let i = 1; i <= 6; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+        )
+      }
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        deleteDeltas: true,
+        parallelism: 2,
+        chunkSize: 2,
+      })
+
+      expect(result.success).toBe(true)
+
+      // All delta files should be deleted
+      for (let i = 1; i <= 6; i++) {
+        const delta = await bucket.get(`ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`)
+        expect(delta).toBeNull()
+      }
+    })
+
+    it('archives deltas after parallel compaction when requested', async () => {
+      const bucket = createMockR2Bucket()
+
+      for (let i = 1; i <= 6; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+        )
+      }
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        archiveDeltas: true,
+        parallelism: 2,
+        chunkSize: 2,
+      })
+
+      expect(result.success).toBe(true)
+
+      // Delta files should be moved to processed folder
+      for (let i = 1; i <= 6; i++) {
+        const original = await bucket.get(`ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`)
+        expect(original).toBeNull()
+
+        const archived = await bucket.get(`ns/users/processed/${i.toString().padStart(6, '0')}.parquet`)
+        expect(archived).not.toBeNull()
+      }
+    })
+
+    it('updates manifest correctly', async () => {
+      const bucket = createMockR2Bucket()
+
+      for (let i = 1; i <= 6; i++) {
+        await bucket.put(
+          `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
+          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+        )
+      }
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 2,
+        chunkSize: 2,
+      })
+
+      expect(result.success).toBe(true)
+
+      const manifestFile = await bucket.get('ns/users/manifest.json')
+      expect(manifestFile).not.toBeNull()
+
+      const manifest = await manifestFile!.json()
+      expect(manifest.recordCount).toBe(6)
+      expect(manifest.lastDeltaSequence).toBe(6)
+      expect(manifest.compactionCount).toBe(1)
+      expect(manifest.lastCompactionAt).toBeDefined()
+    })
+
+    it('handles large datasets efficiently', async () => {
+      const bucket = createMockR2Bucket()
+
+      // Create 50 delta files with 20 records each = 1000 total records
+      for (let i = 1; i <= 50; i++) {
+        const deltas: CompactionDeltaRecord[] = []
+        for (let j = 0; j < 20; j++) {
+          const userId = (i - 1) * 20 + j
+          deltas.push(
+            createDelta('insert', `user-${userId.toString().padStart(5, '0')}`, { name: `User ${userId}`, batch: i }, userId)
+          )
+        }
+        await bucket.put(`ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`, deltasToParquet(deltas))
+      }
+
+      const result = await compactCollectionParallel(bucket, 'ns', 'users', {
+        parallelism: 8,
+        chunkSize: 10,
+      })
+
+      expect(result.success).toBe(true)
+      expect(result.recordCount).toBe(1000)
+      expect(result.deltasProcessed).toBe(50)
+    })
+  })
+})

@@ -8,6 +8,7 @@ import type { SchemaRegistryDO } from '../../../core/src/schema-registry'
 import { SchemaValidationError as SchemaValidationErrorClass, toErrorResponse } from '../../../core/src/errors'
 import { corsHeaders } from '../../utils'
 import { recordIngestMetric } from '../../metrics'
+import { logger, logError } from '../../logger'
 import type { Env } from '../../env'
 import type {
   IngestContext,
@@ -56,8 +57,13 @@ export async function validateEventsAgainstSchemas(
 
     return null
   } catch (err) {
-    // Log but don't fail on schema registry errors
-    console.error('[ingest] Schema validation error:', err)
+    // Log but don't fail on schema registry errors - this allows events to pass through
+    // even if the schema registry is unavailable
+    logError(logger, 'Schema validation error - allowing events through', err, {
+      component: 'schema',
+      namespace,
+      eventCount: events.length,
+    })
     return null
   }
 }

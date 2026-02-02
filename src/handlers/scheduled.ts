@@ -19,18 +19,18 @@ import { compactCollection } from '../../core/src/cdc-compaction'
 import { compactEventStream } from '../../core/src/event-compaction'
 import { withSchedulerLock } from '../scheduler-lock'
 import { KNOWN_SUBSCRIPTION_SHARDS } from '../subscription-routes'
-import { createLogger, logError } from '../logger'
+import { createLogger, logError, generateCorrelationId, type Logger } from '../logger'
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
 const DEAD_LETTER_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 const SUBSCRIPTION_DEAD_LETTER_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 
-const log = createLogger({ component: 'scheduled' })
+// Note: log is created per-invocation in handleScheduled to include correlation ID
 
 /**
  * Task 1: Dedup marker cleanup (delete markers older than 24 hours)
  */
-async function cleanupDedupMarkers(env: Env): Promise<void> {
+async function cleanupDedupMarkers(env: Env, log: Logger): Promise<void> {
   try {
     const now = Date.now()
     let dedupDeleted = 0
@@ -44,7 +44,7 @@ async function cleanupDedupMarkers(env: Env): Promise<void> {
       const list = await env.EVENTS_BUCKET.list({
         prefix: 'dedup/',
         limit: 1000,
-        cursor,
+        ...(cursor !== undefined ? { cursor } : {}),
       })
 
       for (const obj of list.objects) {
@@ -69,7 +69,7 @@ async function cleanupDedupMarkers(env: Env): Promise<void> {
 /**
  * Task 2: CDC Compaction
  */
-async function runCDCCompaction(env: Env): Promise<void> {
+async function runCDCCompaction(env: Env, log: Logger): Promise<void> {
   try {
     log.info('Starting CDC compaction')
 
@@ -83,7 +83,7 @@ async function runCDCCompaction(env: Env): Promise<void> {
       const list = await env.EVENTS_BUCKET.list({
         prefix: 'cdc/',
         delimiter: '/',
-        cursor: cdcCursor,
+        ...(cdcCursor !== undefined ? { cursor: cdcCursor } : {}),
       })
 
       // Extract namespace from common prefixes (format: cdc/{namespace}/)
@@ -192,7 +192,7 @@ async function runCDCCompaction(env: Env): Promise<void> {
  * Compacts hourly Parquet files from EventWriterDO into daily files.
  * Only runs at 1:30 UTC to avoid compacting files still being written.
  */
-async function runEventStreamCompaction(env: Env): Promise<void> {
+async function runEventStreamCompaction(env: Env, log: Logger): Promise<void> {
   const currentHour = new Date().getUTCHours()
   if (currentHour !== 1) {
     return
@@ -227,7 +227,7 @@ async function runEventStreamCompaction(env: Env): Promise<void> {
  * Prunes R2 dead-letter messages older than 30 days.
  * Dead letters are stored in: dead-letter/queue/{date}/{id}.json
  */
-async function cleanupDeadLetters(env: Env): Promise<void> {
+async function cleanupDeadLetters(env: Env, log: Logger): Promise<void> {
   const currentHour = new Date().getUTCHours()
   if (currentHour !== 2) {
     return
@@ -246,7 +246,7 @@ async function cleanupDeadLetters(env: Env): Promise<void> {
       const list = await env.EVENTS_BUCKET.list({
         prefix: 'dead-letter/',
         limit: 1000,
-        cursor,
+        ...(cursor !== undefined ? { cursor } : {}),
       })
 
       for (const obj of list.objects) {
@@ -273,7 +273,7 @@ async function cleanupDeadLetters(env: Env): Promise<void> {
  * Triggers cleanup of old dead letters and delivery logs in all SubscriptionDO shards.
  * This helps prevent unbounded growth of the SQLite tables in each shard.
  */
-async function cleanupSubscriptionDeadLetters(env: Env): Promise<void> {
+async function cleanupSubscriptionDeadLetters(env: Env, log: Logger): Promise<void> {
   const currentHour = new Date().getUTCHours()
   if (currentHour !== 3) {
     return
@@ -339,6 +339,10 @@ async function cleanupSubscriptionDeadLetters(env: Env): Promise<void> {
  */
 export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
   const startTime = Date.now()
+  // Generate correlation ID for this scheduled run
+  const correlationId = generateCorrelationId()
+  const log = createLogger({ component: 'scheduled', correlationId })
+
   log.info('Scheduled task triggered', { timestamp: new Date().toISOString(), cron: event.cron })
 
   ctx.waitUntil((async () => {
@@ -347,19 +351,19 @@ export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: Exec
       env.EVENTS_BUCKET,
       async () => {
         // Task 1: Dedup marker cleanup (hourly)
-        await cleanupDedupMarkers(env)
+        await cleanupDedupMarkers(env, log)
 
         // Task 2: CDC Compaction (hourly)
-        await runCDCCompaction(env)
+        await runCDCCompaction(env, log)
 
         // Task 3: Event Stream Compaction (only at 1:30 UTC)
-        await runEventStreamCompaction(env)
+        await runEventStreamCompaction(env, log)
 
         // Task 4: Dead Letter Cleanup (only at 2:30 UTC)
-        await cleanupDeadLetters(env)
+        await cleanupDeadLetters(env, log)
 
         // Task 5: Subscription Dead Letter Cleanup (only at 3:30 UTC)
-        await cleanupSubscriptionDeadLetters(env)
+        await cleanupSubscriptionDeadLetters(env, log)
 
         const durationMs = Date.now() - startTime
         log.info('All scheduled tasks completed', { durationMs })

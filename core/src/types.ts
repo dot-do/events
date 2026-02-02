@@ -11,10 +11,10 @@ export interface BaseEvent {
   /** DO identity */
   do: {
     id: string
-    name?: string
-    class?: string
-    colo?: string
-    worker?: string
+    name?: string | undefined
+    class?: string | undefined
+    colo?: string | undefined
+    worker?: string | undefined
   }
 }
 
@@ -22,10 +22,10 @@ export interface BaseEvent {
 export interface RpcCallEvent extends BaseEvent {
   type: 'rpc.call'
   method: string
-  namespace?: string
+  namespace?: string | undefined
   durationMs: number
   success: boolean
-  error?: string
+  error?: string | undefined
 }
 
 /** Collection change event (CDC) */
@@ -34,43 +34,43 @@ export interface CollectionChangeEvent extends BaseEvent {
   collection: string
   docId: string
   /** For inserts/updates: the new document */
-  doc?: Record<string, unknown>
+  doc?: Record<string, unknown> | undefined
   /** For updates: the previous document (if tracking enabled) */
-  prev?: Record<string, unknown>
+  prev?: Record<string, unknown> | undefined
   /** SQLite bookmark for PITR (point-in-time recovery) */
-  bookmark?: string
+  bookmark?: string | undefined
 }
 
 /** DO lifecycle event */
 export interface LifecycleEvent extends BaseEvent {
   type: 'do.create' | 'do.alarm' | 'do.hibernate' | 'do.evict'
-  reason?: string
+  reason?: string | undefined
 }
 
 /** WebSocket event */
 export interface WebSocketEvent extends BaseEvent {
   type: 'ws.connect' | 'ws.message' | 'ws.close' | 'ws.error'
-  connectionCount?: number
-  code?: number
-  reason?: string
+  connectionCount?: number | undefined
+  code?: number | undefined
+  reason?: string | undefined
 }
 
 /** Client-side analytics event (browser) */
 export interface ClientEvent extends BaseEvent {
   type: 'page' | 'track' | 'identify'
-  event?: string
-  properties?: Record<string, unknown>
-  traits?: Record<string, unknown>
-  userId?: string
-  anonymousId?: string
-  sessionId?: string
+  event?: string | undefined
+  properties?: Record<string, unknown> | undefined
+  traits?: Record<string, unknown> | undefined
+  userId?: string | undefined
+  anonymousId?: string | undefined
+  sessionId?: string | undefined
 }
 
 /** Custom event with user-defined type */
 export interface CustomEvent extends BaseEvent {
   type: `custom.${string}`
   /** Custom event data */
-  data?: Record<string, unknown>
+  data?: Record<string, unknown> | undefined
 }
 
 /** Union of all event types (discriminated by 'type' field) */
@@ -144,25 +144,25 @@ export interface EventBatch {
 /** Event emitter configuration */
 export interface EventEmitterOptions {
   /** Endpoint to send events (default: events.do) */
-  endpoint?: string
+  endpoint?: string | undefined
   /** Batch size before auto-flush (default: 100) */
-  batchSize?: number
+  batchSize?: number | undefined
   /** Max time to hold events before flush in ms (default: 1000) */
-  flushIntervalMs?: number
+  flushIntervalMs?: number | undefined
   /** Enable CDC for collections (default: false) */
-  cdc?: boolean
+  cdc?: boolean | undefined
   /** R2 bucket for lakehouse streaming (optional) */
-  r2Bucket?: R2Bucket
+  r2Bucket?: R2Bucket | undefined
   /** Include previous doc in CDC updates (more storage, enables diffs) */
-  trackPrevious?: boolean
+  trackPrevious?: boolean | undefined
   /** API key for authentication (optional) */
-  apiKey?: string
+  apiKey?: string | undefined
   /** Max retry queue size (default: 10000). When exceeded, oldest events are dropped. */
-  maxRetryQueueSize?: number
+  maxRetryQueueSize?: number | undefined
   /** Max consecutive failures before circuit breaker opens (default: 10). Set to 0 to disable. */
-  maxConsecutiveFailures?: number
+  maxConsecutiveFailures?: number | undefined
   /** Circuit breaker reset timeout in ms (default: 300000 = 5 minutes) */
-  circuitBreakerResetMs?: number
+  circuitBreakerResetMs?: number | undefined
 }
 
 /** Error thrown when the retry buffer is full and backpressure is needed */

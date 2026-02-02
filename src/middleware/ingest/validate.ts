@@ -14,6 +14,7 @@ import {
   InvalidBatchError,
   InvalidEventError,
   EventTooLargeError,
+  PayloadTooLargeError,
   toErrorResponse,
 } from '../../../core/src/errors'
 import { corsHeaders } from '../../utils'
@@ -27,6 +28,8 @@ import {
   MAX_EVENT_SIZE,
   MAX_BATCH_SIZE,
   MAX_TYPE_LENGTH,
+  EVENT_TYPE_PATTERN,
+  DEFAULT_MAX_BODY_SIZE,
 } from './types'
 
 // ============================================================================
@@ -34,12 +37,25 @@ import {
 // ============================================================================
 
 /**
+ * Validate event type follows strict character allowlist.
+ * Only allows: alphanumeric, dots, underscores, hyphens.
+ * Max length: 128 characters.
+ *
+ * This prevents injection attacks and parsing issues.
+ */
+export function isValidEventType(type: unknown): type is string {
+  if (typeof type !== 'string') return false
+  if (type.length === 0 || type.length > MAX_TYPE_LENGTH) return false
+  return EVENT_TYPE_PATTERN.test(type)
+}
+
+/**
  * Validate a single event has required fields
  */
 export function validateEvent(event: unknown): event is { type: string; ts: string } {
   if (typeof event !== 'object' || event === null) return false
   const e = event as Record<string, unknown>
-  if (typeof e.type !== 'string' || e.type.length === 0 || e.type.length > MAX_TYPE_LENGTH) return false
+  if (!isValidEventType(e.type)) return false
   if (typeof e.ts !== 'string' || isNaN(Date.parse(e.ts))) return false
   return true
 }
@@ -64,21 +80,130 @@ export function validateEventSize(event: unknown): boolean {
 }
 
 // ============================================================================
+// Body Size Utilities
+// ============================================================================
+
+/**
+ * Get the max body size from environment or use default.
+ * @param env - Environment bindings
+ * @param defaultSize - Default size if not configured
+ * @returns Max body size in bytes
+ */
+export function getMaxBodySize(env: { MAX_INGEST_BODY_SIZE?: string }, defaultSize: number = DEFAULT_MAX_BODY_SIZE): number {
+  if (env.MAX_INGEST_BODY_SIZE) {
+    const parsed = parseInt(env.MAX_INGEST_BODY_SIZE, 10)
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed
+    }
+  }
+  return defaultSize
+}
+
+/**
+ * Check Content-Length header against max size limit.
+ * Returns the content length if valid, or throws PayloadTooLargeError.
+ *
+ * @param request - The incoming request
+ * @param maxSize - Maximum allowed body size in bytes
+ * @returns Content length if provided and valid
+ * @throws PayloadTooLargeError if content length exceeds limit
+ */
+export function checkContentLength(request: Request, maxSize: number): number | undefined {
+  const contentLength = request.headers.get('content-length')
+  if (contentLength) {
+    const length = parseInt(contentLength, 10)
+    if (!isNaN(length) && length > maxSize) {
+      throw new PayloadTooLargeError(
+        `Request body too large: ${length} bytes exceeds ${maxSize} byte limit`,
+        { maxSize, contentLength: length }
+      )
+    }
+    return length
+  }
+  return undefined
+}
+
+/**
+ * Read request body with streaming size limit.
+ * Reads chunks until either the body is complete or the size limit is exceeded.
+ *
+ * @param request - The incoming request
+ * @param maxSize - Maximum allowed body size in bytes
+ * @returns The body as a string
+ * @throws PayloadTooLargeError if body exceeds limit during streaming
+ */
+export async function readBodyWithLimit(request: Request, maxSize: number): Promise<string> {
+  // First check Content-Length header if available
+  checkContentLength(request, maxSize)
+
+  const body = request.body
+  if (!body) {
+    return ''
+  }
+
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  const chunks: string[] = []
+  let totalSize = 0
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      totalSize += value.length
+      if (totalSize > maxSize) {
+        // Cancel the stream to free resources
+        await reader.cancel()
+        throw new PayloadTooLargeError(
+          `Request body too large: exceeds ${maxSize} byte limit`,
+          { maxSize, contentLength: totalSize }
+        )
+      }
+
+      chunks.push(decoder.decode(value, { stream: true }))
+    }
+
+    // Flush any remaining bytes in the decoder
+    chunks.push(decoder.decode())
+    return chunks.join('')
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+// ============================================================================
 // Validation Middleware
 // ============================================================================
 
 /**
- * Parse JSON body middleware
+ * Parse JSON body middleware with size limit checking.
+ * Checks Content-Length header first, then uses streaming read with limit.
  */
 export const parseJsonMiddleware: IngestMiddleware = async (
   context: IngestContext
 ): Promise<MiddlewareResult> => {
   const timer = new MetricTimer()
+  const maxSize = getMaxBodySize(context.env)
 
   try {
-    context.rawBody = await context.request.json()
+    // Read body with size limit
+    const bodyText = await readBodyWithLimit(context.request, maxSize)
+
+    // Parse JSON
+    context.rawBody = JSON.parse(bodyText)
     return { continue: true }
   } catch (err) {
+    // Handle payload too large error
+    if (err instanceof PayloadTooLargeError) {
+      recordIngestMetric(context.env.ANALYTICS, 'validation_error', 0, timer.elapsed(), 'payload_too_large')
+      return {
+        continue: false,
+        response: toErrorResponse(err, { headers: corsHeaders() }),
+      }
+    }
+
+    // Handle JSON parse error
     recordIngestMetric(context.env.ANALYTICS, 'validation_error', 0, timer.elapsed(), 'invalid_json')
     return {
       continue: false,
@@ -148,7 +273,7 @@ export const validateEventsMiddleware: IngestMiddleware = async (
       continue: false,
       response: toErrorResponse(
         new InvalidEventError(
-          `Invalid events at indices: ${invalidEvents.slice(0, 10).join(', ')}${invalidEvents.length > 10 ? '...' : ''}. Each event must have type (string, 1-256 chars) and ts (valid ISO timestamp)`,
+          `Invalid events at indices: ${invalidEvents.slice(0, 10).join(', ')}${invalidEvents.length > 10 ? '...' : ''}. Each event must have type (string, 1-${MAX_TYPE_LENGTH} chars, alphanumeric/dots/underscores/hyphens only) and ts (valid ISO timestamp)`,
           { indices: invalidEvents.slice(0, 10) }
         ),
         { headers: corsHeaders() }

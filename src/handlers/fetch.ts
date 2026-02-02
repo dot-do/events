@@ -40,12 +40,22 @@ import {
 } from '../routes/schema'
 import { handleShardRoutes } from '../routes/shards'
 import { getAllowedOrigin } from '../utils'
-import { createRequestLogger, getRequestId } from '../logger'
+import {
+  createRequestLogger,
+  extractRequestContext,
+  withCorrelationId,
+  type RequestContext,
+} from '../logger'
 
 /**
  * Handle CORS preflight requests
  */
-function handleCORS(request?: Request, env?: { ALLOWED_ORIGINS?: string }, authenticated = false): Response {
+function handleCORS(
+  request?: Request,
+  env?: { ALLOWED_ORIGINS?: string },
+  authenticated = false,
+  correlationId?: string
+): Response {
   const requestOrigin = request?.headers.get('Origin') ?? null
   const origin = authenticated
     ? (getAllowedOrigin(requestOrigin, env) ?? 'null')
@@ -55,10 +65,25 @@ function handleCORS(request?: Request, env?: { ALLOWED_ORIGINS?: string }, authe
     headers: {
       'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Correlation-ID, X-Request-ID',
+      'Access-Control-Expose-Headers': 'X-Correlation-ID',
       'Access-Control-Max-Age': '86400',
       ...(authenticated && origin !== '*' ? { 'Vary': 'Origin' } : {}),
+      ...(correlationId ? { 'x-correlation-id': correlationId } : {}),
     },
+  })
+}
+
+/**
+ * Adds correlation ID to a response
+ */
+function addCorrelationId(response: Response, correlationId: string): Response {
+  const headers = new Headers(response.headers)
+  headers.set('x-correlation-id', correlationId)
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   })
 }
 
@@ -68,12 +93,15 @@ function handleCORS(request?: Request, env?: { ALLOWED_ORIGINS?: string }, authe
 export async function handleFetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const startTime = performance.now()
   const url = new URL(request.url)
-  const requestId = getRequestId(request)
-  const log = createRequestLogger({ requestId })
+
+  // Extract request context including correlation ID
+  const reqCtx = extractRequestContext(request)
+  const { correlationId, requestId, method, path } = reqCtx
+  const log = createRequestLogger({ correlationId, requestId, method, path })
 
   // CORS preflight - use restricted origins for authenticated routes
   if (request.method === 'OPTIONS') {
-    return handleCORS()
+    return handleCORS(request, env, false, correlationId)
   }
 
   // Detect domain for service name
@@ -81,23 +109,23 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
 
   // Health check
   const healthResponse = handleHealth(request, env, url, isWebhooksDomain, startTime)
-  if (healthResponse) return healthResponse
+  if (healthResponse) return addCorrelationId(healthResponse, correlationId)
 
   // Auth routes (/login, /callback, /logout, /me)
   const authResponse = await handleAuth(request, env, url)
-  if (authResponse) return authResponse
+  if (authResponse) return addCorrelationId(authResponse, correlationId)
 
   // Ingest endpoint
   if ((url.pathname === '/ingest' || url.pathname === '/e') && request.method === 'POST') {
     const response = await handleIngest(request, env, ctx)
     const cpuTime = performance.now() - startTime
-    log.info('POST /ingest', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/ingest' })
-    return response
+    log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), status: response.status })
+    return addCorrelationId(response, correlationId)
   }
 
   // Webhook endpoints
   const webhookResponse = await handleWebhooks(request, env, ctx, url, isWebhooksDomain, startTime)
-  if (webhookResponse) return webhookResponse
+  if (webhookResponse) return addCorrelationId(webhookResponse, correlationId)
 
   // ================================================================
   // Protected routes - require admin auth
@@ -113,17 +141,26 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
       const accept = request.headers.get('Accept') || ''
       if (accept.includes('text/html')) {
         const loginUrl = `${url.origin}/login?redirect_uri=${encodeURIComponent(url.pathname + url.search)}`
+        log.info('Redirecting to login', { status: 302 })
         return Response.redirect(loginUrl, 302)
       }
-      return Response.json({ error: result.error || 'Authentication required' }, { status: result.status || 401 })
+      log.warn('Authentication failed', { status: result.status || 401 })
+      return addCorrelationId(
+        Response.json({ error: result.error || 'Authentication required' }, { status: result.status || 401 }),
+        correlationId
+      )
     }
 
     if (!result.user?.roles?.includes('admin')) {
-      return Response.json({
-        error: 'Admin access required',
-        authenticated: true,
-        message: 'You are logged in but do not have admin privileges'
-      }, { status: 403 })
+      log.warn('Admin access denied', { user: result.user?.email, status: 403 })
+      return addCorrelationId(
+        Response.json({
+          error: 'Admin access required',
+          authenticated: true,
+          message: 'You are logged in but do not have admin privileges'
+        }, { status: 403 }),
+        correlationId
+      )
     }
 
     // Attach user to request for downstream handlers
@@ -144,48 +181,48 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname === '/query' && request.method === 'POST') {
       const response = await handleQuery(request, env, adminTenant)
       const cpuTime = performance.now() - startTime
-      log.info('POST /query', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/query', user })
-      return response
+      log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
+      return addCorrelationId(response, correlationId)
     }
 
     // Recent events
     if (url.pathname === '/recent' && request.method === 'GET') {
       const response = await handleRecent(request, env)
       const cpuTime = performance.now() - startTime
-      log.info('GET /recent', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/recent', user })
-      return response
+      log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
+      return addCorrelationId(response, correlationId)
     }
 
     // Events query (parquet)
     if (url.pathname === '/events' && request.method === 'GET') {
       const response = await handleEventsQuery(request, env)
       const cpuTime = performance.now() - startTime
-      log.info('GET /events', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/events', user })
-      return response
+      log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
+      return addCorrelationId(response, correlationId)
     }
 
     // Pipeline bucket check
     if (url.pathname === '/pipeline' && request.method === 'GET') {
       const response = await handlePipelineCheck(request, env)
       const cpuTime = performance.now() - startTime
-      log.info('GET /pipeline', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/pipeline', user })
-      return response
+      log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
+      return addCorrelationId(response, correlationId)
     }
 
     // Catalog API
     if (url.pathname.startsWith('/catalog')) {
       const response = await handleCatalog(request, env, url)
       const cpuTime = performance.now() - startTime
-      log.info(`${request.method} ${url.pathname}`, { cpuMs: parseFloat(cpuTime.toFixed(2)), path: url.pathname, user })
-      return response
+      log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
+      return addCorrelationId(response, correlationId)
     }
 
     // Subscription API (with admin tenant context for namespace isolation)
     if (url.pathname.startsWith('/subscriptions')) {
       const response = await handleSubscriptionRoutes(request, env, url, adminTenant)
       const cpuTime = performance.now() - startTime
-      log.info(`${request.method} ${url.pathname}`, { cpuMs: parseFloat(cpuTime.toFixed(2)), path: url.pathname, user })
-      if (response) return response
+      log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response?.status })
+      if (response) return addCorrelationId(response, correlationId)
     }
 
     // Schema Registry API
@@ -238,8 +275,8 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
 
       if (response) {
         const cpuTime = performance.now() - startTime
-        log.info(`${request.method} ${url.pathname}`, { cpuMs: parseFloat(cpuTime.toFixed(2)), path: url.pathname, user })
-        return response
+        log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
+        return addCorrelationId(response, correlationId)
       }
     }
 
@@ -247,8 +284,8 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname === '/benchmark' && request.method === 'GET') {
       const response = await handleBenchmark(request, env)
       const cpuTime = performance.now() - startTime
-      log.info('GET /benchmark', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/benchmark', user })
-      return response
+      log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
+      return addCorrelationId(response, correlationId)
     }
 
     // Shard management API
@@ -256,8 +293,8 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
       const response = await handleShardRoutes(request, env, url)
       if (response) {
         const cpuTime = performance.now() - startTime
-        log.info(`${request.method} ${url.pathname}`, { cpuMs: parseFloat(cpuTime.toFixed(2)), path: url.pathname, user })
-        return response
+        log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
+        return addCorrelationId(response, correlationId)
       }
     }
 
@@ -265,10 +302,11 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     const dashboardResponse = await handleDashboard(request, env, url)
     if (dashboardResponse) {
       const cpuTime = performance.now() - startTime
-      log.info('GET /dashboard', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/dashboard', user })
-      return dashboardResponse
+      log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: dashboardResponse.status })
+      return addCorrelationId(dashboardResponse, correlationId)
     }
   }
 
-  return new Response('Not found', { status: 404 })
+  log.info('Not found', { status: 404 })
+  return addCorrelationId(new Response('Not found', { status: 404 }), correlationId)
 }

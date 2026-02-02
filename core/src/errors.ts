@@ -41,6 +41,7 @@ export enum ErrorCode {
   INVALID_BATCH = 'INVALID_BATCH',
   INVALID_EVENT = 'INVALID_EVENT',
   EVENT_TOO_LARGE = 'EVENT_TOO_LARGE',
+  PAYLOAD_TOO_LARGE = 'PAYLOAD_TOO_LARGE',
   SCHEMA_VALIDATION_ERROR = 'SCHEMA_VALIDATION_ERROR',
   INVALID_PATTERN = 'INVALID_PATTERN',
   INVALID_PATH = 'INVALID_PATH',
@@ -89,6 +90,7 @@ export const ErrorCodeToStatus: Record<ErrorCode, number> = {
   [ErrorCode.INVALID_BATCH]: 400,
   [ErrorCode.INVALID_EVENT]: 400,
   [ErrorCode.EVENT_TOO_LARGE]: 400,
+  [ErrorCode.PAYLOAD_TOO_LARGE]: 413,
   [ErrorCode.SCHEMA_VALIDATION_ERROR]: 400,
   [ErrorCode.INVALID_PATTERN]: 400,
   [ErrorCode.INVALID_PATH]: 400,
@@ -147,25 +149,29 @@ export class EventsError extends Error {
   readonly status: number
 
   /** Additional metadata about the error */
-  readonly details?: Record<string, unknown>
+  readonly details?: Record<string, unknown> | undefined
 
   /** Original error that caused this error */
-  readonly cause?: Error
+  readonly cause?: Error | undefined
 
   constructor(
     message: string,
     code: ErrorCode = ErrorCode.INTERNAL_ERROR,
     options?: {
-      details?: Record<string, unknown>
-      cause?: Error
+      details?: Record<string, unknown> | undefined
+      cause?: Error | undefined
     }
   ) {
     super(message)
     this.name = 'EventsError'
     this.code = code
     this.status = ErrorCodeToStatus[code]
-    this.details = options?.details
-    this.cause = options?.cause
+    if (options?.details !== undefined) {
+      this.details = options.details
+    }
+    if (options?.cause !== undefined) {
+      this.cause = options.cause
+    }
 
     // Maintains proper stack trace in V8 environments
     // V8's captureStackTrace is a non-standard extension
@@ -251,6 +257,19 @@ export class EventTooLargeError extends EventsError {
   ) {
     super(message, ErrorCode.EVENT_TOO_LARGE, { details })
     this.name = 'EventTooLargeError'
+  }
+}
+
+/**
+ * Payload too large error - thrown when request body exceeds size limit (413)
+ */
+export class PayloadTooLargeError extends EventsError {
+  constructor(
+    message: string = 'Payload Too Large',
+    details?: { maxSize?: number; contentLength?: number }
+  ) {
+    super(message, ErrorCode.PAYLOAD_TOO_LARGE, { details })
+    this.name = 'PayloadTooLargeError'
   }
 }
 

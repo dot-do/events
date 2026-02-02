@@ -9,6 +9,7 @@
  */
 
 import { corsHeaders } from '../utils'
+import { logger } from '../logger'
 
 // ============================================================================
 // Types
@@ -212,8 +213,10 @@ function validateNamespaceApiKey(
           keyId: maskApiKey(fullKey),
         }
       }
-    } catch {
-      console.error('[tenant] Failed to parse NAMESPACE_API_KEYS')
+    } catch (err) {
+      logger.child({ component: 'Tenant' }).error('Failed to parse NAMESPACE_API_KEYS', {
+        error: err instanceof Error ? err.message : String(err),
+      })
     }
   }
 

@@ -16,6 +16,7 @@ import {
   DEFAULT_RATE_LIMIT_EVENTS_PER_MINUTE,
   DEFAULT_RATE_LIMIT_RETRY_AFTER,
 } from '../config'
+import { logger, logError } from '../logger'
 
 /** Environment variables for rate limiting */
 export interface RateLimitEnv {
@@ -138,7 +139,7 @@ export async function checkRateLimit(
     return null
   } catch (err) {
     // Log the error but don't block the request on rate limiter failures
-    console.error('[rate-limit] Error checking rate limit:', err)
+    logError(logger.child({ component: 'RateLimit' }), 'Error checking rate limit - allowing request', err)
     return null
   }
 }
