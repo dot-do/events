@@ -387,6 +387,18 @@ export {
   setSequenceState,
 } from './cdc-deltalake.js'
 
+// Compatibility reader for legacy + DeltaLake migration
+export type {
+  CompatQueryOptions,
+  CompatQueryResult,
+  CompatReaderConfig,
+} from './compat-reader.js'
+
+export {
+  CompatReader,
+  createCompatReader,
+} from './compat-reader.js'
+
 // === Configuration ===
 // Centralized configuration constants for tuning and defaults
 export { coreConfig } from './config.js'
