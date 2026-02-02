@@ -19,10 +19,13 @@ import { compactCollection } from '../../core/src/cdc-compaction'
 import { compactEventStream } from '../../core/src/event-compaction'
 import { withSchedulerLock } from '../scheduler-lock'
 import { KNOWN_SUBSCRIPTION_SHARDS } from '../subscription-routes'
+import { createLogger, logError } from '../logger'
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
 const DEAD_LETTER_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
 const SUBSCRIPTION_DEAD_LETTER_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+
+const log = createLogger({ component: 'scheduled' })
 
 /**
  * Task 1: Dedup marker cleanup (delete markers older than 24 hours)
@@ -34,7 +37,7 @@ async function cleanupDedupMarkers(env: Env): Promise<void> {
     let dedupChecked = 0
     let cursor: string | undefined
 
-    console.log('[DEDUP-CLEANUP] Starting dedup marker cleanup...')
+    log.info('Starting dedup marker cleanup')
 
     // Paginate through all dedup markers
     do {
@@ -57,9 +60,9 @@ async function cleanupDedupMarkers(env: Env): Promise<void> {
       cursor = list.truncated ? list.cursor : undefined
     } while (cursor)
 
-    console.log(`[DEDUP-CLEANUP] Completed: checked ${dedupChecked}, deleted ${dedupDeleted} expired markers`)
+    log.info('Dedup cleanup completed', { checked: dedupChecked, deleted: dedupDeleted })
   } catch (err) {
-    console.error('[DEDUP-CLEANUP] Error during dedup cleanup:', err)
+    logError(log, 'Error during dedup cleanup', err)
   }
 }
 
@@ -68,7 +71,7 @@ async function cleanupDedupMarkers(env: Env): Promise<void> {
  */
 async function runCDCCompaction(env: Env): Promise<void> {
   try {
-    console.log('[COMPACT-CDC] Starting CDC compaction...')
+    log.info('Starting CDC compaction')
 
     // Discover namespaces by scanning R2 for cdc prefixes
     // This is more reliable than relying on catalog state since we're sharding by namespace
@@ -107,7 +110,7 @@ async function runCDCCompaction(env: Env): Promise<void> {
     }
 
     const namespaceList = [...namespaces]
-    console.log(`[COMPACT-CDC] Found ${namespaceList.length} namespaces: ${namespaceList.join(', ')}`)
+    log.info('Found namespaces', { count: namespaceList.length, namespaces: namespaceList })
 
     let totalCompacted = 0
     let totalSkipped = 0
@@ -160,26 +163,27 @@ async function runCDCCompaction(env: Env): Promise<void> {
               recordCount: compactionResult.recordCount,
               deltasProcessed: compactionResult.deltasProcessed,
             })
-            console.log(
-              `[COMPACT-CDC] Compacted ${ns}/${table}: ${compactionResult.deltasProcessed} deltas -> ${compactionResult.recordCount} records`
-            )
+            log.info('CDC compacted', {
+              namespace: ns,
+              table,
+              deltasProcessed: compactionResult.deltasProcessed,
+              recordCount: compactionResult.recordCount,
+            })
           } else {
             totalSkipped++
             results.push({ ns, table, result: 'no-deltas' })
           }
         } catch (err) {
           const errorMsg = err instanceof Error ? err.message : String(err)
-          console.error(`[COMPACT-CDC] Error compacting ${ns}/${table}:`, errorMsg)
+          logError(log, 'Error compacting collection', err, { namespace: ns, table })
           results.push({ ns, table, result: `error: ${errorMsg}` })
         }
       }
     }
 
-    console.log(
-      `[COMPACT-CDC] Completed: ${totalCompacted} compacted, ${totalSkipped} skipped`
-    )
+    log.info('CDC compaction completed', { compacted: totalCompacted, skipped: totalSkipped })
   } catch (err) {
-    console.error('[COMPACT-CDC] Error during CDC compaction:', err)
+    logError(log, 'Error during CDC compaction', err)
   }
 }
 
@@ -195,25 +199,26 @@ async function runEventStreamCompaction(env: Env): Promise<void> {
   }
 
   try {
-    console.log('[COMPACT-EVENTS] Starting event stream compaction...')
+    log.info('Starting event stream compaction')
 
     const result = await compactEventStream(env.EVENTS_BUCKET, {
       prefixes: ['events', 'webhooks', 'tail'],
       daysBack: 7,
     })
 
-    console.log(
-      `[COMPACT-EVENTS] Completed in ${result.durationMs}ms: ` +
-      `${result.days.length} days processed, ` +
-      `${result.totalSourceFiles} source files -> ${result.totalOutputFiles} output files, ` +
-      `${result.totalRecords} total records`
-    )
+    log.info('Event stream compaction completed', {
+      durationMs: result.durationMs,
+      daysProcessed: result.days.length,
+      sourceFiles: result.totalSourceFiles,
+      outputFiles: result.totalOutputFiles,
+      totalRecords: result.totalRecords,
+    })
 
     if (result.errors && result.errors.length > 0) {
-      console.warn('[COMPACT-EVENTS] Errors:', result.errors)
+      log.warn('Event stream compaction had errors', { errors: result.errors })
     }
   } catch (err) {
-    console.error('[COMPACT-EVENTS] Error during event stream compaction:', err)
+    logError(log, 'Error during event stream compaction', err)
   }
 }
 
@@ -234,7 +239,7 @@ async function cleanupDeadLetters(env: Env): Promise<void> {
     let deadLetterChecked = 0
     let cursor: string | undefined
 
-    console.log('[DEAD-LETTER-CLEANUP] Starting dead letter cleanup...')
+    log.info('Starting dead letter cleanup')
 
     // Paginate through all dead-letter files
     do {
@@ -257,9 +262,9 @@ async function cleanupDeadLetters(env: Env): Promise<void> {
       cursor = list.truncated ? list.cursor : undefined
     } while (cursor)
 
-    console.log(`[DEAD-LETTER-CLEANUP] Completed: checked ${deadLetterChecked}, deleted ${deadLetterDeleted} expired dead letters`)
+    log.info('Dead letter cleanup completed', { checked: deadLetterChecked, deleted: deadLetterDeleted })
   } catch (err) {
-    console.error('[DEAD-LETTER-CLEANUP] Error during dead letter cleanup:', err)
+    logError(log, 'Error during dead letter cleanup', err)
   }
 }
 
@@ -275,12 +280,12 @@ async function cleanupSubscriptionDeadLetters(env: Env): Promise<void> {
   }
 
   if (!env.SUBSCRIPTIONS) {
-    console.log('[SUB-CLEANUP] Skipping - SUBSCRIPTIONS binding not available')
+    log.info('Skipping subscription cleanup - SUBSCRIPTIONS binding not available')
     return
   }
 
   try {
-    console.log('[SUB-CLEANUP] Starting subscription dead letter cleanup...')
+    log.info('Starting subscription dead letter cleanup')
 
     const cutoffTs = Date.now() - SUBSCRIPTION_DEAD_LETTER_TTL_MS
     let totalDeadLettersDeleted = 0
@@ -301,22 +306,25 @@ async function cleanupSubscriptionDeadLetters(env: Env): Promise<void> {
         totalDeliveriesDeleted += result.deliveriesDeleted
 
         if (result.deadLettersDeleted > 0 || result.deliveryLogsDeleted > 0 || result.deliveriesDeleted > 0) {
-          console.log(
-            `[SUB-CLEANUP] Shard ${shard}: deleted ${result.deadLettersDeleted} dead letters, ` +
-            `${result.deliveryLogsDeleted} logs, ${result.deliveriesDeleted} deliveries`
-          )
+          log.info('Shard cleanup', {
+            shard,
+            deadLettersDeleted: result.deadLettersDeleted,
+            logsDeleted: result.deliveryLogsDeleted,
+            deliveriesDeleted: result.deliveriesDeleted,
+          })
         }
       } catch (err) {
-        console.error(`[SUB-CLEANUP] Error cleaning up shard ${shard}:`, err)
+        logError(log, 'Error cleaning up shard', err, { shard })
       }
     }
 
-    console.log(
-      `[SUB-CLEANUP] Completed: deleted ${totalDeadLettersDeleted} dead letters, ` +
-      `${totalDeliveryLogsDeleted} delivery logs, ${totalDeliveriesDeleted} old deliveries`
-    )
+    log.info('Subscription cleanup completed', {
+      deadLettersDeleted: totalDeadLettersDeleted,
+      deliveryLogsDeleted: totalDeliveryLogsDeleted,
+      deliveriesDeleted: totalDeliveriesDeleted,
+    })
   } catch (err) {
-    console.error('[SUB-CLEANUP] Error during subscription cleanup:', err)
+    logError(log, 'Error during subscription cleanup', err)
   }
 }
 
@@ -331,7 +339,7 @@ async function cleanupSubscriptionDeadLetters(env: Env): Promise<void> {
  */
 export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
   const startTime = Date.now()
-  console.log(`[SCHEDULED] Triggered at ${new Date().toISOString()}, cron: ${event.cron}`)
+  log.info('Scheduled task triggered', { timestamp: new Date().toISOString(), cron: event.cron })
 
   ctx.waitUntil((async () => {
     // Acquire distributed lock to prevent concurrent scheduled runs
@@ -354,13 +362,13 @@ export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: Exec
         await cleanupSubscriptionDeadLetters(env)
 
         const durationMs = Date.now() - startTime
-        console.log(`[SCHEDULED] All tasks completed in ${durationMs}ms`)
+        log.info('All scheduled tasks completed', { durationMs })
       },
       { timeoutMs: 10 * 60 * 1000 } // 10 minute lock timeout
     )
 
     if (lockResult.skipped) {
-      console.log('[SCHEDULED] Skipped - another worker is running scheduled tasks')
+      log.info('Scheduled tasks skipped - another worker is running')
     }
   })())
 }

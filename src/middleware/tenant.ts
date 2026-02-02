@@ -66,7 +66,10 @@ const NAMESPACE_KEY_REGEX = /^ns_([a-z0-9_-]+)_([a-zA-Z0-9_-]+)$/
 export function parseNamespaceKey(key: string): { namespace: string; token: string } | null {
   const match = key.match(NAMESPACE_KEY_REGEX)
   if (!match) return null
-  return { namespace: match[1]!, token: match[2]! }
+  const namespace = match[1]
+  const token = match[2]
+  if (!namespace || !token) return null
+  return { namespace, token }
 }
 
 /**

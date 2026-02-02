@@ -24,6 +24,7 @@ import type { SubscriptionDO } from '../core/src/subscription'
 import { corsHeaders as baseCorsHeaders } from './utils'
 import type { Env } from './env'
 import type { TenantContext } from './middleware/tenant'
+import { MAX_PATTERN_LENGTH } from './config'
 
 type SubscriptionEnv = Pick<Env, 'SUBSCRIPTIONS'>
 
@@ -49,11 +50,6 @@ export const KNOWN_SUBSCRIPTION_SHARDS = [
   'webhook',
   'default',
 ]
-
-/**
- * Maximum allowed length for subscription patterns
- */
-const MAX_PATTERN_LENGTH = 256
 
 /**
  * Validates a subscription pattern for safety and correctness.

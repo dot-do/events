@@ -20,7 +20,7 @@
 
 import type { Env } from '../env'
 import type { EventBatch, DurableEvent } from '@dotdo/events'
-import type { CDCEvent } from '../../core/src/cdc-processor'
+import { isCollectionChangeEvent, type CDCEvent } from '../../core/src/cdc-processor'
 import { ulid } from '../../core/src/ulid'
 import {
   batchCheckDuplicates,
@@ -29,8 +29,10 @@ import {
   getSubDedupCache,
 } from '../../core/src/dedup-cache'
 import { recordQueueMetric, recordCDCMetric, recordSubscriptionMetric, MetricTimer } from '../metrics'
+import { createLogger, logError } from '../logger'
 
 const MAX_RETRIES = 5
+const log = createLogger({ component: 'queue' })
 
 /**
  * Queue consumer handler - processes EventBatch messages for CDC/subscription fanout.
@@ -39,7 +41,7 @@ export async function handleQueue(batch: MessageBatch<EventBatch>, env: Env): Pr
   const timer = new MetricTimer()
   const startTime = Date.now()
 
-  console.log(`[QUEUE] Processing batch of ${batch.messages.length} messages (QUEUE fanout mode)`)
+  log.info('Processing batch', { messageCount: batch.messages.length, mode: 'QUEUE fanout' })
 
   let totalEvents = 0
   let cdcEventsProcessed = 0
@@ -61,21 +63,20 @@ export async function handleQueue(batch: MessageBatch<EventBatch>, env: Env): Pr
       const eventBatch = message.body
 
       if (!eventBatch?.events || !Array.isArray(eventBatch.events)) {
-        console.warn(`[QUEUE] Invalid message format, missing events array`)
+        log.warn('Invalid message format', { reason: 'missing events array', messageId: message.id })
         message.ack()
         continue
       }
 
       totalEvents += eventBatch.events.length
 
-      // Process CDC events (type starts with 'collection.')
-      const cdcEvents = eventBatch.events.filter((e: DurableEvent) => e.type.startsWith('collection.'))
+      // Process CDC events using type guard for proper type narrowing
+      const cdcEvents = eventBatch.events.filter(isCollectionChangeEvent)
 
       if (cdcEvents.length > 0 && env.CDC_PROCESSOR) {
         // Group CDC events by namespace/collection for routing to the correct DO instance
         const cdcByKey = new Map<string, CDCEvent[]>()
-        for (const event of cdcEvents) {
-          const cdcEvent = event as unknown as CDCEvent
+        for (const cdcEvent of cdcEvents) {
           const ns = cdcEvent.do?.class || cdcEvent.do?.name || 'default'
           const collection = cdcEvent.collection || 'default'
           const key = `${ns}/${collection}`
@@ -135,10 +136,10 @@ export async function handleQueue(batch: MessageBatch<EventBatch>, env: Env): Pr
               }
             }
 
-            console.log(`[QUEUE] CDC processed ${eventsToProcess.length} events for ${key} (skipped ${events.length - eventsToProcess.length} duplicates)`)
+            log.info('CDC processed', { key, processed: eventsToProcess.length, skipped: events.length - eventsToProcess.length })
           } catch (err) {
             recordCDCMetric(env.ANALYTICS, 'error', events.length, key)
-            console.error(`[QUEUE] CDC processor error for ${key}:`, err)
+            logError(log, 'CDC processor error', err, { key })
             // Don't ack the message yet - will retry or dead letter
             throw err
           }
@@ -215,10 +216,10 @@ export async function handleQueue(batch: MessageBatch<EventBatch>, env: Env): Pr
             }
 
             recordSubscriptionMetric(env.ANALYTICS, 'success', newEventIndices.length, shardKey)
-            console.log(`[QUEUE] Subscription fanout: ${newEventIndices.length} events to shard ${shardKey} (skipped ${shardSkipped} duplicates)`)
+            log.info('Subscription fanout', { shardKey, delivered: newEventIndices.length, skipped: shardSkipped })
           } catch (err) {
             recordSubscriptionMetric(env.ANALYTICS, 'error', events.length, shardKey, 'shard_error')
-            console.error(`[QUEUE] Subscription shard error for shard ${shardKey}:`, err)
+            logError(log, 'Subscription shard error', err, { shardKey })
             // Don't ack the message yet - will retry or dead letter
             throw err
           }
@@ -233,10 +234,11 @@ export async function handleQueue(batch: MessageBatch<EventBatch>, env: Env): Pr
       // Check if we've exceeded max retries
       if (attempts >= MAX_RETRIES) {
         // Permanent failure - log to dead letter and ack to prevent further retries
-        console.error(
-          `[QUEUE] Dead letter: message failed after ${attempts} attempts. Error: ${errorMsg}`,
-          { messageId: message.id, body: message.body }
-        )
+        log.error('Dead letter: message failed permanently', {
+          attempts,
+          error: errorMsg,
+          messageId: message.id,
+        })
 
         // Write to R2 dead letter storage for later inspection/reprocessing
         try {
@@ -252,18 +254,16 @@ export async function handleQueue(batch: MessageBatch<EventBatch>, env: Env): Pr
             }),
             { httpMetadata: { contentType: 'application/json' } }
           )
-          console.log(`[QUEUE] Dead letter written to ${deadLetterKey}`)
+          log.info('Dead letter written', { key: deadLetterKey })
         } catch (dlErr) {
-          console.error(`[QUEUE] Failed to write dead letter:`, dlErr)
+          logError(log, 'Failed to write dead letter', dlErr)
         }
 
         deadLettered++
         message.ack() // Ack to prevent further retries
       } else {
         // Transient failure - retry
-        console.warn(
-          `[QUEUE] Retrying message (attempt ${attempts}/${MAX_RETRIES}). Error: ${errorMsg}`
-        )
+        log.warn('Retrying message', { attempt: attempts, maxRetries: MAX_RETRIES, error: errorMsg })
         message.retry()
       }
     }
@@ -286,11 +286,13 @@ export async function handleQueue(batch: MessageBatch<EventBatch>, env: Env): Pr
     }, 0)
   }
 
-  console.log(
-    `[QUEUE] Completed in ${durationMs}ms: ${totalEvents} events, ` +
-    `CDC: ${cdcEventsProcessed} processed/${cdcEventsSkipped} skipped, ` +
-    `Subscriptions: ${subscriptionFanouts} delivered/${subscriptionSkipped} skipped, ` +
-    `R2 calls: ${totalR2Calls}, cache hits: ${totalCacheHits}` +
-    (deadLettered > 0 ? `, ${deadLettered} dead-lettered` : '')
-  )
+  log.info('Batch completed', {
+    durationMs,
+    totalEvents,
+    cdc: { processed: cdcEventsProcessed, skipped: cdcEventsSkipped },
+    subscriptions: { delivered: subscriptionFanouts, skipped: subscriptionSkipped },
+    r2Calls: totalR2Calls,
+    cacheHits: totalCacheHits,
+    deadLettered: deadLettered > 0 ? deadLettered : undefined,
+  })
 }

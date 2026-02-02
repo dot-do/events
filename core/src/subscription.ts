@@ -22,6 +22,13 @@ import {
   type SqlRow,
 } from './sql-mapper.js'
 import { ulid } from './ulid.js'
+import {
+  DEFAULT_SUBSCRIPTION_MAX_RETRIES,
+  DEFAULT_SUBSCRIPTION_TIMEOUT_MS,
+  SUBSCRIPTION_BATCH_LIMIT,
+  SUBSCRIPTION_RETRY_BASE_DELAY_MS,
+  SUBSCRIPTION_RETRY_MAX_DELAY_MS,
+} from './config.js'
 
 // ============================================================================
 // Types
@@ -220,8 +227,8 @@ export class SubscriptionDO extends DurableObject<Env> {
         params.pattern,
         patternPrefix,
         params.rpcMethod,
-        params.maxRetries ?? 5,
-        params.timeoutMs ?? 30000,
+        params.maxRetries ?? DEFAULT_SUBSCRIPTION_MAX_RETRIES,
+        params.timeoutMs ?? DEFAULT_SUBSCRIPTION_TIMEOUT_MS,
         now,
         now
       )
@@ -570,7 +577,7 @@ export class SubscriptionDO extends DurableObject<Env> {
     }
 
     // Schedule retry with exponential backoff
-    const backoffMs = Math.min(1000 * Math.pow(2, newAttemptCount), 300000) // Max 5 minutes
+    const backoffMs = Math.min(SUBSCRIPTION_RETRY_BASE_DELAY_MS * Math.pow(2, newAttemptCount), SUBSCRIPTION_RETRY_MAX_DELAY_MS)
     const nextAttemptAt = now + backoffMs
 
     this.sql.exec(
@@ -1073,10 +1080,8 @@ export class SubscriptionDO extends DurableObject<Env> {
    * Formula: min(baseDelay * 2^(attempt-1), maxDelay) + random jitter (0-1s)
    */
   private calculateRetryDelay(attemptNumber: number): number {
-    const baseDelay = 1000 // 1 second
-    const maxDelay = 300000 // 5 minutes
-    const exponential = Math.min(baseDelay * Math.pow(2, attemptNumber - 1), maxDelay)
-    const jitter = Math.random() * 1000
+    const exponential = Math.min(SUBSCRIPTION_RETRY_BASE_DELAY_MS * Math.pow(2, attemptNumber - 1), SUBSCRIPTION_RETRY_MAX_DELAY_MS)
+    const jitter = Math.random() * SUBSCRIPTION_RETRY_BASE_DELAY_MS
     return Math.round(exponential + jitter)
   }
 
@@ -1107,7 +1112,7 @@ export class SubscriptionDO extends DurableObject<Env> {
    * Alarm handler - processes failed deliveries ready for retry
    *
    * Called by Cloudflare when a scheduled alarm fires.
-   * Processes up to 100 deliveries per alarm to avoid timeout.
+   * Processes up to SUBSCRIPTION_BATCH_LIMIT deliveries per alarm to avoid timeout.
    */
   async alarm(): Promise<void> {
     // Process all failed deliveries ready for retry
@@ -1115,8 +1120,9 @@ export class SubscriptionDO extends DurableObject<Env> {
       `SELECT id FROM deliveries
        WHERE status = 'failed' AND next_attempt_at <= ?
        ORDER BY next_attempt_at ASC
-       LIMIT 100`,
-      Date.now()
+       LIMIT ?`,
+      Date.now(),
+      SUBSCRIPTION_BATCH_LIMIT
     ).toArray()
 
     for (const row of ready) {

@@ -11,11 +11,13 @@
  * - Full logging/observability (loop prevented at wrangler level)
  * - Source field distinguishes event origin
  * - Workers RPC for type-safe direct method calls
+ * - Dynamic sharding via ShardCoordinatorDO
  */
 
 import { DurableObject } from 'cloudflare:workers'
 import { writeEvents, ulid, type EventRecord, type WriteResult } from './event-writer'
 import { recordWriterDOMetric, recordR2WriteMetric, MetricTimer } from './metrics'
+import type { ShardCoordinatorDO } from './shard-coordinator-do'
 
 /**
  * Internal event with unique ID for deduplication
@@ -26,10 +28,11 @@ interface BufferedEvent extends EventRecord {
 
 const BUFFER_KEY = '_eventWriter:buffer'
 const FLUSHED_KEY = '_eventWriter:flushed'
+const METRICS_REPORT_INTERVAL_MS = 5_000 // Report metrics every 5 seconds
 
 import type { Env as FullEnv } from './env'
 
-export type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'ANALYTICS'>
+export type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'ANALYTICS' | 'SHARD_COORDINATOR'>
 
 // ============================================================================
 // Configuration
@@ -73,6 +76,7 @@ export class EventWriterDO extends DurableObject<Env> {
   private buffer: BufferedEvent[] = []
   private flushedEventIds: Set<string> = new Set()
   private lastFlushTime = Date.now()
+  private lastMetricsReport = 0
   private pendingWrites = 0
   private shardId = 0
   private config = DEFAULT_CONFIG
@@ -89,6 +93,65 @@ export class EventWriterDO extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => {
       await this.restoreBuffer()
     })
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Metrics Reporting to Shard Coordinator
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Report metrics to the shard coordinator (called periodically)
+   */
+  private async reportMetricsToCoordinator(): Promise<void> {
+    const now = Date.now()
+    if ((now - this.lastMetricsReport) < METRICS_REPORT_INTERVAL_MS) {
+      return // Not time to report yet
+    }
+
+    // Check if shard coordinator is bound
+    if (!this.env.SHARD_COORDINATOR) {
+      return
+    }
+
+    this.lastMetricsReport = now
+
+    try {
+      const coordinatorId = this.env.SHARD_COORDINATOR.idFromName('global')
+      const coordinator = this.env.SHARD_COORDINATOR.get(coordinatorId)
+
+      await coordinator.reportMetrics({
+        shardId: this.shardId,
+        buffered: this.buffer.length,
+        pendingWrites: this.pendingWrites,
+        lastFlushTime: new Date(this.lastFlushTime).toISOString(),
+        timeSinceFlush: now - this.lastFlushTime,
+        flushScheduled: this.flushScheduled,
+      })
+    } catch (err) {
+      // Non-fatal: coordinator unavailable
+      console.warn(`[EventWriterDO:${this.shardId}] Failed to report metrics to coordinator:`, err)
+    }
+  }
+
+  /**
+   * Report backpressure to coordinator and get alternative shard
+   */
+  private async reportBackpressureToCoordinator(): Promise<number | undefined> {
+    if (!this.env.SHARD_COORDINATOR) {
+      // Fall back to simple increment
+      return this.shardId + 1
+    }
+
+    try {
+      const coordinatorId = this.env.SHARD_COORDINATOR.idFromName('global')
+      const coordinator = this.env.SHARD_COORDINATOR.get(coordinatorId)
+
+      const result = await coordinator.reportBackpressure(this.shardId)
+      return result.alternativeShard
+    } catch (err) {
+      console.warn(`[EventWriterDO:${this.shardId}] Failed to report backpressure:`, err)
+      return this.shardId + 1
+    }
   }
 
   /**
@@ -174,11 +237,15 @@ export class EventWriterDO extends DurableObject<Env> {
         events: events.length,
         shard: this.shardId,
       }, timer.elapsed())
+
+      // Report backpressure to coordinator and get alternative shard
+      const alternativeShard = await this.reportBackpressureToCoordinator()
+
       return {
         ok: false,
         buffered: this.buffer.length,
         shard: this.shardId,
-        tryNextShard: this.shardId + 1,
+        tryNextShard: alternativeShard,
       }
     }
 
@@ -189,6 +256,10 @@ export class EventWriterDO extends DurableObject<Env> {
         events: events.length,
         shard: this.shardId,
       }, timer.elapsed())
+
+      // Report metrics periodically to coordinator
+      await this.reportMetricsToCoordinator()
+
       return result
     } catch (err) {
       recordWriterDOMetric(this.env.ANALYTICS, 'ingest', 'error', {
@@ -391,16 +462,59 @@ export function getEventWriterDO(env: Env, shard: number = 0): DurableObjectStub
 }
 
 /**
+ * Get the shard coordinator for dynamic sharding
+ */
+export function getShardCoordinator(env: Env): DurableObjectStub<ShardCoordinatorDO> | null {
+  if (!env.SHARD_COORDINATOR) return null
+  const id = env.SHARD_COORDINATOR.idFromName('global')
+  return env.SHARD_COORDINATOR.get(id)
+}
+
+/**
+ * Get active shards from coordinator (with fallback)
+ */
+export async function getActiveShards(env: Env): Promise<number[]> {
+  const coordinator = getShardCoordinator(env)
+  if (!coordinator) {
+    return [0] // Fallback to shard 0 if no coordinator
+  }
+  try {
+    return await coordinator.getActiveShards()
+  } catch (err) {
+    console.warn('[Router] Failed to get active shards from coordinator:', err)
+    return [0]
+  }
+}
+
+/**
+ * Get recommended routing shard from coordinator
+ */
+export async function getRoutingShard(env: Env, preferredShard?: number): Promise<number> {
+  const coordinator = getShardCoordinator(env)
+  if (!coordinator) {
+    return preferredShard ?? 0
+  }
+  try {
+    return await coordinator.getRoutingShard(preferredShard)
+  } catch (err) {
+    console.warn('[Router] Failed to get routing shard from coordinator:', err)
+    return preferredShard ?? 0
+  }
+}
+
+/**
  * Ingest events with automatic shard overflow via RPC
+ * Now uses dynamic shard coordinator when available
  */
 export async function ingestWithOverflow(
   env: Env,
   events: EventRecord[],
   source: string,
-  startShard: number = 0,
+  startShard?: number,
   maxRetries: number = 16
 ): Promise<IngestResult> {
-  let currentShard = startShard
+  // Get starting shard from coordinator if not specified
+  let currentShard = startShard ?? await getRoutingShard(env)
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const stub = getEventWriterDO(env, currentShard)
@@ -412,7 +526,7 @@ export async function ingestWithOverflow(
       return result
     }
 
-    // Overloaded - try next shard
+    // Overloaded - try next shard (provided by coordinator via EventWriterDO)
     console.log(`[Router] Shard ${currentShard} overloaded, trying shard ${result.tryNextShard}`)
     currentShard = result.tryNextShard
   }
@@ -422,21 +536,34 @@ export async function ingestWithOverflow(
 
 /**
  * Ingest events in parallel across multiple shards via RPC
+ * Now uses dynamic shard count from coordinator
  */
 export async function ingestParallel(
   env: Env,
   events: EventRecord[],
   source: string,
-  shardCount: number = 4
+  shardCount?: number
 ): Promise<{ ok: boolean; results: IngestResult[] }> {
+  // Get active shards from coordinator if count not specified
+  const activeShards = shardCount
+    ? Array.from({ length: shardCount }, (_, i) => i)
+    : await getActiveShards(env)
+
+  const effectiveShardCount = activeShards.length
+
   // Partition events by shard using hash of timestamp + type
   const shards = new Map<number, EventRecord[]>()
 
   for (const event of events) {
     const hash = simpleHash(`${event.ts}:${event.type}`)
-    const shard = hash % shardCount
-    if (!shards.has(shard)) shards.set(shard, [])
-    shards.get(shard)!.push(event)
+    const shardIndex = hash % effectiveShardCount
+    const shardId = activeShards[shardIndex] ?? 0
+    const shardEvents = shards.get(shardId)
+    if (shardEvents) {
+      shardEvents.push(event)
+    } else {
+      shards.set(shardId, [event])
+    }
   }
 
   // Send to each shard in parallel via RPC
@@ -455,6 +582,48 @@ export async function ingestParallel(
   return {
     ok: results.every(r => r.ok),
     results,
+  }
+}
+
+/**
+ * Get shard statistics from coordinator
+ */
+export async function getShardStats(env: Env): Promise<{
+  activeShards: number[]
+  totalBuffered: number
+  totalPendingWrites: number
+  averageUtilization: number
+} | null> {
+  const coordinator = getShardCoordinator(env)
+  if (!coordinator) {
+    return null
+  }
+  try {
+    return await coordinator.getStats()
+  } catch (err) {
+    console.warn('[Router] Failed to get shard stats:', err)
+    return null
+  }
+}
+
+/**
+ * Force scale to a specific shard count
+ */
+export async function forceScaleShards(env: Env, targetCount: number): Promise<{
+  scaled: boolean
+  previousCount: number
+  newCount: number
+  reason: string
+} | null> {
+  const coordinator = getShardCoordinator(env)
+  if (!coordinator) {
+    return null
+  }
+  try {
+    return await coordinator.forceScale(targetCount)
+  } catch (err) {
+    console.warn('[Router] Failed to force scale:', err)
+    return null
   }
 }
 

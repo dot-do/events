@@ -28,6 +28,7 @@ import { SubscriptionDO } from '../core/src/subscription'
 import { CDCProcessorDO } from '../core/src/cdc-processor'
 import { SchemaRegistryDO } from '../core/src/schema-registry'
 import { EventWriterDO } from './event-writer-do'
+import { ShardCoordinatorDO } from './shard-coordinator-do'
 import { RateLimiterDO } from './middleware/rate-limiter-do'
 
 // Import handlers
@@ -36,7 +37,7 @@ import { handleQueue } from './handlers/queue'
 import { handleScheduled } from './handlers/scheduled'
 
 // Re-export DOs for wrangler
-export { CatalogDO, SubscriptionDO, CDCProcessorDO, SchemaRegistryDO, EventWriterDO, RateLimiterDO }
+export { CatalogDO, SubscriptionDO, CDCProcessorDO, SchemaRegistryDO, EventWriterDO, ShardCoordinatorDO, RateLimiterDO }
 
 export default {
   fetch: handleFetch,

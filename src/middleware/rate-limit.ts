@@ -11,6 +11,11 @@
 
 import type { RateLimiterDO } from './rate-limiter-do'
 import { corsHeaders } from '../utils'
+import {
+  DEFAULT_RATE_LIMIT_REQUESTS_PER_MINUTE,
+  DEFAULT_RATE_LIMIT_EVENTS_PER_MINUTE,
+  DEFAULT_RATE_LIMIT_RETRY_AFTER,
+} from '../config'
 
 /** Environment variables for rate limiting */
 export interface RateLimitEnv {
@@ -81,8 +86,8 @@ export async function checkRateLimit(
   }
 
   const key = getRateLimitKey(request)
-  const requestsPerMinute = parseInt(env.RATE_LIMIT_REQUESTS_PER_MINUTE || '1000', 10)
-  const eventsPerMinute = parseInt(env.RATE_LIMIT_EVENTS_PER_MINUTE || '100000', 10)
+  const requestsPerMinute = parseInt(env.RATE_LIMIT_REQUESTS_PER_MINUTE || String(DEFAULT_RATE_LIMIT_REQUESTS_PER_MINUTE), 10)
+  const eventsPerMinute = parseInt(env.RATE_LIMIT_EVENTS_PER_MINUTE || String(DEFAULT_RATE_LIMIT_EVENTS_PER_MINUTE), 10)
 
   try {
     // Get the rate limiter DO for this key
@@ -97,7 +102,7 @@ export async function checkRateLimit(
     )
 
     if (!result.allowed) {
-      const retryAfter = result.retryAfterSeconds || 60
+      const retryAfter = result.retryAfterSeconds || DEFAULT_RATE_LIMIT_RETRY_AFTER
 
       return Response.json(
         {
@@ -149,8 +154,8 @@ export function addRateLimitHeaders(
 ): void {
   if (!result) return
 
-  const requestsPerMinute = parseInt(env.RATE_LIMIT_REQUESTS_PER_MINUTE || '1000', 10)
-  const eventsPerMinute = parseInt(env.RATE_LIMIT_EVENTS_PER_MINUTE || '100000', 10)
+  const requestsPerMinute = parseInt(env.RATE_LIMIT_REQUESTS_PER_MINUTE || String(DEFAULT_RATE_LIMIT_REQUESTS_PER_MINUTE), 10)
+  const eventsPerMinute = parseInt(env.RATE_LIMIT_EVENTS_PER_MINUTE || String(DEFAULT_RATE_LIMIT_EVENTS_PER_MINUTE), 10)
 
   headers.set('X-RateLimit-Limit-Requests', String(requestsPerMinute))
   headers.set('X-RateLimit-Limit-Events', String(eventsPerMinute))

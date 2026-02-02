@@ -19,8 +19,9 @@ import {
   type SqlRow,
 } from './sql-mapper.js'
 
-// Re-export CDCEvent for backwards compatibility
+// Re-export CDCEvent and type guard for backwards compatibility
 export type { CDCEvent } from './cdc-delta.js'
+export { isCollectionChangeEvent } from './types.js'
 
 // ============================================================================
 // Types

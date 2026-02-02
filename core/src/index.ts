@@ -219,3 +219,36 @@ export {
 // Note: For browser usage, import from '@dotdo/events/browser' for the standalone bundle
 export type { BrowserConfig } from './browser.js'
 export { EventsSDK, init as initBrowser, page, track, identify, flush as flushBrowser } from './browser.js'
+
+// === Configuration ===
+// Centralized configuration constants for tuning and defaults
+export { coreConfig } from './config.js'
+export {
+  // Emitter defaults
+  DEFAULT_EMITTER_ENDPOINT,
+  DEFAULT_BATCH_SIZE,
+  DEFAULT_FLUSH_INTERVAL_MS,
+  DEFAULT_MAX_RETRY_QUEUE_SIZE,
+  DEFAULT_MAX_CONSECUTIVE_FAILURES,
+  DEFAULT_CIRCUIT_BREAKER_RESET_MS,
+  // Retry configuration
+  RETRY_BASE_DELAY_MS,
+  RETRY_MAX_DELAY_MS,
+  RETRY_JITTER_MS,
+  // Subscription defaults
+  DEFAULT_SUBSCRIPTION_MAX_RETRIES,
+  DEFAULT_SUBSCRIPTION_TIMEOUT_MS,
+  SUBSCRIPTION_BATCH_LIMIT,
+  SUBSCRIPTION_RETRY_BASE_DELAY_MS,
+  SUBSCRIPTION_RETRY_MAX_DELAY_MS,
+  // Pattern validation
+  MAX_PATTERN_LENGTH,
+  MAX_PATTERN_SEGMENTS,
+  ALLOWED_PATTERN_CHARS,
+  MAX_PATTERN_MATCH_ITERATIONS,
+  // Storage keys
+  STORAGE_KEY_RETRY,
+  STORAGE_KEY_RETRY_COUNT,
+  STORAGE_KEY_BATCH,
+  STORAGE_KEY_CIRCUIT_BREAKER,
+} from './config.js'

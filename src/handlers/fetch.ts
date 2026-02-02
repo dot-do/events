@@ -38,7 +38,9 @@ import {
   handleGetNamespaceConfig,
   handleValidateEvents,
 } from '../routes/schema'
+import { handleShardRoutes } from '../routes/shards'
 import { getAllowedOrigin } from '../utils'
+import { createRequestLogger, getRequestId } from '../logger'
 
 /**
  * Handle CORS preflight requests
@@ -66,6 +68,8 @@ function handleCORS(request?: Request, env?: { ALLOWED_ORIGINS?: string }, authe
 export async function handleFetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const startTime = performance.now()
   const url = new URL(request.url)
+  const requestId = getRequestId(request)
+  const log = createRequestLogger({ requestId })
 
   // CORS preflight - use restricted origins for authenticated routes
   if (request.method === 'OPTIONS') {
@@ -87,7 +91,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   if ((url.pathname === '/ingest' || url.pathname === '/e') && request.method === 'POST') {
     const response = await handleIngest(request, env, ctx)
     const cpuTime = performance.now() - startTime
-    console.log(`[CPU:${cpuTime.toFixed(2)}ms] POST /ingest`)
+    log.info('POST /ingest', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/ingest' })
     return response
   }
 
@@ -98,7 +102,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   // ================================================================
   // Protected routes - require admin auth
   // ================================================================
-  const protectedRoutes = ['/query', '/recent', '/events', '/pipeline', '/catalog', '/subscriptions', '/schemas', '/benchmark', '/dashboard']
+  const protectedRoutes = ['/query', '/recent', '/events', '/pipeline', '/catalog', '/subscriptions', '/schemas', '/shards', '/benchmark', '/dashboard']
   if (protectedRoutes.some(r => url.pathname === r || url.pathname.startsWith(r + '/'))) {
     // Authenticate using AUTH RPC binding directly
     const auth = request.headers.get('Authorization')
@@ -140,7 +144,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname === '/query' && request.method === 'POST') {
       const response = await handleQuery(request, env, adminTenant)
       const cpuTime = performance.now() - startTime
-      console.log(`[CPU:${cpuTime.toFixed(2)}ms] POST /query (${user})`)
+      log.info('POST /query', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/query', user })
       return response
     }
 
@@ -148,7 +152,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname === '/recent' && request.method === 'GET') {
       const response = await handleRecent(request, env)
       const cpuTime = performance.now() - startTime
-      console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /recent (${user})`)
+      log.info('GET /recent', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/recent', user })
       return response
     }
 
@@ -156,7 +160,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname === '/events' && request.method === 'GET') {
       const response = await handleEventsQuery(request, env)
       const cpuTime = performance.now() - startTime
-      console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /events (${user})`)
+      log.info('GET /events', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/events', user })
       return response
     }
 
@@ -164,7 +168,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname === '/pipeline' && request.method === 'GET') {
       const response = await handlePipelineCheck(request, env)
       const cpuTime = performance.now() - startTime
-      console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /pipeline (${user})`)
+      log.info('GET /pipeline', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/pipeline', user })
       return response
     }
 
@@ -172,7 +176,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname.startsWith('/catalog')) {
       const response = await handleCatalog(request, env, url)
       const cpuTime = performance.now() - startTime
-      console.log(`[CPU:${cpuTime.toFixed(2)}ms] ${request.method} ${url.pathname} (${user})`)
+      log.info(`${request.method} ${url.pathname}`, { cpuMs: parseFloat(cpuTime.toFixed(2)), path: url.pathname, user })
       return response
     }
 
@@ -180,7 +184,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname.startsWith('/subscriptions')) {
       const response = await handleSubscriptionRoutes(request, env, url, adminTenant)
       const cpuTime = performance.now() - startTime
-      console.log(`[CPU:${cpuTime.toFixed(2)}ms] ${request.method} ${url.pathname} (${user})`)
+      log.info(`${request.method} ${url.pathname}`, { cpuMs: parseFloat(cpuTime.toFixed(2)), path: url.pathname, user })
       if (response) return response
     }
 
@@ -234,7 +238,7 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
 
       if (response) {
         const cpuTime = performance.now() - startTime
-        console.log(`[CPU:${cpuTime.toFixed(2)}ms] ${request.method} ${url.pathname} (${user})`)
+        log.info(`${request.method} ${url.pathname}`, { cpuMs: parseFloat(cpuTime.toFixed(2)), path: url.pathname, user })
         return response
       }
     }
@@ -243,15 +247,25 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname === '/benchmark' && request.method === 'GET') {
       const response = await handleBenchmark(request, env)
       const cpuTime = performance.now() - startTime
-      console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /benchmark (${user})`)
+      log.info('GET /benchmark', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/benchmark', user })
       return response
+    }
+
+    // Shard management API
+    if (url.pathname.startsWith('/shards')) {
+      const response = await handleShardRoutes(request, env, url)
+      if (response) {
+        const cpuTime = performance.now() - startTime
+        log.info(`${request.method} ${url.pathname}`, { cpuMs: parseFloat(cpuTime.toFixed(2)), path: url.pathname, user })
+        return response
+      }
     }
 
     // Admin dashboard
     const dashboardResponse = await handleDashboard(request, env, url)
     if (dashboardResponse) {
       const cpuTime = performance.now() - startTime
-      console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /dashboard (${user})`)
+      log.info('GET /dashboard', { cpuMs: parseFloat(cpuTime.toFixed(2)), path: '/dashboard', user })
       return dashboardResponse
     }
   }

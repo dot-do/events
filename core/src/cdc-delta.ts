@@ -14,30 +14,17 @@
 import { parquetReadObjects } from 'hyparquet'
 import { parquetWriteBuffer } from '@dotdo/hyparquet-writer'
 import { createAsyncBuffer } from './async-buffer.js'
+import type { CollectionChangeEvent } from './types.js'
 
 // ============================================================================
 // Types
 // ============================================================================
 
 /**
- * CDC Event from the emitter (matches CollectionChangeEvent)
+ * CDC Event from the emitter - alias for CollectionChangeEvent
+ * This ensures type compatibility and enables proper type narrowing
  */
-export interface CDCEvent {
-  type: 'collection.insert' | 'collection.update' | 'collection.delete'
-  collection: string
-  docId: string
-  doc?: Record<string, unknown>
-  prev?: Record<string, unknown>
-  bookmark?: string
-  ts: string
-  do: {
-    id: string
-    name?: string
-    class?: string
-    colo?: string
-    worker?: string
-  }
-}
+export type CDCEvent = CollectionChangeEvent
 
 /**
  * Delta record for Parquet storage

@@ -270,6 +270,135 @@ export function createMockEmitter() {
 }
 
 // ============================================================================
+// Queue Mocks
+// ============================================================================
+
+export interface MockQueueMessage<T = unknown> {
+  body: T
+  contentType?: string
+  delaySeconds?: number
+}
+
+export interface MockQueueOptions {
+  /** Throw this error on send() */
+  sendError?: Error
+  /** Throw this error on sendBatch() */
+  sendBatchError?: Error
+  /** Throw errors after this many successful sends */
+  failAfter?: number
+}
+
+/**
+ * Creates a mock WorkerQueue for testing queue producers
+ *
+ * @example
+ * ```ts
+ * const queue = createMockQueue<MyEventType>()
+ *
+ * // Use in your code
+ * await queue.send({ type: 'test', data: 123 })
+ * await queue.sendBatch([
+ *   { body: { type: 'batch1' } },
+ *   { body: { type: 'batch2' }, delaySeconds: 60 }
+ * ])
+ *
+ * // Assert on sent messages
+ * expect(queue.messages).toHaveLength(3)
+ * expect(queue.messages[0].body).toEqual({ type: 'test', data: 123 })
+ *
+ * // Check batch-specific metadata
+ * expect(queue.messages[2].delaySeconds).toBe(60)
+ *
+ * // Test error handling
+ * const failingQueue = createMockQueue({ sendError: new Error('Queue full') })
+ * await expect(failingQueue.send({ test: 1 })).rejects.toThrow('Queue full')
+ * ```
+ */
+export function createMockQueue<T = unknown>(options: MockQueueOptions = {}) {
+  const messages: MockQueueMessage<T>[] = []
+  let sendCount = 0
+
+  const checkError = (errorType: 'send' | 'sendBatch') => {
+    // If failAfter is set, only throw after that many successful sends
+    if (options.failAfter !== undefined) {
+      if (sendCount >= options.failAfter) {
+        const error = errorType === 'send' ? options.sendError : options.sendBatchError
+        throw error ?? new Error(`Mock queue error after ${options.failAfter} sends`)
+      }
+      // If failAfter is set but threshold not reached, don't throw
+      return
+    }
+    // If no failAfter, always throw if error is configured
+    if (errorType === 'send' && options.sendError) {
+      throw options.sendError
+    }
+    if (errorType === 'sendBatch' && options.sendBatchError) {
+      throw options.sendBatchError
+    }
+  }
+
+  return {
+    /** All messages sent to this queue (both send() and sendBatch()) */
+    messages,
+
+    /** Mock send() function */
+    send: vi.fn(async (body: T, sendOptions?: { contentType?: string; delaySeconds?: number }) => {
+      checkError('send')
+      messages.push({
+        body,
+        contentType: sendOptions?.contentType,
+        delaySeconds: sendOptions?.delaySeconds,
+      })
+      sendCount++
+    }),
+
+    /** Mock sendBatch() function */
+    sendBatch: vi.fn(async (batch: Iterable<{ body: T; contentType?: string; delaySeconds?: number }>) => {
+      checkError('sendBatch')
+      for (const item of batch) {
+        messages.push({
+          body: item.body,
+          contentType: item.contentType,
+          delaySeconds: item.delaySeconds,
+        })
+        sendCount++
+      }
+    }),
+
+    /** Clear all messages (useful between tests) */
+    clear: () => {
+      messages.length = 0
+      sendCount = 0
+    },
+
+    /** Get the number of send/sendBatch calls */
+    get sendCount() {
+      return sendCount
+    },
+
+    /** Configure error injection dynamically */
+    injectError: (error: Error, opts?: { failAfter?: number; sendBatchOnly?: boolean }) => {
+      if (opts?.sendBatchOnly) {
+        ;(options as any).sendBatchError = error
+      } else {
+        ;(options as any).sendError = error
+        ;(options as any).sendBatchError = error
+      }
+      if (opts?.failAfter !== undefined) {
+        ;(options as any).failAfter = opts.failAfter
+      }
+    },
+  } as Queue<T> & {
+    messages: MockQueueMessage<T>[]
+    clear: () => void
+    sendCount: number
+    injectError: (error: Error, options?: { failAfter?: number; sendBatchOnly?: boolean }) => void
+    send: ReturnType<typeof vi.fn>
+    sendBatch: ReturnType<typeof vi.fn>
+  }
+}
+
+// ============================================================================
 // Fetch Mock Helper
 // ============================================================================
 

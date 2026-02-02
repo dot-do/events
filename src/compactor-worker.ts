@@ -114,7 +114,10 @@ export default {
       if (day) {
         // Compact entire day
         const [year, month, dayNum] = day.split('/').map(Number)
-        const date = new Date(Date.UTC(year!, (month ?? 1) - 1, dayNum))
+        if (year === undefined || isNaN(year)) {
+          return Response.json({ error: 'Invalid day format: year missing' }, { status: 400, headers: corsHeaders() })
+        }
+        const date = new Date(Date.UTC(year, (month ?? 1) - 1, dayNum))
         const result = await compactDay(env, date)
         return Response.json(result, { headers: corsHeaders() })
       }
