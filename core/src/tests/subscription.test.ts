@@ -958,18 +958,21 @@ describe('Batched Delivery Logic', () => {
     const MAX_BATCH_DELIVERY_SIZE = 1000
     const MAX_BATCH_DELIVERY_WINDOW_MS = 10000
 
-    function validateBatchConfig(config: {
+    /**
+     * Validates batch config at subscription creation time.
+     * Mirrors the validation logic in SubscriptionDO.subscribe().
+     * Validates batchSize and batchWindowMs regardless of enabled state
+     * to ensure we never store invalid values in the database.
+     */
+    function validateBatchConfigAtCreation(config?: {
       enabled: boolean
       batchSize?: number
       batchWindowMs?: number
     }): { ok: true } | { ok: false; error: string } {
-      if (!config.enabled) {
-        return { ok: true }
-      }
+      const batchSize = config?.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
+      const batchWindowMs = config?.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
 
-      const batchSize = config.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
-      const batchWindowMs = config.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
-
+      // Always validate - even when disabled, we don't want invalid values stored
       if (batchSize < 1 || batchSize > MAX_BATCH_DELIVERY_SIZE) {
         return { ok: false, error: `batchSize must be between 1 and ${MAX_BATCH_DELIVERY_SIZE}` }
       }
@@ -981,56 +984,192 @@ describe('Batched Delivery Logic', () => {
       return { ok: true }
     }
 
-    it('accepts disabled batch config', () => {
-      expect(validateBatchConfig({ enabled: false })).toEqual({ ok: true })
-    })
+    /**
+     * Validates batch config at subscription update time.
+     * Mirrors the validation logic in SubscriptionDO.updateSubscription().
+     * Only validates values that are explicitly provided.
+     */
+    function validateBatchConfigAtUpdate(config?: {
+      enabled: boolean
+      batchSize?: number
+      batchWindowMs?: number
+    }): { ok: true } | { ok: false; error: string } {
+      if (config === undefined) {
+        return { ok: true }
+      }
 
-    it('accepts valid enabled batch config', () => {
-      expect(validateBatchConfig({
-        enabled: true,
-        batchSize: 50,
-        batchWindowMs: 2000,
-      })).toEqual({ ok: true })
-    })
+      if (config.batchSize !== undefined) {
+        if (config.batchSize < 1 || config.batchSize > MAX_BATCH_DELIVERY_SIZE) {
+          return { ok: false, error: `batchSize must be between 1 and ${MAX_BATCH_DELIVERY_SIZE}` }
+        }
+      }
 
-    it('uses defaults when values not provided', () => {
-      expect(validateBatchConfig({ enabled: true })).toEqual({ ok: true })
-    })
+      if (config.batchWindowMs !== undefined) {
+        if (config.batchWindowMs < 1 || config.batchWindowMs > MAX_BATCH_DELIVERY_WINDOW_MS) {
+          return { ok: false, error: `batchWindowMs must be between 1 and ${MAX_BATCH_DELIVERY_WINDOW_MS}` }
+        }
+      }
 
-    it('rejects batchSize of 0', () => {
-      const result = validateBatchConfig({
-        enabled: true,
-        batchSize: 0,
+      return { ok: true }
+    }
+
+    describe('at subscription creation', () => {
+      it('accepts config with no batchConfig (uses defaults)', () => {
+        expect(validateBatchConfigAtCreation()).toEqual({ ok: true })
       })
-      expect(result.ok).toBe(false)
-      expect((result as { ok: false; error: string }).error).toContain('batchSize')
+
+      it('accepts disabled batch config with valid values', () => {
+        expect(validateBatchConfigAtCreation({ enabled: false, batchSize: 50 })).toEqual({ ok: true })
+      })
+
+      it('accepts valid enabled batch config', () => {
+        expect(validateBatchConfigAtCreation({
+          enabled: true,
+          batchSize: 50,
+          batchWindowMs: 2000,
+        })).toEqual({ ok: true })
+      })
+
+      it('uses defaults when values not provided', () => {
+        expect(validateBatchConfigAtCreation({ enabled: true })).toEqual({ ok: true })
+      })
+
+      it('rejects batchSize of 0 even when disabled', () => {
+        const result = validateBatchConfigAtCreation({
+          enabled: false,
+          batchSize: 0,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchSize')
+      })
+
+      it('rejects batchSize of 0 when enabled', () => {
+        const result = validateBatchConfigAtCreation({
+          enabled: true,
+          batchSize: 0,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchSize')
+      })
+
+      it('rejects negative batchSize', () => {
+        const result = validateBatchConfigAtCreation({
+          enabled: true,
+          batchSize: -1,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchSize')
+      })
+
+      it('rejects batchSize exceeding max', () => {
+        const result = validateBatchConfigAtCreation({
+          enabled: true,
+          batchSize: 1001,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchSize')
+      })
+
+      it('accepts batchSize at boundary (1)', () => {
+        expect(validateBatchConfigAtCreation({
+          enabled: true,
+          batchSize: 1,
+        })).toEqual({ ok: true })
+      })
+
+      it('accepts batchSize at boundary (max)', () => {
+        expect(validateBatchConfigAtCreation({
+          enabled: true,
+          batchSize: MAX_BATCH_DELIVERY_SIZE,
+        })).toEqual({ ok: true })
+      })
+
+      it('rejects batchWindowMs of 0 even when disabled', () => {
+        const result = validateBatchConfigAtCreation({
+          enabled: false,
+          batchWindowMs: 0,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchWindowMs')
+      })
+
+      it('rejects batchWindowMs of 0 when enabled', () => {
+        const result = validateBatchConfigAtCreation({
+          enabled: true,
+          batchWindowMs: 0,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchWindowMs')
+      })
+
+      it('rejects negative batchWindowMs', () => {
+        const result = validateBatchConfigAtCreation({
+          enabled: true,
+          batchWindowMs: -100,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchWindowMs')
+      })
+
+      it('rejects batchWindowMs exceeding max', () => {
+        const result = validateBatchConfigAtCreation({
+          enabled: true,
+          batchWindowMs: 10001,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchWindowMs')
+      })
+
+      it('accepts batchWindowMs at boundary (1)', () => {
+        expect(validateBatchConfigAtCreation({
+          enabled: true,
+          batchWindowMs: 1,
+        })).toEqual({ ok: true })
+      })
+
+      it('accepts batchWindowMs at boundary (max)', () => {
+        expect(validateBatchConfigAtCreation({
+          enabled: true,
+          batchWindowMs: MAX_BATCH_DELIVERY_WINDOW_MS,
+        })).toEqual({ ok: true })
+      })
     })
 
-    it('rejects batchSize exceeding max', () => {
-      const result = validateBatchConfig({
-        enabled: true,
-        batchSize: 1001,
+    describe('at subscription update', () => {
+      it('accepts update with no batchConfig', () => {
+        expect(validateBatchConfigAtUpdate()).toEqual({ ok: true })
       })
-      expect(result.ok).toBe(false)
-      expect((result as { ok: false; error: string }).error).toContain('batchSize')
-    })
 
-    it('rejects batchWindowMs of 0', () => {
-      const result = validateBatchConfig({
-        enabled: true,
-        batchWindowMs: 0,
+      it('accepts update with enabled only (no size/window)', () => {
+        expect(validateBatchConfigAtUpdate({ enabled: true })).toEqual({ ok: true })
       })
-      expect(result.ok).toBe(false)
-      expect((result as { ok: false; error: string }).error).toContain('batchWindowMs')
-    })
 
-    it('rejects batchWindowMs exceeding max', () => {
-      const result = validateBatchConfig({
-        enabled: true,
-        batchWindowMs: 10001,
+      it('rejects invalid batchSize in update even when disabled', () => {
+        const result = validateBatchConfigAtUpdate({
+          enabled: false,
+          batchSize: 0,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchSize')
       })
-      expect(result.ok).toBe(false)
-      expect((result as { ok: false; error: string }).error).toContain('batchWindowMs')
+
+      it('rejects negative batchSize in update', () => {
+        const result = validateBatchConfigAtUpdate({
+          enabled: true,
+          batchSize: -5,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchSize')
+      })
+
+      it('rejects invalid batchWindowMs in update even when disabled', () => {
+        const result = validateBatchConfigAtUpdate({
+          enabled: false,
+          batchWindowMs: -1,
+        })
+        expect(result.ok).toBe(false)
+        expect((result as { ok: false; error: string }).error).toContain('batchWindowMs')
+      })
     })
   })
 

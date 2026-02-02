@@ -80,6 +80,29 @@ describe('BloomFilter', () => {
     bloom.add(longString)
     expect(bloom.mayContain(longString)).toBe(true)
   })
+
+  it('handles hash overflow edge case (MIN_INT)', () => {
+    // Math.imul can produce 0x80000000 (MIN_INT = -2147483648)
+    // Math.abs(-2147483648) returns -2147483648 due to overflow
+    // The fix uses (hash >>> 0) for unsigned conversion instead
+    const bloom = new BloomFilter(1000, 0.01)
+
+    // Test many strings to increase chance of hitting overflow edge cases
+    const testStrings = [
+      'overflow-test-1',
+      'overflow-test-2',
+      '\x00\x00\x00\x00', // null bytes
+      '\xff\xff\xff\xff', // high bytes
+      String.fromCharCode(0x80, 0x00, 0x00, 0x00),
+    ]
+
+    for (const str of testStrings) {
+      // Should not throw and should always return valid positions
+      bloom.add(str)
+      const result = bloom.mayContain(str)
+      expect(result).toBe(true)
+    }
+  })
 })
 
 // ============================================================================

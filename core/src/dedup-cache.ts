@@ -34,7 +34,7 @@ export class BloomFilter {
       hash ^= str.charCodeAt(i)
       hash = Math.imul(hash, 16777619)
     }
-    return Math.abs(hash) % this.size
+    return (hash >>> 0) % this.size
   }
 
   add(item: string): void {

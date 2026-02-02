@@ -11,6 +11,7 @@ import {
   DEFAULT_MAX_RETRY_QUEUE_SIZE,
   DEFAULT_MAX_CONSECUTIVE_FAILURES,
   DEFAULT_CIRCUIT_BREAKER_RESET_MS,
+  DEFAULT_FETCH_TIMEOUT_MS,
   RETRY_BASE_DELAY_MS,
   RETRY_MAX_DELAY_MS,
   RETRY_JITTER_MS,
@@ -35,6 +36,38 @@ interface CircuitBreakerState {
   openedAt?: string | undefined
   /** Whether circuit breaker is currently open */
   isOpen: boolean
+}
+
+/**
+ * Fetch with timeout using AbortController
+ * @param url - The URL to fetch
+ * @param options - Fetch options (RequestInit)
+ * @param timeoutMs - Timeout in milliseconds (default: 30000)
+ * @returns Promise<Response>
+ * @throws Error when request times out or fetch fails
+ */
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    })
+    return response
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms`)
+    }
+    throw error
+  } finally {
+    clearTimeout(timeoutId)
+  }
 }
 
 /**
@@ -90,6 +123,7 @@ export class EventEmitter {
       maxRetryQueueSize: options.maxRetryQueueSize ?? DEFAULT_MAX_RETRY_QUEUE_SIZE,
       maxConsecutiveFailures: options.maxConsecutiveFailures ?? DEFAULT_MAX_CONSECUTIVE_FAILURES,
       circuitBreakerResetMs: options.circuitBreakerResetMs ?? DEFAULT_CIRCUIT_BREAKER_RESET_MS,
+      fetchTimeoutMs: options.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
     }
 
     // Identity will be enriched on first request
@@ -99,7 +133,9 @@ export class EventEmitter {
     }
 
     // Restore any pending batch from storage (for hibernation recovery)
-    this.restoreBatch()
+    this.restoreBatch().catch((error) => {
+      console.error('[events] Failed to restore batch from storage:', error instanceof Error ? error.message : error)
+    })
   }
 
   /**
@@ -151,10 +187,16 @@ export class EventEmitter {
 
     // Auto-flush on batch size
     if (this.batch.length >= this.options.batchSize) {
-      this.flush()
+      this.flush().catch((error) => {
+        console.error('[events] Failed to flush events:', error instanceof Error ? error.message : error)
+      })
     } else if (!this.flushTimeout) {
       // Schedule flush
-      this.flushTimeout = setTimeout(() => this.flush(), this.options.flushIntervalMs)
+      this.flushTimeout = setTimeout(() => {
+        this.flush().catch((error) => {
+          console.error('[events] Failed to flush events:', error instanceof Error ? error.message : error)
+        })
+      }, this.options.flushIntervalMs)
     }
   }
 
@@ -201,7 +243,9 @@ export class EventEmitter {
 
     // Capture SQLite bookmark for PITR (async, but we emit without waiting)
     // The bookmark is optional - if we can't get it, we still emit the event
-    this.getBookmarkAndEmit(type, collection, docId, doc, prev)
+    this.getBookmarkAndEmit(type, collection, docId, doc, prev).catch((error) => {
+      console.error('[events] Failed to emit CDC event:', error instanceof Error ? error.message : error)
+    })
   }
 
   /**
@@ -260,12 +304,16 @@ export class EventEmitter {
         headers['Authorization'] = `Bearer ${this.options.apiKey}`
       }
 
-      // Send to events endpoint
-      const response = await fetch(this.options.endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ events } satisfies EventBatch),
-      })
+      // Send to events endpoint with timeout
+      const response = await fetchWithTimeout(
+        this.options.endpoint,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ events } satisfies EventBatch),
+        },
+        this.options.fetchTimeoutMs
+      )
 
       if (!response.ok) {
         throw new Error(`Event flush failed: ${response.status}`)
@@ -418,11 +466,15 @@ export class EventEmitter {
         headers['Authorization'] = `Bearer ${this.options.apiKey}`
       }
 
-      const response = await fetch(this.options.endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ events } satisfies EventBatch),
-      })
+      const response = await fetchWithTimeout(
+        this.options.endpoint,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ events } satisfies EventBatch),
+        },
+        this.options.fetchTimeoutMs
+      )
 
       if (response.ok) {
         await this.ctx.storage.delete(STORAGE_KEY_RETRY)

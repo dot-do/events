@@ -332,11 +332,19 @@ export async function processSubscriptionFanout(
 /**
  * Execute direct fanout for CDC and subscriptions.
  * Called in the background via ctx.waitUntil when queue fanout is disabled.
+ *
+ * IMPORTANT: This function and executeQueueFanout are MUTUALLY EXCLUSIVE.
+ * The caller MUST ensure only one path is executed per ingest request.
  */
 export async function executeDirectFanout(context: IngestContext): Promise<void> {
   const { batch, tenant, env } = context
 
-  logger.info('Starting DIRECT fanout', { component: 'fanout', eventCount: batch!.events.length })
+  logger.info('executeDirectFanout called - processing CDC and subscriptions synchronously', {
+    component: 'fanout',
+    mode: 'DIRECT',
+    eventCount: batch!.events.length,
+    namespace: tenant.namespace,
+  })
 
   try {
     await Promise.all([
@@ -354,8 +362,22 @@ export async function executeDirectFanout(context: IngestContext): Promise<void>
 /**
  * Execute queue-based fanout.
  * Called in the background via ctx.waitUntil when queue fanout is enabled.
+ *
+ * IMPORTANT: This function and executeDirectFanout are MUTUALLY EXCLUSIVE.
+ * The caller MUST ensure only one path is executed per ingest request.
  */
 export async function executeQueueFanout(context: IngestContext): Promise<void> {
-  const { batch, env } = context
+  const { batch, tenant, env } = context
+  logger.info('executeQueueFanout called - sending to queue for async processing', {
+    component: 'fanout',
+    mode: 'QUEUE',
+    eventCount: batch!.events.length,
+    namespace: tenant.namespace,
+  })
   await sendToQueue(env, batch!)
+  logger.info('executeQueueFanout completed - events queued successfully', {
+    component: 'fanout',
+    mode: 'QUEUE',
+    eventCount: batch!.events.length,
+  })
 }

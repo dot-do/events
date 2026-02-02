@@ -251,6 +251,8 @@ export interface EventEmitterOptions {
   maxConsecutiveFailures?: number | undefined
   /** Circuit breaker reset timeout in ms (default: 300000 = 5 minutes) */
   circuitBreakerResetMs?: number | undefined
+  /** Fetch timeout in ms for event delivery (default: 30000 = 30 seconds) */
+  fetchTimeoutMs?: number | undefined
 }
 
 /** Error thrown when the retry buffer is full and backpressure is needed */

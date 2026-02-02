@@ -222,17 +222,26 @@ export async function handleIngest(
       // Write dedup marker if batchId was provided
       await writeDedupMarker(context)
 
-      // MUTUAL EXCLUSION: Only send to queue if queue fanout is enabled
+      // MUTUAL EXCLUSION: Execute exactly one fanout path
+      // Queue and direct fanout are mutually exclusive - never both
       if (useQueueFanout) {
+        log.info('Executing QUEUE fanout path', {
+          eventCount: records.length,
+          namespace: tenant.namespace,
+        })
         await executeQueueFanout(context)
+        // Explicit return - do NOT fall through to direct fanout
+        return
       }
+
+      // Direct fanout path - only reached if queue fanout is disabled
+      log.info('Executing DIRECT fanout path', {
+        eventCount: records.length,
+        namespace: tenant.namespace,
+      })
+      await executeDirectFanout(context)
     })()
   )
-
-  // MUTUAL EXCLUSION: Only do direct fanout if queue fanout is NOT enabled
-  if (!useQueueFanout) {
-    ctx.waitUntil(executeDirectFanout(context))
-  }
 
   // Record successful ingest metric
   const elapsedMs = timer.elapsed()

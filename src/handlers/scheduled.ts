@@ -8,16 +8,18 @@
  *
  * Tasks:
  * 1. Dedup Cleanup: Deletes dedup markers older than 24 hours (hourly)
- * 2. CDC Compaction: Compacts delta files for collections with pending deltas (hourly)
- * 3. Event Stream Compaction: Compacts hourly Parquet files into daily files (daily at 1:30 UTC)
- * 4. Dead Letter Cleanup: Prunes R2 dead-letter messages older than 30 days (daily at 2:30 UTC)
- * 5. Subscription Dead Letter Cleanup: Triggers cleanup of old dead letters in SubscriptionDO shards (daily at 3:30 UTC)
- * 6. Reconciliation: Detects and repairs missed event deliveries (daily at 4:30 UTC)
+ * 2. CDC Compaction: Compacts delta files for collections with pending deltas (daily at 2:30 UTC)
+ * 3. Event Stream Compaction: Compacts hourly Parquet files into daily files (hourly)
+ * 4. Dead Letter Cleanup: Prunes R2 dead-letter messages older than 30 days (daily at 4:30 UTC)
+ * 5. Subscription Dead Letter Cleanup: Triggers cleanup of old dead letters in SubscriptionDO shards (daily at 5:30 UTC)
+ * 6. Reconciliation: Detects and repairs missed event deliveries (daily at 6:30 UTC)
+ * 7. PITR Snapshots: Creates weekly snapshots on Sundays at 3:30 UTC
  */
 
 import type { Env } from '../env'
 import { compactCollection } from '../../core/src/cdc-compaction'
 import { compactEventStream } from '../../core/src/event-compaction'
+import { createSnapshot as createCDCSnapshot, cleanupSnapshots } from '../../core/src/cdc-snapshot'
 import { withSchedulerLock } from '../scheduler-lock'
 import { KNOWN_SUBSCRIPTION_SHARDS } from '../subscription-routes'
 import { createLogger, logError, generateCorrelationId, type Logger } from '../logger'
@@ -69,9 +71,15 @@ async function cleanupDedupMarkers(env: Env, log: Logger): Promise<void> {
 }
 
 /**
- * Task 2: CDC Compaction
+ * Task 2: CDC Compaction (daily at 2:30 UTC only)
+ * Compacts CDC delta files into data.parquet for all collections.
  */
 async function runCDCCompaction(env: Env, log: Logger): Promise<void> {
+  const currentHour = new Date().getUTCHours()
+  if (currentHour !== 2) {
+    return
+  }
+
   try {
     log.info('Starting CDC compaction')
 
@@ -190,16 +198,11 @@ async function runCDCCompaction(env: Env, log: Logger): Promise<void> {
 }
 
 /**
- * Task 3: Event Stream Compaction (daily at 1:30 UTC only)
+ * Task 3: Event Stream Compaction (hourly)
  * Compacts hourly Parquet files from EventWriterDO into daily files.
- * Only runs at 1:30 UTC to avoid compacting files still being written.
+ * Runs every hour to keep event files consolidated.
  */
 async function runEventStreamCompaction(env: Env, log: Logger): Promise<void> {
-  const currentHour = new Date().getUTCHours()
-  if (currentHour !== 1) {
-    return
-  }
-
   try {
     log.info('Starting event stream compaction')
 
@@ -225,13 +228,13 @@ async function runEventStreamCompaction(env: Env, log: Logger): Promise<void> {
 }
 
 /**
- * Task 4: Dead Letter Cleanup (daily at 2:30 UTC only)
+ * Task 4: Dead Letter Cleanup (daily at 4:30 UTC only)
  * Prunes R2 dead-letter messages older than 30 days.
  * Dead letters are stored in: dead-letter/queue/{date}/{id}.json
  */
 async function cleanupDeadLetters(env: Env, log: Logger): Promise<void> {
   const currentHour = new Date().getUTCHours()
-  if (currentHour !== 2) {
+  if (currentHour !== 4) {
     return
   }
 
@@ -271,13 +274,13 @@ async function cleanupDeadLetters(env: Env, log: Logger): Promise<void> {
 }
 
 /**
- * Task 5: Subscription Dead Letter Cleanup (daily at 3:30 UTC only)
+ * Task 5: Subscription Dead Letter Cleanup (daily at 5:30 UTC only)
  * Triggers cleanup of old dead letters and delivery logs in all SubscriptionDO shards.
  * This helps prevent unbounded growth of the SQLite tables in each shard.
  */
 async function cleanupSubscriptionDeadLetters(env: Env, log: Logger): Promise<void> {
   const currentHour = new Date().getUTCHours()
-  if (currentHour !== 3) {
+  if (currentHour !== 5) {
     return
   }
 
@@ -331,7 +334,7 @@ async function cleanupSubscriptionDeadLetters(env: Env, log: Logger): Promise<vo
 }
 
 /**
- * Task 6: Reconciliation Job (daily at 4:30 UTC only)
+ * Task 6: Reconciliation Job (daily at 6:30 UTC only)
  * Detects and repairs missed event deliveries by comparing R2 event files
  * against delivery records in SubscriptionDO.
  *
@@ -341,7 +344,7 @@ async function cleanupSubscriptionDeadLetters(env: Env, log: Logger): Promise<vo
  */
 async function runReconciliationJob(env: Env, log: Logger): Promise<void> {
   const currentHour = new Date().getUTCHours()
-  if (currentHour !== 4) {
+  if (currentHour !== 6) {
     return
   }
 
@@ -374,14 +377,126 @@ async function runReconciliationJob(env: Env, log: Logger): Promise<void> {
 }
 
 /**
+ * Task 7: PITR Snapshots (weekly on Sundays at 3:30 UTC)
+ * Creates point-in-time recovery snapshots for all collections.
+ * Weekly snapshots provide restore points for disaster recovery.
+ */
+async function runPITRSnapshots(env: Env, log: Logger): Promise<void> {
+  const now = new Date()
+  const currentHour = now.getUTCHours()
+  const currentDay = now.getUTCDay() // 0 = Sunday
+
+  // Only run on Sundays at 3am UTC
+  if (currentDay !== 0 || currentHour !== 3) {
+    return
+  }
+
+  try {
+    log.info('Starting PITR snapshot creation')
+
+    // Discover namespaces by scanning R2 for cdc prefixes
+    const namespaces = new Set<string>()
+
+    // Scan R2 for existing CDC namespaces (format: cdc/{namespace}/{table}/...)
+    let cdcCursor: string | undefined
+    do {
+      const list = await env.EVENTS_BUCKET.list({
+        prefix: 'cdc/',
+        delimiter: '/',
+        ...(cdcCursor !== undefined ? { cursor: cdcCursor } : {}),
+      })
+
+      // Extract namespace from common prefixes (format: cdc/{namespace}/)
+      for (const prefix of list.delimitedPrefixes || []) {
+        const parts = prefix.split('/')
+        if (parts.length >= 2 && parts[1]) {
+          namespaces.add(parts[1])
+        }
+      }
+
+      cdcCursor = list.truncated ? list.cursor : undefined
+    } while (cdcCursor)
+
+    const namespaceList = [...namespaces]
+    log.info('Found namespaces for PITR snapshots', { count: namespaceList.length })
+
+    let totalSnapshots = 0
+    let totalSkipped = 0
+    let totalErrors = 0
+
+    // For each namespace, get tables and create snapshots
+    for (const ns of namespaceList) {
+      // Discover tables by scanning R2 for this namespace
+      const tables = new Set<string>()
+      let tableCursor: string | undefined
+      do {
+        const list = await env.EVENTS_BUCKET.list({
+          prefix: `cdc/${ns}/`,
+          delimiter: '/',
+          ...(tableCursor !== undefined ? { cursor: tableCursor } : {}),
+        })
+
+        // Extract table names from common prefixes (format: cdc/{namespace}/{table}/)
+        for (const prefix of list.delimitedPrefixes || []) {
+          const parts = prefix.split('/')
+          if (parts.length >= 3 && parts[2]) {
+            tables.add(parts[2])
+          }
+        }
+
+        tableCursor = list.truncated ? list.cursor : undefined
+      } while (tableCursor)
+
+      for (const table of tables) {
+        try {
+          // Create daily snapshot (which is used for PITR)
+          const result = await createCDCSnapshot(env.EVENTS_BUCKET, ns, table, 'daily')
+
+          if (result.skipped) {
+            totalSkipped++
+            log.debug('PITR snapshot skipped', { namespace: ns, table, reason: result.reason })
+          } else {
+            totalSnapshots++
+            log.info('PITR snapshot created', {
+              namespace: ns,
+              table,
+              rowCount: result.rowCount,
+              sizeBytes: result.sizeBytes,
+            })
+          }
+
+          // Cleanup old snapshots (retain 7 daily, 3 monthly)
+          await cleanupSnapshots(env.EVENTS_BUCKET, ns, table, {
+            dailySnapshots: 7,
+            monthlySnapshots: 3,
+          })
+        } catch (err) {
+          totalErrors++
+          logError(log, 'Error creating PITR snapshot', err, { namespace: ns, table })
+        }
+      }
+    }
+
+    log.info('PITR snapshot creation completed', {
+      created: totalSnapshots,
+      skipped: totalSkipped,
+      errors: totalErrors,
+    })
+  } catch (err) {
+    logError(log, 'Error during PITR snapshot creation', err)
+  }
+}
+
+/**
  * Scheduled handler - runs all cleanup and compaction tasks.
  * Tasks are scheduled at different hours to spread load:
  * - Dedup cleanup: every hour
- * - CDC compaction: every hour
- * - Event stream compaction: 1:30 UTC daily
- * - Dead letter cleanup: 2:30 UTC daily
- * - Subscription dead letter cleanup: 3:30 UTC daily
- * - Reconciliation: 4:30 UTC daily
+ * - CDC compaction: 2:30 UTC daily
+ * - Event stream compaction: every hour
+ * - PITR snapshots: 3:30 UTC Sundays
+ * - Dead letter cleanup: 4:30 UTC daily
+ * - Subscription dead letter cleanup: 5:30 UTC daily
+ * - Reconciliation: 6:30 UTC daily
  */
 export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
   const startTime = Date.now()
@@ -399,20 +514,23 @@ export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: Exec
         // Task 1: Dedup marker cleanup (hourly)
         await cleanupDedupMarkers(env, log)
 
-        // Task 2: CDC Compaction (hourly)
+        // Task 2: CDC Compaction (only at 2:30 UTC)
         await runCDCCompaction(env, log)
 
-        // Task 3: Event Stream Compaction (only at 1:30 UTC)
+        // Task 3: Event Stream Compaction (hourly)
         await runEventStreamCompaction(env, log)
 
-        // Task 4: Dead Letter Cleanup (only at 2:30 UTC)
+        // Task 4: Dead Letter Cleanup (only at 4:30 UTC)
         await cleanupDeadLetters(env, log)
 
-        // Task 5: Subscription Dead Letter Cleanup (only at 3:30 UTC)
+        // Task 5: Subscription Dead Letter Cleanup (only at 5:30 UTC)
         await cleanupSubscriptionDeadLetters(env, log)
 
-        // Task 6: Reconciliation Job (only at 4:30 UTC)
+        // Task 6: Reconciliation Job (only at 6:30 UTC)
         await runReconciliationJob(env, log)
+
+        // Task 7: PITR Snapshots (only on Sundays at 3:30 UTC)
+        await runPITRSnapshots(env, log)
 
         const durationMs = Date.now() - startTime
         log.info('All scheduled tasks completed', { durationMs })

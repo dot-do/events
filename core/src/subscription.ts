@@ -368,26 +368,23 @@ export class SubscriptionDO extends DurableObject<Env> {
       return { ok: false, error: `Invalid rpcMethod: ${rpcMethodValidation.error}` }
     }
 
-    // Validate batch config if provided
-    if (params.batchConfig?.enabled) {
-      const batchSize = params.batchConfig.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
-      const batchWindowMs = params.batchConfig.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
+    // Validate batch config if provided - validate values even when disabled
+    // to ensure we never store invalid values in the database
+    const batchEnabled = params.batchConfig?.enabled ?? false
+    const batchSize = params.batchConfig?.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
+    const batchWindowMs = params.batchConfig?.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
 
-      if (batchSize < 1 || batchSize > MAX_BATCH_DELIVERY_SIZE) {
-        return { ok: false, error: `batchSize must be between 1 and ${MAX_BATCH_DELIVERY_SIZE}` }
-      }
-      if (batchWindowMs < 1 || batchWindowMs > MAX_BATCH_DELIVERY_WINDOW_MS) {
-        return { ok: false, error: `batchWindowMs must be between 1 and ${MAX_BATCH_DELIVERY_WINDOW_MS}` }
-      }
+    // Always validate batchSize and batchWindowMs if explicitly provided
+    if (batchSize < 1 || batchSize > MAX_BATCH_DELIVERY_SIZE) {
+      return { ok: false, error: `batchSize must be between 1 and ${MAX_BATCH_DELIVERY_SIZE}` }
+    }
+    if (batchWindowMs < 1 || batchWindowMs > MAX_BATCH_DELIVERY_WINDOW_MS) {
+      return { ok: false, error: `batchWindowMs must be between 1 and ${MAX_BATCH_DELIVERY_WINDOW_MS}` }
     }
 
     const patternPrefix = extractPatternPrefix(params.pattern)
     const id = ulid()
     const now = Date.now()
-
-    const batchEnabled = params.batchConfig?.enabled ?? false
-    const batchSize = params.batchConfig?.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
-    const batchWindowMs = params.batchConfig?.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
 
     try {
       this.sql.exec(
@@ -526,16 +523,18 @@ export class SubscriptionDO extends DurableObject<Env> {
       }
     }
 
-    // Validate batch config if provided
-    if (updates.batchConfig?.enabled) {
-      const batchSize = updates.batchConfig.batchSize ?? DEFAULT_BATCH_DELIVERY_SIZE
-      const batchWindowMs = updates.batchConfig.batchWindowMs ?? DEFAULT_BATCH_DELIVERY_WINDOW_MS
-
-      if (batchSize < 1 || batchSize > MAX_BATCH_DELIVERY_SIZE) {
-        return { ok: false, error: `batchSize must be between 1 and ${MAX_BATCH_DELIVERY_SIZE}` }
+    // Validate batch config if provided - validate values even when disabled
+    // to ensure we never store invalid values in the database
+    if (updates.batchConfig !== undefined) {
+      if (updates.batchConfig.batchSize !== undefined) {
+        if (updates.batchConfig.batchSize < 1 || updates.batchConfig.batchSize > MAX_BATCH_DELIVERY_SIZE) {
+          return { ok: false, error: `batchSize must be between 1 and ${MAX_BATCH_DELIVERY_SIZE}` }
+        }
       }
-      if (batchWindowMs < 1 || batchWindowMs > MAX_BATCH_DELIVERY_WINDOW_MS) {
-        return { ok: false, error: `batchWindowMs must be between 1 and ${MAX_BATCH_DELIVERY_WINDOW_MS}` }
+      if (updates.batchConfig.batchWindowMs !== undefined) {
+        if (updates.batchConfig.batchWindowMs < 1 || updates.batchConfig.batchWindowMs > MAX_BATCH_DELIVERY_WINDOW_MS) {
+          return { ok: false, error: `batchWindowMs must be between 1 and ${MAX_BATCH_DELIVERY_WINDOW_MS}` }
+        }
       }
     }
 

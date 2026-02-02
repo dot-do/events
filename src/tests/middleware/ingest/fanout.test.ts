@@ -472,7 +472,14 @@ describe('executeDirectFanout', () => {
     await executeDirectFanout(context)
 
     // Check that structured logger was called with appropriate message
-    expect(logger.info).toHaveBeenCalledWith('Starting DIRECT fanout', expect.any(Object))
+    expect(logger.info).toHaveBeenCalledWith(
+      'executeDirectFanout called - processing CDC and subscriptions synchronously',
+      expect.objectContaining({
+        component: 'fanout',
+        mode: 'DIRECT',
+        eventCount: 2,
+      })
+    )
   })
 
   it('handles errors gracefully', async () => {
