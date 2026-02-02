@@ -16,7 +16,7 @@
  * ```
  */
 
-import type { DurableEvent, EventBatch } from '@dotdo/events'
+import type { DurableEvent, EventBatch, BaseEvent } from '@dotdo/events'
 import type { IngestContext, IngestMiddleware, MiddlewareResult } from './types'
 import type { Env } from '../../env'
 import { corsHeaders } from '../../utils'
@@ -33,6 +33,32 @@ import {
 } from '../../../core/src/encryption'
 
 const log = createLogger({ component: 'encryption-middleware' })
+
+// ============================================================================
+// Encrypted Event Types
+// ============================================================================
+
+/**
+ * Base structure for an encrypted event - core fields preserved, payload encrypted.
+ * Used as an intermediate type to avoid double casts.
+ */
+interface EncryptedEventBase {
+  type: string
+  ts: string
+  do?: BaseEvent['do']
+  _encrypted: EncryptedPayload
+}
+
+/**
+ * Event with encrypted payload - union compatible with DurableEvent for storage.
+ * The _encrypted field contains the encrypted sensitive data.
+ */
+type EncryptedEvent = EncryptedEventBase & Omit<DurableEvent, 'type' | 'ts' | 'do'>
+
+/**
+ * Event that may have either encrypted or decrypted payload.
+ */
+type MaybeEncryptedEvent = DurableEvent | (DurableEvent & { _encrypted?: EncryptedPayload })
 
 // ============================================================================
 // Type Validators
@@ -299,14 +325,16 @@ export const encryptionMiddleware: IngestMiddleware = async (
 }
 
 /**
- * Encrypt a single event's payload
+ * Encrypt a single event's payload.
+ * Returns either the original event (for field-level encryption) or
+ * an event with `_encrypted` field (for full payload encryption).
  */
 async function encryptEvent(
   event: DurableEvent,
   keyBase64: string,
   keyId: string,
   config: PayloadEncryptionConfig
-): Promise<DurableEvent> {
+): Promise<MaybeEncryptedEvent> {
   // Determine what to encrypt
   const eventWithPayload = event as DurableEvent & { payload?: unknown; data?: unknown }
 
@@ -343,12 +371,13 @@ async function encryptEvent(
   const encrypted = await encryptPayload(sensitiveData, keyBase64, keyId)
 
   // Return event with encrypted payload marker
-  return {
+  const encryptedEvent: EncryptedEventBase = {
     type,
     ts,
     do: doInfo,
     _encrypted: encrypted,
-  } as unknown as DurableEvent
+  }
+  return encryptedEvent as MaybeEncryptedEvent
 }
 
 // ============================================================================
@@ -397,8 +426,11 @@ export async function decryptEvent(
   }
 
   // Check for field-level encryption (recursive)
+  // Cast event to Record for field decryption - DurableEvent fields are compatible
   const { decryptFields } = await import('../../../core/src/encryption')
-  return decryptFields(event as unknown as Record<string, unknown>, keyStore) as Promise<DurableEvent>
+  const eventAsRecord = event as DurableEvent & Record<string, unknown>
+  const decrypted = await decryptFields(eventAsRecord, keyStore)
+  return decrypted as DurableEvent
 }
 
 /**
