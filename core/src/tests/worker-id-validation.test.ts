@@ -483,4 +483,46 @@ describe('SSRF_BLOCKLIST_PATTERNS coverage', () => {
     expect(SSRF_BLOCKLIST_PATTERNS).toContain('127.0.0.1')
     expect(SSRF_BLOCKLIST_PATTERNS).toContain('169.254.169.254')
   })
+
+  it('contains octal IP bypass patterns', () => {
+    expect(SSRF_BLOCKLIST_PATTERNS).toContain('0177.0.0.1')
+    expect(SSRF_BLOCKLIST_PATTERNS).toContain('0x7f.0.0.1')
+  })
+
+  it('contains IPv6 localhost variants', () => {
+    expect(SSRF_BLOCKLIST_PATTERNS).toContain('::1')
+    expect(SSRF_BLOCKLIST_PATTERNS).toContain('[::1]')
+    expect(SSRF_BLOCKLIST_PATTERNS).toContain('::ffff:127.0.0.1')
+  })
+
+  it('contains Punycode/IDN bypass patterns', () => {
+    expect(SSRF_BLOCKLIST_PATTERNS).toContain('xn--')
+  })
+
+  it('contains cloud internal patterns', () => {
+    expect(SSRF_BLOCKLIST_PATTERNS).toContain('ec2')
+    expect(SSRF_BLOCKLIST_PATTERNS).toContain('imds')
+    expect(SSRF_BLOCKLIST_PATTERNS).toContain('metadata.google.internal')
+  })
+})
+
+describe('SSRF attack prevention - octal/hex IP bypass', () => {
+  it('blocks octal IP address patterns', () => {
+    // These would fail pattern validation (start with number) but blocklist provides defense-in-depth
+    expect(validateWorkerId('0177.0.0.1').valid).toBe(false)
+    expect(validateWorkerId('0x7f.0.0.1').valid).toBe(false)
+  })
+
+  it('blocks embedded octal IPs in worker names', () => {
+    // Worker names containing full octal IPs
+    expect(validateWorkerId('a0177.0.0.1').valid).toBe(false)
+    expect(validateWorkerId('test-0x7f.0.0.1-worker').valid).toBe(false)
+  })
+})
+
+describe('SSRF attack prevention - Punycode/IDN bypass', () => {
+  it('blocks Punycode-encoded domains (xn-- prefix)', () => {
+    expect(validateWorkerId('xn--worker').valid).toBe(false)
+    expect(validateWorkerId('axn--test').valid).toBe(false)
+  })
 })

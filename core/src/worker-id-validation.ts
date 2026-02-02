@@ -90,15 +90,30 @@ export const SSRF_BLOCKLIST_PATTERNS = [
   '127.0.0.1',
   '0.0.0.0',
   '[::1]',
+  // Octal IP representations (127.0.0.1 variants)
+  '0177.0.0.1',
+  '0177.0.0.01',
+  '0177.0.01.01',
+  '0x7f.0.0.1',
+  // IPv6 localhost variants
+  '::1',
+  '0:0:0:0:0:0:0:1',
+  '::ffff:127.0.0.1',
   // Cloud metadata endpoints
   '169.254.169.254',
   'metadata.google.internal',
+  // Punycode/IDN bypass attempts (xn-- prefix)
+  'xn--',
   // Common internal hostnames
   'internal',
   'private',
   'admin',
   'kubernetes',
   'k8s',
+  // AWS/cloud internal
+  'ec2',
+  'imds',
+  'instance-data',
 ]
 
 // ============================================================================
