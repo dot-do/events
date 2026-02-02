@@ -27,6 +27,8 @@
  *   log.info('Auth callback', { token: sanitize.token(accessToken) })
  */
 
+import { simpleHash } from './utils/hash'
+
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 export interface LogContext {
@@ -578,14 +580,3 @@ export const sanitize = {
   },
 }
 
-/**
- * Simple string hash for ID correlation
- */
-function simpleHash(str: string): number {
-  let hash = 0
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) - hash) + str.charCodeAt(i)
-    hash |= 0
-  }
-  return Math.abs(hash)
-}

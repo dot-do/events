@@ -19,6 +19,12 @@ import { writeEvents, ulid, type EventRecord, type WriteResult } from './event-w
 import { recordWriterDOMetric, recordR2WriteMetric, MetricTimer } from './metrics'
 import type { ShardCoordinatorDO } from './shard-coordinator-do'
 import { logger, sanitize, logError, type Logger } from './logger'
+import { simpleHash } from './utils/hash'
+import {
+  getShardCoordinator,
+  getActiveShards,
+  getRoutingShard,
+} from './utils/sharding'
 
 /**
  * Internal event with unique ID for deduplication
@@ -29,7 +35,9 @@ interface BufferedEvent extends EventRecord {
 
 const BUFFER_KEY = '_eventWriter:buffer'
 const FLUSHED_KEY = '_eventWriter:flushed'
+const DEDUP_MARKERS_PREFIX = '_eventWriter:dedup:'
 const METRICS_REPORT_INTERVAL_MS = 5_000 // Report metrics every 5 seconds
+const DEFAULT_DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours default TTL for dedup markers
 
 import type { Env as FullEnv } from './env'
 
@@ -45,6 +53,15 @@ const DEFAULT_CONFIG = {
   maxBufferSize: 10_000,
   maxPendingWrites: 100,  // Backpressure threshold
   flushIntervalMs: 5_000,
+  dedupTtlMs: DEFAULT_DEDUP_TTL_MS,  // TTL for dedup markers (24 hours default)
+}
+
+/**
+ * Dedup marker stored with timestamp for TTL-based cleanup
+ */
+interface DedupMarker {
+  eventIds: string[]
+  createdAt: number
 }
 
 // ============================================================================
@@ -67,6 +84,7 @@ export interface StatsResult {
   lastFlushTime: string
   timeSinceFlush: number
   flushScheduled: boolean
+  dedupMarkerCount: number
 }
 
 // ============================================================================
@@ -163,11 +181,21 @@ export class EventWriterDO extends DurableObject<Env> {
    */
   private async restoreBuffer(): Promise<void> {
     try {
-      // First, restore the set of flushed event IDs
+      // Load all dedup markers (with TTL support)
+      await this.loadDedupMarkers()
+
+      // Handle legacy format (FLUSHED_KEY stores string[])
       const flushedIds = await this.ctx.storage.get<string[]>(FLUSHED_KEY)
       if (flushedIds && flushedIds.length > 0) {
-        this.flushedEventIds = new Set(flushedIds)
-        logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Restored flushed event markers', { count: flushedIds.length })
+        // Add legacy markers to in-memory set
+        for (const id of flushedIds) {
+          this.flushedEventIds.add(id)
+        }
+        logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Restored legacy flushed event markers', { count: flushedIds.length })
+        // Migrate legacy markers to new TTL format
+        await this.storeDedupMarkers(flushedIds)
+        // Delete legacy key
+        await this.ctx.storage.delete(FLUSHED_KEY)
       }
 
       // Then restore buffer, filtering out already-flushed events
@@ -192,24 +220,90 @@ export class EventWriterDO extends DurableObject<Env> {
           })
         }
 
-        // Clean up: if we filtered events, update persisted buffer and clear flushed markers
+        // Clean up: if we filtered events, update persisted buffer
         if (duplicateCount > 0) {
           await this.persistBuffer()
-          // Clear flushed markers since we've now filtered the buffer
-          this.flushedEventIds.clear()
-          await this.ctx.storage.delete(FLUSHED_KEY)
-        }
-      } else {
-        // No buffer to restore, clear any stale flushed markers
-        if (this.flushedEventIds.size > 0) {
-          this.flushedEventIds.clear()
-          await this.ctx.storage.delete(FLUSHED_KEY)
         }
       }
     } catch (error) {
       const log = logger.child({ component: 'EventWriterDO', shard: this.shardId })
       logError(log, 'Failed to restore buffer', error)
     }
+  }
+
+  /**
+   * Load all dedup markers from storage, filtering out expired ones
+   */
+  private async loadDedupMarkers(): Promise<void> {
+    const now = Date.now()
+    const allMarkers = await this.ctx.storage.list<DedupMarker>({ prefix: DEDUP_MARKERS_PREFIX })
+    const expiredKeys: string[] = []
+
+    for (const [key, marker] of allMarkers) {
+      const age = now - marker.createdAt
+      if (age > this.config.dedupTtlMs) {
+        expiredKeys.push(key)
+      } else {
+        // Add non-expired markers to in-memory set
+        for (const eventId of marker.eventIds) {
+          this.flushedEventIds.add(eventId)
+        }
+      }
+    }
+
+    // Log loaded markers
+    if (this.flushedEventIds.size > 0) {
+      logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Loaded dedup markers', { count: this.flushedEventIds.size })
+    }
+
+    // Delete expired markers
+    if (expiredKeys.length > 0) {
+      await this.ctx.storage.delete(expiredKeys)
+      logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Cleaned up expired dedup markers', { count: expiredKeys.length })
+    }
+  }
+
+  /**
+   * Store dedup markers with timestamp for TTL-based cleanup
+   */
+  private async storeDedupMarkers(eventIds: string[]): Promise<void> {
+    if (eventIds.length === 0) return
+
+    const marker: DedupMarker = {
+      eventIds,
+      createdAt: Date.now(),
+    }
+    // Use timestamp-based key to enable efficient cleanup
+    const key = `${DEDUP_MARKERS_PREFIX}${marker.createdAt}`
+    await this.ctx.storage.put(key, marker)
+  }
+
+  /**
+   * Clean up expired dedup markers (called during alarm)
+   * Deletes markers older than dedupTtlMs (default 24 hours)
+   */
+  private async cleanupExpiredDedupMarkers(): Promise<number> {
+    const now = Date.now()
+    const allMarkers = await this.ctx.storage.list<DedupMarker>({ prefix: DEDUP_MARKERS_PREFIX })
+    const expiredKeys: string[] = []
+
+    for (const [key, marker] of allMarkers) {
+      const age = now - marker.createdAt
+      if (age > this.config.dedupTtlMs) {
+        expiredKeys.push(key)
+        // Remove from in-memory set
+        for (const eventId of marker.eventIds) {
+          this.flushedEventIds.delete(eventId)
+        }
+      }
+    }
+
+    if (expiredKeys.length > 0) {
+      await this.ctx.storage.delete(expiredKeys)
+      logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Cleaned up expired dedup markers', { count: expiredKeys.length })
+    }
+
+    return expiredKeys.length
   }
 
   /**
@@ -332,6 +426,7 @@ export class EventWriterDO extends DurableObject<Env> {
       lastFlushTime: new Date(this.lastFlushTime).toISOString(),
       timeSinceFlush: Date.now() - this.lastFlushTime,
       flushScheduled: this.flushScheduled,
+      dedupMarkerCount: this.flushedEventIds.size,
     }
   }
 
@@ -357,9 +452,69 @@ export class EventWriterDO extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     this.flushScheduled = false
+
+    // Flush any buffered events
     if (this.buffer.length > 0) {
       await this.flush()
     }
+
+    // Clean up expired dedup markers to prevent unbounded storage growth
+    await this.cleanupExpiredDedupMarkers()
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // HTTP Fetch Handler - Health Check
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Handle HTTP requests to the DO
+   * GET /health - Returns health diagnostics with internal state metrics
+   */
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+
+    if (url.pathname === '/health' || url.pathname === '/diagnostics') {
+      const now = Date.now()
+      const health = {
+        status: 'healthy',
+        shard: this.shardId,
+        buffer: {
+          size: this.buffer.length,
+          maxSize: this.config.maxBufferSize,
+          utilizationPercent: (this.buffer.length / this.config.maxBufferSize) * 100,
+        },
+        pendingWrites: {
+          count: this.pendingWrites,
+          maxPending: this.config.maxPendingWrites,
+          utilizationPercent: (this.pendingWrites / this.config.maxPendingWrites) * 100,
+        },
+        flush: {
+          lastFlushTime: new Date(this.lastFlushTime).toISOString(),
+          timeSinceFlushMs: now - this.lastFlushTime,
+          flushScheduled: this.flushScheduled,
+          countThreshold: this.config.countThreshold,
+          timeThresholdMs: this.config.timeThresholdMs,
+        },
+        deduplication: {
+          trackedEventIds: this.flushedEventIds.size,
+          dedupTtlMs: this.config.dedupTtlMs,
+        },
+        config: {
+          countThreshold: this.config.countThreshold,
+          timeThresholdMs: this.config.timeThresholdMs,
+          maxBufferSize: this.config.maxBufferSize,
+          maxPendingWrites: this.config.maxPendingWrites,
+          flushIntervalMs: this.config.flushIntervalMs,
+        },
+        timestamp: new Date(now).toISOString(),
+      }
+
+      return new Response(JSON.stringify(health, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    return new Response('Not Found', { status: 404 })
   }
 
   private async flush(): Promise<WriteResult | null> {
@@ -413,16 +568,18 @@ export class EventWriterDO extends DurableObject<Env> {
       }
 
       // ATOMIC FLUSH PATTERN:
-      // Step 1: Mark these events as flushed BEFORE deleting buffer
+      // Step 1: Store dedup markers with TTL BEFORE deleting buffer
       // This survives the race condition where R2 write succeeds but buffer delete fails
-      await this.ctx.storage.put(FLUSHED_KEY, eventIds)
+      // Markers are cleaned up automatically after dedupTtlMs (default 24 hours)
+      await this.storeDedupMarkers(eventIds)
+      // Also add to in-memory set for immediate dedup
+      for (const id of eventIds) {
+        this.flushedEventIds.add(id)
+      }
       logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Marked events as flushed', { count: eventIds.length })
 
       // Step 2: Delete the buffer (if this fails, flushed markers protect against duplication)
       await this.ctx.storage.delete(BUFFER_KEY)
-
-      // Step 3: Clear flushed markers (safe to fail - will be cleaned on next restore)
-      await this.ctx.storage.delete(FLUSHED_KEY)
 
       // Record successful flush metric
       recordWriterDOMetric(this.env.ANALYTICS, 'flush', 'success', {
@@ -466,46 +623,8 @@ export function getEventWriterDO(env: Env, shard: number = 0): DurableObjectStub
   return env.EVENT_WRITER.get(id)
 }
 
-/**
- * Get the shard coordinator for dynamic sharding
- */
-export function getShardCoordinator(env: Env): DurableObjectStub<ShardCoordinatorDO> | null {
-  if (!env.SHARD_COORDINATOR) return null
-  const id = env.SHARD_COORDINATOR.idFromName('global')
-  return env.SHARD_COORDINATOR.get(id)
-}
-
-/**
- * Get active shards from coordinator (with fallback)
- */
-export async function getActiveShards(env: Env): Promise<number[]> {
-  const coordinator = getShardCoordinator(env)
-  if (!coordinator) {
-    return [0] // Fallback to shard 0 if no coordinator
-  }
-  try {
-    return await coordinator.getActiveShards()
-  } catch (err) {
-    logError(logger.child({ component: 'Router' }), 'Failed to get active shards from coordinator', err)
-    return [0]
-  }
-}
-
-/**
- * Get recommended routing shard from coordinator
- */
-export async function getRoutingShard(env: Env, preferredShard?: number): Promise<number> {
-  const coordinator = getShardCoordinator(env)
-  if (!coordinator) {
-    return preferredShard ?? 0
-  }
-  try {
-    return await coordinator.getRoutingShard(preferredShard)
-  } catch (err) {
-    logError(logger.child({ component: 'Router' }), 'Failed to get routing shard from coordinator', err, { preferredShard })
-    return preferredShard ?? 0
-  }
-}
+// Re-export sharding utilities from shared module for backwards compatibility
+export { getShardCoordinator, getActiveShards, getRoutingShard } from './utils/sharding'
 
 /**
  * Ingest events with automatic shard overflow via RPC
@@ -632,12 +751,3 @@ export async function forceScaleShards(env: Env, targetCount: number): Promise<{
   }
 }
 
-/** Simple string hash for shard distribution */
-function simpleHash(str: string): number {
-  let hash = 0
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) - hash) + str.charCodeAt(i)
-    hash |= 0
-  }
-  return Math.abs(hash)
-}

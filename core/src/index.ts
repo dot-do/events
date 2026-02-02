@@ -24,6 +24,13 @@ export type {
   EmitInput,
   EventBatch,
   EventEmitterOptions,
+  // Branded ID types
+  SubscriptionId,
+  DeliveryId,
+  EventId,
+  TableId,
+  SnapshotId,
+  SchemaId,
 } from './types.js'
 export {
   isRpcCallEvent,
@@ -34,6 +41,13 @@ export {
   isCustomEvent,
   EventBufferFullError,
   CircuitBreakerOpenError,
+  // Branded ID factory functions
+  subscriptionId,
+  deliveryId,
+  eventId,
+  tableId,
+  snapshotId,
+  schemaId,
 } from './types.js'
 
 // === CDC: Change Data Capture ===
@@ -122,6 +136,22 @@ export type {
   SchemaVersion,
 } from './catalog.js'
 export { CatalogDO } from './catalog.js'
+
+// === Quotas: Per-Namespace Resource Limits ===
+
+export type {
+  NamespaceQuota,
+  NamespaceUsage,
+  QuotaCheckResult,
+} from './quota.js'
+export {
+  DEFAULT_QUOTA,
+  getCurrentDateString,
+  isQuotaExceeded,
+  wouldExceedQuota,
+  createDefaultUsage,
+  QUOTA_SCHEMA_SQL,
+} from './quota.js'
 
 // === Subscriptions: Pub/Sub ===
 

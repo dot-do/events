@@ -61,6 +61,34 @@ export const DEFAULT_RPC_TIMEOUT_MS = 30000
 /** Queue processing timeout (ms) - 60 seconds */
 export const QUEUE_PROCESSING_TIMEOUT_MS = 60000
 
+/** Default DO call timeout for middleware (ms) - 5 seconds */
+export const DEFAULT_DO_TIMEOUT_MS = 5000
+
+/** Schema validation DO timeout (ms) - 3 seconds */
+export const SCHEMA_VALIDATION_TIMEOUT_MS = 3000
+
+/** Rate limiter DO timeout (ms) - 2 seconds */
+export const RATE_LIMITER_TIMEOUT_MS = 2000
+
+/** CDC processor DO timeout (ms) - 10 seconds */
+export const CDC_PROCESSOR_TIMEOUT_MS = 10000
+
+/** Subscription fanout DO timeout (ms) - 5 seconds */
+export const SUBSCRIPTION_FANOUT_TIMEOUT_MS = 5000
+
+// ============================================================================
+// Circuit Breaker Configuration
+// ============================================================================
+
+/** Default failure threshold before opening circuit */
+export const DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+
+/** Default reset timeout for circuit breaker (ms) - 30 seconds */
+export const DEFAULT_CIRCUIT_BREAKER_RESET_TIMEOUT_MS = 30000
+
+/** Default success threshold to close circuit in half-open state */
+export const DEFAULT_CIRCUIT_BREAKER_SUCCESS_THRESHOLD = 2
+
 // ============================================================================
 // Event Writer Configuration
 // ============================================================================
@@ -125,6 +153,16 @@ export const workerConfig = {
     http: DEFAULT_HTTP_TIMEOUT_MS,
     rpc: DEFAULT_RPC_TIMEOUT_MS,
     queueProcessing: QUEUE_PROCESSING_TIMEOUT_MS,
+    doDefault: DEFAULT_DO_TIMEOUT_MS,
+    schemaValidation: SCHEMA_VALIDATION_TIMEOUT_MS,
+    rateLimiter: RATE_LIMITER_TIMEOUT_MS,
+    cdcProcessor: CDC_PROCESSOR_TIMEOUT_MS,
+    subscriptionFanout: SUBSCRIPTION_FANOUT_TIMEOUT_MS,
+  },
+  circuitBreaker: {
+    failureThreshold: DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+    resetTimeoutMs: DEFAULT_CIRCUIT_BREAKER_RESET_TIMEOUT_MS,
+    successThreshold: DEFAULT_CIRCUIT_BREAKER_SUCCESS_THRESHOLD,
   },
   eventWriter: {
     flushIntervalMs: EVENT_WRITER_FLUSH_INTERVAL_MS,

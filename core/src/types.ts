@@ -2,6 +2,94 @@
  * Event Types for @dotdo/events
  */
 
+// ============================================================================
+// Branded Types for IDs
+// ============================================================================
+
+/** Unique symbol for branding types */
+declare const __brand: unique symbol
+
+/** Brand utility type for creating nominal types */
+type Brand<T, B extends string> = T & { [__brand]: B }
+
+/** Branded type for subscription identifiers */
+export type SubscriptionId = Brand<string, 'SubscriptionId'>
+
+/** Branded type for delivery identifiers */
+export type DeliveryId = Brand<string, 'DeliveryId'>
+
+/** Branded type for event identifiers */
+export type EventId = Brand<string, 'EventId'>
+
+/** Branded type for table identifiers */
+export type TableId = Brand<string, 'TableId'>
+
+/** Branded type for snapshot identifiers */
+export type SnapshotId = Brand<string, 'SnapshotId'>
+
+/** Branded type for schema identifiers */
+export type SchemaId = Brand<string, 'SchemaId'>
+
+// Factory functions for creating branded IDs
+
+/**
+ * Create a SubscriptionId from a string
+ * @param id - The raw string identifier
+ * @returns A branded SubscriptionId
+ */
+export function subscriptionId(id: string): SubscriptionId {
+  return id as SubscriptionId
+}
+
+/**
+ * Create a DeliveryId from a string
+ * @param id - The raw string identifier
+ * @returns A branded DeliveryId
+ */
+export function deliveryId(id: string): DeliveryId {
+  return id as DeliveryId
+}
+
+/**
+ * Create an EventId from a string
+ * @param id - The raw string identifier
+ * @returns A branded EventId
+ */
+export function eventId(id: string): EventId {
+  return id as EventId
+}
+
+/**
+ * Create a TableId from a string
+ * @param id - The raw string identifier
+ * @returns A branded TableId
+ */
+export function tableId(id: string): TableId {
+  return id as TableId
+}
+
+/**
+ * Create a SnapshotId from a string
+ * @param id - The raw string identifier
+ * @returns A branded SnapshotId
+ */
+export function snapshotId(id: string): SnapshotId {
+  return id as SnapshotId
+}
+
+/**
+ * Create a SchemaId from a string
+ * @param id - The raw string identifier
+ * @returns A branded SchemaId
+ */
+export function schemaId(id: string): SchemaId {
+  return id as SchemaId
+}
+
+// ============================================================================
+// Event Types
+// ============================================================================
+
 /** Base event structure */
 export interface BaseEvent {
   /** Event type (e.g., "rpc.call", "collection.write", "do.alarm") */

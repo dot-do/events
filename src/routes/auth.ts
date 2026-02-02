@@ -4,6 +4,7 @@
 
 import type { Env, AuthRequest } from '../env'
 import { corsHeaders, authCorsHeaders } from '../utils'
+import { successResponse, errorResponse, unauthorized, badRequest, internalError, ErrorCodes } from '../utils/response'
 import { optionalAuth } from 'oauth.do/itty'
 import { logger, sanitize } from '../logger'
 
@@ -151,10 +152,10 @@ export async function handleAuth(
     await optionalAuth()(authReq)
 
     if (!authReq.auth?.isAuth) {
-      return Response.json({ error: 'Not authenticated' }, { status: 401, headers: authCorsHeaders(request, env) })
+      return unauthorized('Not authenticated', { headers: authCorsHeaders(request, env) })
     }
 
-    return Response.json(authReq.auth.user, { headers: authCorsHeaders(request, env) })
+    return successResponse(authReq.auth.user, { headers: authCorsHeaders(request, env) })
   }
 
   return null
@@ -173,11 +174,15 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
   })
 
   if (error) {
-    return Response.json({ error, error_description: url.searchParams.get('error_description') }, { status: 400, headers: corsHeaders() })
+    return badRequest(
+      url.searchParams.get('error_description') || error,
+      error,
+      { headers: corsHeaders() }
+    )
   }
 
   if (!code) {
-    return Response.json({ error: 'invalid_request', error_description: 'Missing code' }, { status: 400, headers: corsHeaders() })
+    return badRequest('Missing code', 'INVALID_REQUEST', { headers: corsHeaders() })
   }
 
   // Exchange code for token via oauth.do service binding
@@ -193,7 +198,12 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
   if (!response.ok) {
     const err = await response.json() as { error: string; error_description?: string }
     log.error('oauth.do/exchange error', { errorCode: err.error })
-    return Response.json(err, { status: response.status, headers: corsHeaders() })
+    return errorResponse(
+      err.error,
+      err.error_description || err.error,
+      response.status,
+      { headers: corsHeaders() }
+    )
   }
 
   const data = await response.json() as {
@@ -208,14 +218,18 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
 
   if (data.error) {
     log.error('oauth.do/exchange returned error', { errorCode: data.error })
-    return Response.json({ error: data.error, error_description: data.error_description }, { status: 400, headers: corsHeaders() })
+    return badRequest(
+      data.error_description || data.error,
+      data.error,
+      { headers: corsHeaders() }
+    )
   }
 
   // oauth.do returns 'token', standard OAuth returns 'access_token' - accept both
   const accessToken = data.access_token || data.token
   if (!accessToken) {
     log.error('No access_token from oauth.do/exchange')
-    return Response.json({ error: 'invalid_response', error_description: 'No access token received' }, { status: 500, headers: corsHeaders() })
+    return internalError('No access token received', { headers: corsHeaders() })
   }
 
   // Set auth cookie and redirect
@@ -228,8 +242,7 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
 
   // Debug mode - return JSON instead of redirect
   if (debug) {
-    return Response.json({
-      success: true,
+    return successResponse({
       tokenLength: accessToken.length,
       redirectTo,
       cookieSet: true,

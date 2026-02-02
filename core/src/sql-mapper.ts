@@ -195,12 +195,12 @@ export function getOptionalBoolean(row: SqlRow, key: string): boolean | null {
  * Get a JSON-parsed value from a string column.
  * Parses the string value as JSON and returns the typed result.
  *
- * WARNING: Without a validator, this function does NOT verify that the parsed
- * JSON matches type T. For type-safe parsing, use getValidatedJson instead.
+ * @deprecated This function does NOT verify that the parsed JSON matches type T.
+ * Use `getValidatedJson(row, key, validator)` for type-safe parsing.
  *
  * @param row - The SQL row object
  * @param key - The column name
- * @returns The parsed JSON value
+ * @returns The parsed JSON value (unvalidated - use with caution)
  * @throws SqlTypeError if value is not a string
  * @throws SyntaxError if JSON parsing fails
  */
@@ -209,7 +209,9 @@ export function getJson<T>(row: SqlRow, key: string): T {
   if (typeof value !== 'string') {
     throw new SqlTypeError(key, 'string (JSON)', value)
   }
-  return JSON.parse(value) as T
+  // Note: This cast is unsafe. Prefer getValidatedJson for new code.
+  const parsed: unknown = JSON.parse(value)
+  return parsed as T
 }
 
 /**
@@ -217,12 +219,12 @@ export function getJson<T>(row: SqlRow, key: string): T {
  * Returns null if the value is null or undefined.
  * Parses the string value as JSON and returns the typed result.
  *
- * WARNING: Without a validator, this function does NOT verify that the parsed
- * JSON matches type T. For type-safe parsing, use getValidatedOptionalJson instead.
+ * @deprecated This function does NOT verify that the parsed JSON matches type T.
+ * Use `getValidatedOptionalJson(row, key, validator)` for type-safe parsing.
  *
  * @param row - The SQL row object
  * @param key - The column name
- * @returns The parsed JSON value or null
+ * @returns The parsed JSON value or null (unvalidated - use with caution)
  * @throws SqlTypeError if value is not null, undefined, or string
  * @throws SyntaxError if JSON parsing fails
  */
@@ -234,7 +236,9 @@ export function getOptionalJson<T>(row: SqlRow, key: string): T | null {
   if (typeof value !== 'string') {
     throw new SqlTypeError(key, 'string (JSON) | null', value)
   }
-  return JSON.parse(value) as T
+  // Note: This cast is unsafe. Prefer getValidatedOptionalJson for new code.
+  const parsed: unknown = JSON.parse(value)
+  return parsed as T
 }
 
 // ============================================================================
@@ -422,5 +426,61 @@ export function nullable<T>(validator: JsonValidator<T>): JsonValidator<T | null
 export function optional<T>(validator: JsonValidator<T>): JsonValidator<T | undefined> {
   return (value: unknown): value is T | undefined => {
     return value === undefined || validator(value)
+  }
+}
+
+// ============================================================================
+// Typed SQL Execution Helper
+// ============================================================================
+
+/**
+ * Result wrapper for typed SQL execution
+ */
+export interface TypedExecResult<T extends SqlRow> {
+  /** All rows as a typed array */
+  rows: T[]
+  /** Get first row or null if empty */
+  one: () => T | null
+  /** Alias for rows (compatibility with SqlStorage.exec().toArray()) */
+  toArray: () => T[]
+}
+
+/**
+ * Execute a SQL query with typed results, eliminating `as SqlRow` casts.
+ *
+ * @param sql - The SqlStorage instance
+ * @param query - The SQL query string
+ * @param params - Query parameters
+ * @returns Typed result wrapper with rows, one(), and toArray() methods
+ *
+ * @example
+ * // Before:
+ * const rows = sql.exec(`SELECT * FROM users`).toArray()
+ * return rows.map(r => getString(r as SqlRow, 'name'))
+ *
+ * // After:
+ * const { rows } = typedExec(sql, `SELECT * FROM users`)
+ * return rows.map(r => getString(r, 'name'))
+ *
+ * @example
+ * // With typed interface:
+ * interface UserRow extends SqlRow {
+ *   name: string
+ *   age: number
+ * }
+ * const { one } = typedExec<UserRow>(sql, `SELECT * FROM users WHERE id = ?`, id)
+ * const user = one()
+ */
+export function typedExec<T extends SqlRow = SqlRow>(
+  sql: SqlStorage,
+  query: string,
+  ...params: unknown[]
+): TypedExecResult<T> {
+  const result = sql.exec(query, ...params)
+  const rows = result.toArray() as T[]
+  return {
+    rows,
+    one: () => (rows.length > 0 ? rows[0]! : null),
+    toArray: () => rows,
   }
 }

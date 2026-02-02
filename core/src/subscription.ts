@@ -21,9 +21,18 @@ import {
   getOptionalString,
   getOptionalNumber,
   getOptionalBoolean,
+  typedExec,
   type SqlRow,
 } from './sql-mapper.js'
 import { ulid } from './ulid.js'
+import {
+  type SubscriptionId,
+  type DeliveryId,
+  type EventId,
+  subscriptionId,
+  deliveryId,
+  eventId,
+} from './types.js'
 import {
   DEFAULT_SUBSCRIPTION_MAX_RETRIES,
   DEFAULT_SUBSCRIPTION_TIMEOUT_MS,
@@ -46,7 +55,7 @@ import {
 // ============================================================================
 
 export interface Subscription {
-  id: string
+  id: SubscriptionId
   workerId: string
   workerBinding?: string  // null = HTTP fallback
   pattern: string
@@ -97,8 +106,8 @@ export interface BatchDeliveryResult {
 /** Pending batch for a subscription */
 export interface PendingBatch {
   id: string
-  subscriptionId: string
-  deliveryIds: string[]
+  subscriptionId: SubscriptionId
+  deliveryIds: DeliveryId[]
   eventCount: number
   windowStart: number
   windowEnd?: number | undefined
@@ -111,9 +120,9 @@ export interface PendingBatch {
 }
 
 export interface Delivery {
-  id: string
-  subscriptionId: string
-  eventId: string
+  id: DeliveryId
+  subscriptionId: SubscriptionId
+  eventId: EventId
   eventType: string
   eventPayload: string  // JSON
   status: 'pending' | 'delivered' | 'failed' | 'dead'
@@ -126,8 +135,8 @@ export interface Delivery {
 
 export interface DeliveryLog {
   id: string
-  deliveryId: string
-  subscriptionId: string
+  deliveryId: DeliveryId
+  subscriptionId: SubscriptionId
   attemptNumber: number
   status: string
   durationMs?: number
@@ -138,9 +147,9 @@ export interface DeliveryLog {
 
 export interface DeadLetter {
   id: string
-  deliveryId: string
-  subscriptionId: string
-  eventId: string
+  deliveryId: DeliveryId
+  subscriptionId: SubscriptionId
+  eventId: EventId
   eventPayload: string
   reason: string
   lastError?: string
@@ -324,7 +333,19 @@ export class SubscriptionDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Create a new subscription
+   * Create a new event subscription for a worker.
+   * The subscription will match events against the specified pattern and deliver
+   * them to the worker via RPC (service binding) or HTTP fallback.
+   *
+   * @param params - Subscription configuration
+   * @param params.workerId - The worker identifier (used for HTTP fallback delivery)
+   * @param params.workerBinding - Optional service binding name for RPC delivery
+   * @param params.pattern - Glob-style pattern to match event types (e.g., 'collection.*')
+   * @param params.rpcMethod - The RPC method name to call on the worker
+   * @param params.maxRetries - Maximum delivery retry attempts (default: 5)
+   * @param params.timeoutMs - Delivery timeout in milliseconds (default: 30000)
+   * @param params.batchConfig - Optional batch delivery configuration
+   * @returns A result object with subscriptionId on success, or error message on failure
    */
   async subscribe(params: {
     workerId: string
@@ -334,7 +355,7 @@ export class SubscriptionDO extends DurableObject<Env> {
     maxRetries?: number
     timeoutMs?: number
     batchConfig?: BatchDeliveryConfig
-  }): Promise<{ ok: true; subscriptionId: string } | { ok: false; error: string }> {
+  }): Promise<{ ok: true; subscriptionId: SubscriptionId } | { ok: false; error: string }> {
     // Validate workerId to prevent SSRF attacks
     const workerIdValidation = validateWorkerId(params.workerId)
     if (!workerIdValidation.valid) {
@@ -387,7 +408,7 @@ export class SubscriptionDO extends DurableObject<Env> {
         now,
         now
       )
-      return { ok: true, subscriptionId: id }
+      return { ok: true, subscriptionId: subscriptionId(id) }
     } catch (e) {
       const error = e instanceof Error ? e.message : 'Unknown error'
       // Check for unique constraint violation
@@ -399,57 +420,71 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Deactivate a subscription (soft delete)
+   * Deactivate a subscription (soft delete).
+   * The subscription remains in the database but will no longer receive events.
+   * Can be reactivated later using reactivate().
+   *
+   * @param subId - The subscription ID to deactivate
+   * @returns A result object indicating success
    */
-  async unsubscribe(subscriptionId: string): Promise<{ ok: boolean }> {
+  async unsubscribe(subId: SubscriptionId): Promise<{ ok: boolean }> {
     this.sql.exec(
       `UPDATE subscriptions SET active = 0, updated_at = ? WHERE id = ?`,
       Date.now(),
-      subscriptionId
+      subId
     )
     return { ok: true }
   }
 
   /**
-   * Reactivate a previously deactivated subscription
+   * Reactivate a previously deactivated subscription.
+   * The subscription will resume receiving events matching its pattern.
+   *
+   * @param subId - The subscription ID to reactivate
+   * @returns A result object indicating success
    */
-  async reactivate(subscriptionId: string): Promise<{ ok: boolean }> {
+  async reactivate(subId: SubscriptionId): Promise<{ ok: boolean }> {
     this.sql.exec(
       `UPDATE subscriptions SET active = 1, updated_at = ? WHERE id = ?`,
       Date.now(),
-      subscriptionId
+      subId
     )
     return { ok: true }
   }
 
   /**
-   * Permanently delete a subscription and all related data
+   * Permanently delete a subscription and all related data.
+   * This removes the subscription, all deliveries, delivery logs, dead letters,
+   * and batch deliveries associated with it. This action cannot be undone.
+   *
+   * @param subId - The subscription ID to delete
+   * @returns A result object with counts of deleted records
    */
-  async deleteSubscription(subscriptionId: string): Promise<{ ok: boolean; deleted: { deliveries: number; logs: number; deadLetters: number; batchDeliveries: number } }> {
+  async deleteSubscription(subId: SubscriptionId): Promise<{ ok: boolean; deleted: { deliveries: number; logs: number; deadLetters: number; batchDeliveries: number } }> {
     // Delete in order due to foreign key-like relationships
     const deadLettersDeleted = this.sql.exec(
       `DELETE FROM dead_letters WHERE subscription_id = ?`,
-      subscriptionId
+      subId
     ).rowsWritten
 
     const logsDeleted = this.sql.exec(
       `DELETE FROM delivery_log WHERE subscription_id = ?`,
-      subscriptionId
+      subId
     ).rowsWritten
 
     const deliveriesDeleted = this.sql.exec(
       `DELETE FROM deliveries WHERE subscription_id = ?`,
-      subscriptionId
+      subId
     ).rowsWritten
 
     const batchDeliveriesDeleted = this.sql.exec(
       `DELETE FROM batch_deliveries WHERE subscription_id = ?`,
-      subscriptionId
+      subId
     ).rowsWritten
 
     this.sql.exec(
       `DELETE FROM subscriptions WHERE id = ?`,
-      subscriptionId
+      subId
     )
 
     return {
@@ -464,10 +499,18 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Update subscription settings
+   * Update subscription settings such as retry limits, timeouts, or batch configuration.
+   *
+   * @param subId - The subscription ID to update
+   * @param updates - The settings to update
+   * @param updates.maxRetries - New maximum retry count
+   * @param updates.timeoutMs - New timeout in milliseconds
+   * @param updates.rpcMethod - New RPC method name
+   * @param updates.batchConfig - New batch delivery configuration
+   * @returns A result object indicating success or containing an error message
    */
   async updateSubscription(
-    subscriptionId: string,
+    subId: SubscriptionId,
     updates: {
       maxRetries?: number
       timeoutMs?: number
@@ -524,7 +567,7 @@ export class SubscriptionDO extends DurableObject<Env> {
       }
     }
 
-    params.push(subscriptionId)
+    params.push(subId)
 
     this.sql.exec(
       `UPDATE subscriptions SET ${setClauses.join(', ')} WHERE id = ?`,
@@ -534,7 +577,16 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * List subscriptions with optional filters
+   * List subscriptions with optional filters for active status, worker, pattern prefix, or batch mode.
+   *
+   * @param options - Optional filter and pagination options
+   * @param options.active - Filter by active status (true/false)
+   * @param options.workerId - Filter by worker ID
+   * @param options.patternPrefix - Filter by pattern prefix (e.g., 'collection')
+   * @param options.batchEnabled - Filter by batch delivery mode
+   * @param options.limit - Maximum number of results to return
+   * @param options.offset - Number of results to skip for pagination
+   * @returns Array of matching subscriptions
    */
   async listSubscriptions(options?: {
     active?: boolean
@@ -579,18 +631,25 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Get a single subscription by ID
+   * Get a single subscription by its ID.
+   *
+   * @param subId - The subscription ID to retrieve
+   * @returns The subscription object, or null if not found
    */
-  async getSubscription(subscriptionId: string): Promise<Subscription | null> {
+  async getSubscription(subId: SubscriptionId): Promise<Subscription | null> {
     const row = this.sql.exec(
       `SELECT * FROM subscriptions WHERE id = ?`,
-      subscriptionId
+      subId
     ).one()
     return row ? this.rowToSubscription(row) : null
   }
 
   /**
-   * Find subscriptions matching an event type
+   * Find all active subscriptions that match a given event type.
+   * Uses pattern matching to find subscriptions whose patterns match the event type.
+   *
+   * @param eventType - The event type to match against subscription patterns
+   * @returns Array of matching subscriptions
    */
   async findMatchingSubscriptions(eventType: string): Promise<Subscription[]> {
     // Get all active subscriptions and filter by pattern match
@@ -620,12 +679,12 @@ export class SubscriptionDO extends DurableObject<Env> {
    * Create a new delivery record
    */
   async createDelivery(params: {
-    subscriptionId: string
-    eventId: string
+    subscriptionId: SubscriptionId
+    eventId: EventId
     eventType: string
     eventPayload: unknown
     batchId?: string
-  }): Promise<{ ok: true; deliveryId: string } | { ok: false; error: string }> {
+  }): Promise<{ ok: true; deliveryId: DeliveryId } | { ok: false; error: string }> {
     const id = ulid()
     const now = Date.now()
 
@@ -643,7 +702,7 @@ export class SubscriptionDO extends DurableObject<Env> {
         now,
         params.batchId ?? null
       )
-      return { ok: true, deliveryId: id }
+      return { ok: true, deliveryId: deliveryId(id) }
     } catch (e) {
       const error = e instanceof Error ? e.message : 'Unknown error'
       if (error.includes('UNIQUE constraint')) {
@@ -871,7 +930,7 @@ export class SubscriptionDO extends DurableObject<Env> {
   /**
    * Create a new batch for a subscription
    */
-  private async createNewBatch(subscriptionId: string, deliveryId: string): Promise<void> {
+  private async createNewBatch(subId: SubscriptionId, delId: DeliveryId): Promise<void> {
     const batchId = ulid()
     const now = Date.now()
 
@@ -880,8 +939,8 @@ export class SubscriptionDO extends DurableObject<Env> {
        (id, subscription_id, delivery_ids, status, event_count, window_start, created_at)
        VALUES (?, ?, ?, 'pending', 1, ?, ?)`,
       batchId,
-      subscriptionId,
-      JSON.stringify([deliveryId]),
+      subId,
+      JSON.stringify([delId]),
       now,
       now
     )
@@ -890,11 +949,11 @@ export class SubscriptionDO extends DurableObject<Env> {
     this.sql.exec(
       `UPDATE deliveries SET batch_id = ? WHERE id = ?`,
       batchId,
-      deliveryId
+      delId
     )
 
     // Get subscription to schedule window end alarm
-    const sub = await this.getSubscription(subscriptionId)
+    const sub = await this.getSubscription(subId)
     if (sub) {
       const windowEndTime = now + sub.batchWindowMs
       const currentAlarm = await this.ctx.storage.getAlarm()
@@ -926,7 +985,12 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Deliver a batch of events to a subscriber
+   * Deliver a batch of events to a subscriber.
+   * Attempts RPC via service binding first, falls back to HTTP.
+   * Handles partial success/failure for individual events in the batch.
+   *
+   * @param batchId - The batch ID to deliver
+   * @returns A result object with delivery statistics and per-event results
    */
   async deliverBatch(batchId: string): Promise<BatchDeliveryResult> {
     const startTime = performance.now()
@@ -1131,7 +1195,11 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Get pending batches for a subscription
+   * Get pending batches for a subscription that are awaiting delivery.
+   *
+   * @param subscriptionId - The subscription ID to get batches for
+   * @param limit - Maximum number of batches to return (default: 100)
+   * @returns Array of pending batch objects
    */
   async getPendingBatches(subscriptionId: string, limit = 100): Promise<PendingBatch[]> {
     const rows = this.sql.exec(
@@ -1161,7 +1229,10 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Flush all open batches for immediate delivery
+   * Flush all open batches for immediate delivery.
+   * Closes any batches that are still collecting events and schedules them for delivery.
+   *
+   * @returns An object with the count of flushed batches
    */
   async flushBatches(): Promise<{ flushed: number }> {
     const now = Date.now()
@@ -1188,7 +1259,12 @@ export class SubscriptionDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Get subscription status with delivery stats
+   * Get subscription status with delivery statistics.
+   * Returns the subscription configuration along with counts of pending, failed,
+   * and dead-lettered deliveries, plus success rate metrics.
+   *
+   * @param subscriptionId - The subscription ID to get status for
+   * @returns An object with subscription details and delivery statistics
    */
   async getSubscriptionStatus(subscriptionId: string): Promise<{
     subscription: Subscription | null
@@ -1244,7 +1320,12 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Get dead letters for a subscription
+   * Get dead letters for a subscription.
+   * Dead letters are events that failed delivery after all retry attempts.
+   *
+   * @param subscriptionId - The subscription ID to get dead letters for
+   * @param limit - Maximum number of dead letters to return (default: 100)
+   * @returns Array of dead letter objects
    */
   async getDeadLetters(subscriptionId: string, limit = 100): Promise<DeadLetter[]> {
     const rows = this.sql.exec(
@@ -1269,7 +1350,11 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Retry a dead letter (create new delivery)
+   * Retry a dead letter by creating a new delivery for the failed event.
+   * On success, removes the event from the dead letter queue.
+   *
+   * @param deadLetterId - The dead letter ID to retry
+   * @returns A result object with the new delivery ID on success
    */
   async retryDeadLetter(deadLetterId: string): Promise<{ ok: boolean; deliveryId?: string }> {
     const row = this.sql.exec(
@@ -1309,7 +1394,11 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Get delivery logs for debugging
+   * Get delivery attempt logs for debugging and monitoring.
+   * Shows all delivery attempts with status, duration, errors, and responses.
+   *
+   * @param deliveryId - The delivery ID to get logs for
+   * @returns Array of delivery log entries ordered by creation time
    */
   async getDeliveryLogs(deliveryId: string): Promise<DeliveryLog[]> {
     const rows = this.sql.exec(
@@ -1341,7 +1430,7 @@ export class SubscriptionDO extends DurableObject<Env> {
    */
   private rowToSubscription(row: SqlRow): Subscription {
     return {
-      id: getString(row, 'id'),
+      id: subscriptionId(getString(row, 'id')),
       workerId: getString(row, 'worker_id'),
       workerBinding: getOptionalString(row, 'worker_binding'),
       pattern: getString(row, 'pattern'),
@@ -1363,9 +1452,9 @@ export class SubscriptionDO extends DurableObject<Env> {
    */
   private rowToDelivery(row: SqlRow): Delivery {
     return {
-      id: getString(row, 'id'),
-      subscriptionId: getString(row, 'subscription_id'),
-      eventId: getString(row, 'event_id'),
+      id: deliveryId(getString(row, 'id')),
+      subscriptionId: subscriptionId(getString(row, 'subscription_id')),
+      eventId: eventId(getString(row, 'event_id')),
       eventType: getString(row, 'event_type'),
       eventPayload: getString(row, 'event_payload'),
       status: getString(row, 'status') as 'pending' | 'delivered' | 'failed' | 'dead',
@@ -1630,7 +1719,11 @@ export class SubscriptionDO extends DurableObject<Env> {
   }
 
   /**
-   * Alarm handler - processes failed deliveries and batches ready for delivery
+   * Durable Object alarm handler that processes pending work.
+   * Closes expired batch windows, delivers ready batches, retries failed deliveries,
+   * and schedules the next alarm. Must be called from the DO's alarm() method.
+   *
+   * @returns A promise that resolves when alarm processing completes
    */
   async alarm(): Promise<void> {
     const now = Date.now()
@@ -1735,7 +1828,12 @@ export class SubscriptionDO extends DurableObject<Env> {
   // ---------------------------------------------------------------------------
 
   /**
-   * Clean up old data to prevent unbounded growth
+   * Clean up old data to prevent unbounded storage growth.
+   * Removes completed deliveries, logs, dead letters, and batch deliveries
+   * that are older than the specified cutoff timestamp.
+   *
+   * @param cutoffTs - Unix timestamp in milliseconds; records older than this will be deleted
+   * @returns An object with counts of deleted records by type
    */
   async cleanupOldData(cutoffTs: number): Promise<{
     deadLettersDeleted: number

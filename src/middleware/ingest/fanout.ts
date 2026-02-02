@@ -5,6 +5,7 @@
  * - Queue-based fanout (async via EVENTS_QUEUE)
  * - Direct fanout (sync via DO calls)
  * - Mutual exclusion to prevent duplicate processing
+ * - Timeout protection to prevent slow DOs from blocking
  */
 
 import type { DurableEvent, EventBatch } from '@dotdo/events'
@@ -17,6 +18,54 @@ import type { Env } from '../../env'
 import type { IngestContext } from './types'
 import { logger, logError } from '../../logger'
 import { getSubscriptionRoutingShard } from '../../subscription-shard-coordinator-do'
+import {
+  withTimeout,
+  CircuitBreaker,
+  CircuitBreakerOpenError,
+  TimeoutError,
+} from '../../utils'
+import {
+  CDC_PROCESSOR_TIMEOUT_MS,
+  SUBSCRIPTION_FANOUT_TIMEOUT_MS,
+} from '../../config'
+
+// ============================================================================
+// Circuit Breakers for Fanout
+// ============================================================================
+
+/**
+ * Circuit breaker for CDC processor DO calls.
+ * Shared across all requests to track failures globally.
+ */
+const cdcProcessorCircuitBreaker = new CircuitBreaker('cdc-processor', {
+  failureThreshold: 5,
+  resetTimeoutMs: 30000,
+  successThreshold: 2,
+})
+
+/**
+ * Circuit breaker for subscription fanout DO calls.
+ * Shared across all requests to track failures globally.
+ */
+const subscriptionFanoutCircuitBreaker = new CircuitBreaker('subscription-fanout', {
+  failureThreshold: 5,
+  resetTimeoutMs: 30000,
+  successThreshold: 2,
+})
+
+/**
+ * Get the CDC processor circuit breaker (for testing/monitoring)
+ */
+export function getCDCProcessorCircuitBreaker(): CircuitBreaker {
+  return cdcProcessorCircuitBreaker
+}
+
+/**
+ * Get the subscription fanout circuit breaker (for testing/monitoring)
+ */
+export function getSubscriptionFanoutCircuitBreaker(): CircuitBreaker {
+  return subscriptionFanoutCircuitBreaker
+}
 
 // ============================================================================
 // Fanout Mode Determination
@@ -55,16 +104,30 @@ export async function sendToQueue(
 
 /**
  * Process CDC events directly via CDC Processor DOs
+ *
+ * Uses timeout protection and circuit breaker to prevent slow CDC processors
+ * from causing cascading failures.
  */
 export async function processCDCEvents(
   events: DurableEvent[],
   tenant: TenantContext,
-  env: Env
+  env: Env,
+  timeoutMs: number = CDC_PROCESSOR_TIMEOUT_MS
 ): Promise<void> {
   // Filter for CDC events using type guard for proper type narrowing
   const cdcEvents = events.filter(isCollectionChangeEvent)
 
   if (cdcEvents.length === 0 || !env.CDC_PROCESSOR) {
+    return
+  }
+
+  // Check circuit breaker state before making calls
+  if (cdcProcessorCircuitBreaker.getState() === 'open') {
+    logger.warn('CDC processor circuit breaker is open, skipping CDC fanout', {
+      component: 'fanout',
+      eventCount: cdcEvents.length,
+    })
+    recordCDCMetric(env.ANALYTICS, 'skipped', cdcEvents.length, 'circuit-open')
     return
   }
 
@@ -87,12 +150,37 @@ export async function processCDCEvents(
     try {
       const processorId = env.CDC_PROCESSOR.idFromName(key)
       const processor = env.CDC_PROCESSOR.get(processorId)
-      await processor.process(groupEvents)
+
+      // Use circuit breaker and timeout protection
+      await cdcProcessorCircuitBreaker.execute(async () => {
+        return withTimeout(
+          processor.process(groupEvents),
+          timeoutMs,
+          `CDC processor timed out after ${timeoutMs}ms`
+        )
+      })
+
       recordCDCMetric(env.ANALYTICS, 'success', groupEvents.length, key)
       logger.info('DIRECT CDC processed events', { component: 'fanout', eventCount: groupEvents.length, cdcKey: key })
     } catch (err) {
       recordCDCMetric(env.ANALYTICS, 'error', groupEvents.length, key)
-      logError(logger, 'CDC processor error', err, { component: 'fanout', cdcKey: key, eventCount: groupEvents.length })
+
+      if (err instanceof TimeoutError) {
+        logError(logger, 'CDC processor timed out', err, {
+          component: 'fanout',
+          cdcKey: key,
+          eventCount: groupEvents.length,
+          timeoutMs,
+        })
+      } else if (err instanceof CircuitBreakerOpenError) {
+        logger.warn('CDC processor circuit breaker open', {
+          component: 'fanout',
+          cdcKey: key,
+          eventCount: groupEvents.length,
+        })
+      } else {
+        logError(logger, 'CDC processor error', err, { component: 'fanout', cdcKey: key, eventCount: groupEvents.length })
+      }
     }
   })
 
@@ -106,13 +194,27 @@ export async function processCDCEvents(
 /**
  * Fan out events to subscription matching and delivery.
  * Uses dynamic sharding when SUBSCRIPTION_SHARD_COORDINATOR is available.
+ *
+ * Uses timeout protection and circuit breaker to prevent slow subscription DOs
+ * from causing cascading failures.
  */
 export async function processSubscriptionFanout(
   events: DurableEvent[],
   tenant: TenantContext,
-  env: Env
+  env: Env,
+  timeoutMs: number = SUBSCRIPTION_FANOUT_TIMEOUT_MS
 ): Promise<void> {
   if (!env.SUBSCRIPTIONS) {
+    return
+  }
+
+  // Check circuit breaker state before making calls
+  if (subscriptionFanoutCircuitBreaker.getState() === 'open') {
+    logger.warn('Subscription fanout circuit breaker is open, skipping subscription fanout', {
+      component: 'fanout',
+      eventCount: events.length,
+    })
+    recordSubscriptionMetric(env.ANALYTICS, 'skipped', events.length, 'all', 'circuit-open')
     return
   }
 
@@ -134,6 +236,7 @@ export async function processSubscriptionFanout(
     async ([basePrefix, prefixEvents]) => {
       let successCount = 0
       let errorCount = 0
+      let timeoutCount = 0
 
       try {
         // Process events with dynamic shard routing
@@ -149,21 +252,47 @@ export async function processSubscriptionFanout(
             const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
             const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
 
-            await subscriptionDO.fanout({
-              id: eventId,
-              type: event.type,
-              ts: event.ts,
-              payload: { ...event, _namespace: tenant.namespace },
+            // Use circuit breaker and timeout protection
+            await subscriptionFanoutCircuitBreaker.execute(async () => {
+              return withTimeout(
+                subscriptionDO.fanout({
+                  id: eventId,
+                  type: event.type,
+                  ts: event.ts,
+                  payload: { ...event, _namespace: tenant.namespace },
+                }),
+                timeoutMs,
+                `Subscription fanout timed out after ${timeoutMs}ms`
+              )
             })
             successCount++
           } catch (err) {
             errorCount++
-            logError(logger, 'Subscription fanout error', err, {
-              component: 'fanout',
-              eventId,
-              eventType: event.type,
-              basePrefix,
-            })
+
+            if (err instanceof TimeoutError) {
+              timeoutCount++
+              logError(logger, 'Subscription fanout timed out', err, {
+                component: 'fanout',
+                eventId,
+                eventType: event.type,
+                basePrefix,
+                timeoutMs,
+              })
+            } else if (err instanceof CircuitBreakerOpenError) {
+              logger.warn('Subscription fanout circuit breaker open', {
+                component: 'fanout',
+                eventId,
+                eventType: event.type,
+                basePrefix,
+              })
+            } else {
+              logError(logger, 'Subscription fanout error', err, {
+                component: 'fanout',
+                eventId,
+                eventType: event.type,
+                basePrefix,
+              })
+            }
           }
         })
 
@@ -179,6 +308,7 @@ export async function processSubscriptionFanout(
           namespace: tenant.namespace,
           successCount,
           errorCount,
+          timeoutCount,
           dynamicSharding: !!env.SUBSCRIPTION_SHARD_COORDINATOR,
         })
       } catch (err) {

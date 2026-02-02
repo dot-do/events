@@ -7,6 +7,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { CDCCollection, type Collection } from '../cdc.js'
 import { createMockCollection, createMockEmitter } from './mocks.js'
+import {
+  sampleCollectionInsertEvent,
+  sampleCollectionUpdateEvent,
+  sampleCollectionDeleteEvent,
+  createCdcEventBatch,
+} from './fixtures/index.js'
 
 // ============================================================================
 // Tests

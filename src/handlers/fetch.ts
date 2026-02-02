@@ -5,6 +5,7 @@
  * - POST /ingest, /e - Receive batched events
  * - POST /webhooks?provider=xxx - Receive and verify webhooks
  * - GET /health - Health check
+ * - GET /metrics - Prometheus metrics endpoint
  * - POST /query - Generate DuckDB query (admin)
  * - GET /recent - List recent events (admin)
  * - GET /events - Events query (admin)
@@ -20,6 +21,7 @@ import type { TenantContext } from '../middleware/tenant'
 
 // Route handlers
 import { handleHealth, handlePipelineCheck, handleBenchmark } from '../routes/health'
+import { handleMetrics } from '../routes/metrics'
 import { handleAuth } from '../routes/auth'
 import { handleIngest } from '../routes/ingest'
 import { handleWebhooks } from '../routes/webhooks'
@@ -101,7 +103,11 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
 
   // CORS preflight - use restricted origins for authenticated routes
   if (request.method === 'OPTIONS') {
-    return handleCORS(request, env, false, correlationId)
+    const protectedRoutes = ['/subscriptions', '/schemas', '/catalog', '/dashboard']
+    const isAuthenticatedRoute = protectedRoutes.some(r =>
+      url.pathname === r || url.pathname.startsWith(r + '/')
+    )
+    return handleCORS(request, env, isAuthenticatedRoute, correlationId)
   }
 
   // Detect domain for service name
@@ -111,12 +117,38 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   const healthResponse = handleHealth(request, env, url, isWebhooksDomain, startTime)
   if (healthResponse) return addCorrelationId(healthResponse, correlationId)
 
+  // Prometheus metrics endpoint
+  if (url.pathname === '/metrics') {
+    if (request.method !== 'GET') {
+      return addCorrelationId(
+        Response.json({ error: 'Method not allowed' }, {
+          status: 405,
+          headers: { 'Allow': 'GET' }
+        }),
+        correlationId
+      )
+    }
+    const response = await handleMetrics(request, env)
+    const cpuTime = performance.now() - startTime
+    log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), status: response.status })
+    return addCorrelationId(response, correlationId)
+  }
+
   // Auth routes (/login, /callback, /logout, /me)
   const authResponse = await handleAuth(request, env, url)
   if (authResponse) return addCorrelationId(authResponse, correlationId)
 
   // Ingest endpoint
-  if ((url.pathname === '/ingest' || url.pathname === '/e') && request.method === 'POST') {
+  if (url.pathname === '/ingest' || url.pathname === '/e') {
+    if (request.method !== 'POST') {
+      return addCorrelationId(
+        Response.json({ error: 'Method not allowed' }, {
+          status: 405,
+          headers: { 'Allow': 'POST' }
+        }),
+        correlationId
+      )
+    }
     const response = await handleIngest(request, env, ctx)
     const cpuTime = performance.now() - startTime
     log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), status: response.status })
@@ -178,7 +210,16 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     }
 
     // Query builder endpoint
-    if (url.pathname === '/query' && request.method === 'POST') {
+    if (url.pathname === '/query') {
+      if (request.method !== 'POST') {
+        return addCorrelationId(
+          Response.json({ error: 'Method not allowed' }, {
+            status: 405,
+            headers: { 'Allow': 'POST' }
+          }),
+          correlationId
+        )
+      }
       const response = await handleQuery(request, env, adminTenant)
       const cpuTime = performance.now() - startTime
       log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
@@ -186,7 +227,16 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     }
 
     // Recent events
-    if (url.pathname === '/recent' && request.method === 'GET') {
+    if (url.pathname === '/recent') {
+      if (request.method !== 'GET') {
+        return addCorrelationId(
+          Response.json({ error: 'Method not allowed' }, {
+            status: 405,
+            headers: { 'Allow': 'GET' }
+          }),
+          correlationId
+        )
+      }
       const response = await handleRecent(request, env)
       const cpuTime = performance.now() - startTime
       log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
@@ -194,7 +244,16 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     }
 
     // Events query (parquet)
-    if (url.pathname === '/events' && request.method === 'GET') {
+    if (url.pathname === '/events') {
+      if (request.method !== 'GET') {
+        return addCorrelationId(
+          Response.json({ error: 'Method not allowed' }, {
+            status: 405,
+            headers: { 'Allow': 'GET' }
+          }),
+          correlationId
+        )
+      }
       const response = await handleEventsQuery(request, env)
       const cpuTime = performance.now() - startTime
       log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
@@ -202,7 +261,16 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     }
 
     // Pipeline bucket check
-    if (url.pathname === '/pipeline' && request.method === 'GET') {
+    if (url.pathname === '/pipeline') {
+      if (request.method !== 'GET') {
+        return addCorrelationId(
+          Response.json({ error: 'Method not allowed' }, {
+            status: 405,
+            headers: { 'Allow': 'GET' }
+          }),
+          correlationId
+        )
+      }
       const response = await handlePipelineCheck(request, env)
       const cpuTime = performance.now() - startTime
       log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })
@@ -229,48 +297,105 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     if (url.pathname.startsWith('/schemas')) {
       let response: Response | null = null
 
-      // POST /schemas - Register schema
-      if (url.pathname === '/schemas' && request.method === 'POST') {
-        response = await handleRegisterSchema(request, env)
-      }
-      // GET /schemas - List schemas
-      else if (url.pathname === '/schemas' && request.method === 'GET') {
-        response = await handleListSchemas(request, env)
+      // /schemas - supports GET and POST
+      if (url.pathname === '/schemas') {
+        if (request.method === 'POST') {
+          response = await handleRegisterSchema(request, env)
+        } else if (request.method === 'GET') {
+          response = await handleListSchemas(request, env)
+        } else {
+          return addCorrelationId(
+            Response.json({ error: 'Method not allowed' }, {
+              status: 405,
+              headers: { 'Allow': 'GET, POST' }
+            }),
+            correlationId
+          )
+        }
       }
       // POST /schemas/validate - Validate events (testing endpoint)
-      else if (url.pathname === '/schemas/validate' && request.method === 'POST') {
+      else if (url.pathname === '/schemas/validate') {
+        if (request.method !== 'POST') {
+          return addCorrelationId(
+            Response.json({ error: 'Method not allowed' }, {
+              status: 405,
+              headers: { 'Allow': 'POST' }
+            }),
+            correlationId
+          )
+        }
         response = await handleValidateEvents(request, env)
       }
-      // PUT /schemas/namespace/:namespace/config - Configure namespace
-      else if (url.pathname.match(/^\/schemas\/namespace\/[^/]+\/config$/) && request.method === 'PUT') {
-        const namespace = url.pathname.split('/')[3]!
-        response = await handleConfigureNamespace(request, env, { namespace })
-      }
-      // GET /schemas/namespace/:namespace/config - Get namespace config
-      else if (url.pathname.match(/^\/schemas\/namespace\/[^/]+\/config$/) && request.method === 'GET') {
-        const namespace = url.pathname.split('/')[3]!
-        response = await handleGetNamespaceConfig(request, env, { namespace })
+      // /schemas/namespace/:namespace/config - supports GET and PUT
+      else if (url.pathname.match(/^\/schemas\/namespace\/[^/]+\/config$/)) {
+        const configParts = url.pathname.split('/')
+        const namespace = configParts[3]
+        if (!namespace) {
+          return addCorrelationId(
+            Response.json({ error: 'Invalid path: missing namespace' }, { status: 400 }),
+            correlationId
+          )
+        }
+        if (request.method === 'PUT') {
+          response = await handleConfigureNamespace(request, env, { namespace })
+        } else if (request.method === 'GET') {
+          response = await handleGetNamespaceConfig(request, env, { namespace })
+        } else {
+          return addCorrelationId(
+            Response.json({ error: 'Method not allowed' }, {
+              status: 405,
+              headers: { 'Allow': 'GET, PUT' }
+            }),
+            correlationId
+          )
+        }
       }
       // GET /schemas/:namespace/:eventType/history - Get schema history
-      else if (url.pathname.match(/^\/schemas\/[^/]+\/[^/]+\/history$/) && request.method === 'GET') {
-        const parts = url.pathname.split('/')
-        const namespace = parts[2]!
-        const eventType = decodeURIComponent(parts[3]!)
-        response = await handleGetSchemaHistory(request, env, { namespace, eventType })
+      else if (url.pathname.match(/^\/schemas\/[^/]+\/[^/]+\/history$/)) {
+        if (request.method !== 'GET') {
+          return addCorrelationId(
+            Response.json({ error: 'Method not allowed' }, {
+              status: 405,
+              headers: { 'Allow': 'GET' }
+            }),
+            correlationId
+          )
+        }
+        const historyParts = url.pathname.split('/')
+        const namespace = historyParts[2]
+        const eventType = historyParts[3]
+        if (!namespace || !eventType) {
+          return addCorrelationId(
+            Response.json({ error: 'Invalid path: missing namespace or eventType' }, { status: 400 }),
+            correlationId
+          )
+        }
+        response = await handleGetSchemaHistory(request, env, { namespace, eventType: decodeURIComponent(eventType) })
       }
-      // GET /schemas/:namespace/:eventType - Get specific schema
-      else if (url.pathname.match(/^\/schemas\/[^/]+\/[^/]+$/) && request.method === 'GET') {
-        const parts = url.pathname.split('/')
-        const namespace = parts[2]!
-        const eventType = decodeURIComponent(parts[3]!)
-        response = await handleGetSchema(request, env, { namespace, eventType })
-      }
-      // DELETE /schemas/:namespace/:eventType - Delete schema
-      else if (url.pathname.match(/^\/schemas\/[^/]+\/[^/]+$/) && request.method === 'DELETE') {
-        const parts = url.pathname.split('/')
-        const namespace = parts[2]!
-        const eventType = decodeURIComponent(parts[3]!)
-        response = await handleDeleteSchema(request, env, { namespace, eventType })
+      // /schemas/:namespace/:eventType - supports GET and DELETE
+      else if (url.pathname.match(/^\/schemas\/[^/]+\/[^/]+$/)) {
+        const schemaParts = url.pathname.split('/')
+        const namespace = schemaParts[2]
+        const eventType = schemaParts[3]
+        if (!namespace || !eventType) {
+          return addCorrelationId(
+            Response.json({ error: 'Invalid path: missing namespace or eventType' }, { status: 400 }),
+            correlationId
+          )
+        }
+        if (request.method === 'GET') {
+          response = await handleGetSchema(request, env, { namespace, eventType: decodeURIComponent(eventType) })
+        } else if (request.method === 'DELETE') {
+          response = await handleDeleteSchema(request, env, { namespace, eventType: decodeURIComponent(eventType) })
+        } else {
+          return addCorrelationId(
+            Response.json({ error: 'Method not allowed' }, {
+              status: 405,
+              headers: { 'Allow': 'GET, DELETE' }
+            }),
+            correlationId
+          )
+        }
       }
 
       if (response) {
@@ -281,7 +406,16 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     }
 
     // Benchmark results
-    if (url.pathname === '/benchmark' && request.method === 'GET') {
+    if (url.pathname === '/benchmark') {
+      if (request.method !== 'GET') {
+        return addCorrelationId(
+          Response.json({ error: 'Method not allowed' }, {
+            status: 405,
+            headers: { 'Allow': 'GET' }
+          }),
+          correlationId
+        )
+      }
       const response = await handleBenchmark(request, env)
       const cpuTime = performance.now() - startTime
       log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), user, status: response.status })

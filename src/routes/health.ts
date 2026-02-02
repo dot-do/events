@@ -4,6 +4,7 @@
 
 import type { Env } from '../env'
 import { authCorsHeaders } from '../utils'
+import { successResponse, errorResponse, ErrorCodes } from '../utils/response'
 
 export function handleHealth(
   request: Request,
@@ -17,7 +18,7 @@ export function handleHealth(
   const serviceName = isWebhooksDomain ? 'webhooks.do' : 'events.do'
   const cpuTime = performance.now() - startTime
   console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /health`)
-  return Response.json({
+  return successResponse({
     status: 'ok',
     service: serviceName,
     ts: new Date().toISOString(),
@@ -48,7 +49,7 @@ export async function handlePipelineCheck(request: Request, env: Env): Promise<R
   const rootList = await env.PIPELINE_BUCKET.list({ limit: 10 })
   const rootPrefixes = [...new Set(rootList.objects.map((o) => o.key.split('/')[0]))]
 
-  return Response.json({
+  return successResponse({
     bucket: 'platform-events',
     prefix,
     fileCount: listed.objects.length,
@@ -107,7 +108,7 @@ export async function handleBenchmark(request: Request, env: Env): Promise<Respo
     avgBytesPerEvent: s.events > 0 ? Math.round(s.totalBytes / s.events) : 0,
   }))
 
-  return Response.json({
+  return successResponse({
     bucket: 'events-parquet-test',
     prefix,
     fileCount: files.length,

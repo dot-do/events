@@ -604,35 +604,80 @@ export class ShardCoordinatorDO extends DurableObject<Env> {
       log.info('Started health checks')
     }
   }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // HTTP Fetch Handler - Health Check
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Handle HTTP requests to the DO
+   * GET /health - Returns health diagnostics with internal state metrics
+   */
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+
+    if (url.pathname === '/health' || url.pathname === '/diagnostics') {
+      const now = Date.now()
+      const stats = await this.getStats()
+
+      // Calculate total backpressure events
+      const totalBackpressureEvents = Array.from(this.shardMetrics.values())
+        .reduce((sum, m) => sum + m.backpressureCount, 0)
+
+      // Determine scaling state
+      const cooldownRemaining = Math.max(0, this.config.cooldownMs - (now - this.lastScaleTime))
+      const scalingState = cooldownRemaining > 0 ? 'cooldown' : 'ready'
+
+      const health = {
+        status: 'healthy',
+        initialized: this.initialized,
+        activeShards: {
+          count: this.activeShards.size,
+          ids: Array.from(this.activeShards).sort((a, b) => a - b),
+          minShards: this.config.minShards,
+          maxShards: this.config.maxShards,
+        },
+        scaling: {
+          state: scalingState,
+          lastScaleTime: new Date(this.lastScaleTime).toISOString(),
+          cooldownRemaining,
+          canScaleUp: stats.canScaleUp,
+          canScaleDown: stats.canScaleDown,
+          scaleUpThreshold: this.config.scaleUpThreshold,
+          scaleDownThreshold: this.config.scaleDownThreshold,
+        },
+        metrics: {
+          totalBuffered: stats.totalBuffered,
+          totalPendingWrites: stats.totalPendingWrites,
+          averageUtilization: stats.averageUtilization,
+          totalBackpressureEvents,
+          shardCount: this.shardMetrics.size,
+          metricsWindowMs: this.config.metricsWindowMs,
+        },
+        config: {
+          minShards: this.config.minShards,
+          maxShards: this.config.maxShards,
+          scaleUpThreshold: this.config.scaleUpThreshold,
+          scaleDownThreshold: this.config.scaleDownThreshold,
+          cooldownMs: this.config.cooldownMs,
+          metricsWindowMs: this.config.metricsWindowMs,
+          healthCheckIntervalMs: this.config.healthCheckIntervalMs,
+        },
+        timestamp: new Date(now).toISOString(),
+      }
+
+      return new Response(JSON.stringify(health, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    return new Response('Not Found', { status: 404 })
+  }
 }
 
 // ============================================================================
-// Helper Functions
+// Helper Functions - Re-exported from shared module
 // ============================================================================
 
-/**
- * Get the shard coordinator instance
- */
-export function getShardCoordinator(env: Env): DurableObjectStub<ShardCoordinatorDO> | null {
-  if (!env.SHARD_COORDINATOR) return null
-  const id = env.SHARD_COORDINATOR.idFromName('global')
-  return env.SHARD_COORDINATOR.get(id)
-}
-
-/**
- * Get active shards from coordinator
- */
-export async function getActiveShards(env: Env): Promise<number[]> {
-  const coordinator = getShardCoordinator(env)
-  if (!coordinator) return [0]
-  return coordinator.getActiveShards()
-}
-
-/**
- * Get routing shard from coordinator
- */
-export async function getRoutingShard(env: Env, preferredShard?: number): Promise<number> {
-  const coordinator = getShardCoordinator(env)
-  if (!coordinator) return preferredShard ?? 0
-  return coordinator.getRoutingShard(preferredShard)
-}
+// Re-export sharding utilities from shared module for backwards compatibility
+export { getShardCoordinator, getActiveShards, getRoutingShard } from './utils/sharding'

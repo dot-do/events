@@ -6,7 +6,14 @@
 
 import type { SchemaRegistryDO } from '../../../core/src/schema-registry'
 import { SchemaValidationError as SchemaValidationErrorClass, toErrorResponse } from '../../../core/src/errors'
-import { corsHeaders } from '../../utils'
+import {
+  corsHeaders,
+  withTimeout,
+  CircuitBreaker,
+  CircuitBreakerOpenError,
+  TimeoutError,
+} from '../../utils'
+import { SCHEMA_VALIDATION_TIMEOUT_MS } from '../../config'
 import { recordIngestMetric } from '../../metrics'
 import { logger, logError } from '../../logger'
 import type { Env } from '../../env'
@@ -19,20 +26,55 @@ import type {
 } from './types'
 
 // ============================================================================
+// Circuit Breaker for Schema Registry
+// ============================================================================
+
+/**
+ * Circuit breaker for schema registry calls.
+ * Shared across all requests to track failures globally.
+ */
+const schemaRegistryCircuitBreaker = new CircuitBreaker('schema-registry', {
+  failureThreshold: 5,
+  resetTimeoutMs: 30000,
+  successThreshold: 2,
+})
+
+/**
+ * Get the schema registry circuit breaker (for testing/monitoring)
+ */
+export function getSchemaRegistryCircuitBreaker(): CircuitBreaker {
+  return schemaRegistryCircuitBreaker
+}
+
+// ============================================================================
 // Schema Validation
 // ============================================================================
 
 /**
  * Validate events against registered schemas
  * Returns null if validation passes or is disabled, otherwise returns validation errors
+ *
+ * Uses timeout protection and circuit breaker to prevent slow schema registry
+ * from causing cascading failures.
  */
 export async function validateEventsAgainstSchemas(
   events: { type: string; [key: string]: unknown }[],
   namespace: string,
-  env: Env
+  env: Env,
+  timeoutMs: number = SCHEMA_VALIDATION_TIMEOUT_MS
 ): Promise<SchemaValidationError[] | null> {
   // Check if schema validation is enabled
   if (env.ENABLE_SCHEMA_VALIDATION !== 'true' || !env.SCHEMA_REGISTRY) {
+    return null
+  }
+
+  // Check circuit breaker state before making the call
+  if (schemaRegistryCircuitBreaker.getState() === 'open') {
+    logger.warn('Schema registry circuit breaker is open, skipping validation', {
+      component: 'schema',
+      namespace,
+      eventCount: events.length,
+    })
     return null
   }
 
@@ -41,8 +83,14 @@ export async function validateEventsAgainstSchemas(
     const registryId = env.SCHEMA_REGISTRY.idFromName(namespace)
     const registry = env.SCHEMA_REGISTRY.get(registryId)
 
-    // Validate all events in batch
-    const result = (await registry.validateEvents(events, namespace)) as BatchValidationResult
+    // Validate all events in batch with timeout and circuit breaker protection
+    const result = await schemaRegistryCircuitBreaker.execute(async () => {
+      return withTimeout(
+        registry.validateEvents(events, namespace) as Promise<BatchValidationResult>,
+        timeoutMs,
+        `Schema validation timed out after ${timeoutMs}ms`
+      )
+    })
 
     if (!result.valid && result.results.length > 0) {
       // Return validation errors that caused rejection
@@ -57,13 +105,29 @@ export async function validateEventsAgainstSchemas(
 
     return null
   } catch (err) {
-    // Log but don't fail on schema registry errors - this allows events to pass through
-    // even if the schema registry is unavailable
-    logError(logger, 'Schema validation error - allowing events through', err, {
-      component: 'schema',
-      namespace,
-      eventCount: events.length,
-    })
+    // Handle timeout and circuit breaker errors specifically
+    if (err instanceof TimeoutError) {
+      logError(logger, 'Schema validation timed out - allowing events through', err, {
+        component: 'schema',
+        namespace,
+        eventCount: events.length,
+        timeoutMs,
+      })
+    } else if (err instanceof CircuitBreakerOpenError) {
+      logger.warn('Schema registry circuit breaker open - allowing events through', {
+        component: 'schema',
+        namespace,
+        eventCount: events.length,
+      })
+    } else {
+      // Log but don't fail on schema registry errors - this allows events to pass through
+      // even if the schema registry is unavailable
+      logError(logger, 'Schema validation error - allowing events through', err, {
+        component: 'schema',
+        namespace,
+        eventCount: events.length,
+      })
+    }
     return null
   }
 }

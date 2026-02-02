@@ -12,6 +12,135 @@ import { logger, logError } from '../logger'
 const log = logger.child({ component: 'EventsRoutes' })
 
 // ============================================================================
+// Bounded Priority Queue (Min-Heap)
+// ============================================================================
+
+/**
+ * A bounded priority queue that keeps only the top N items.
+ * Uses a min-heap so we can efficiently remove the smallest item
+ * when the queue exceeds capacity.
+ *
+ * For "newest first" queries, we want items with the HIGHEST timestamps,
+ * so the comparator should return negative when a < b (min-heap keeps smallest,
+ * which we evict to keep largest).
+ */
+export class BoundedPriorityQueue<T> {
+  private heap: T[] = []
+  private readonly capacity: number
+  private readonly compare: (a: T, b: T) => number
+
+  /**
+   * @param capacity Maximum number of items to keep
+   * @param compare Comparison function (like Array.sort). For "keep highest",
+   *                return negative when a < b. The smallest item (by this comparison)
+   *                will be evicted when over capacity.
+   */
+  constructor(capacity: number, compare: (a: T, b: T) => number) {
+    this.capacity = capacity
+    this.compare = compare
+  }
+
+  /**
+   * Add an item to the queue.
+   * Returns true if item was added (either had room or item beat the minimum).
+   */
+  add(item: T): boolean {
+    if (this.heap.length < this.capacity) {
+      // Still have room, just add it
+      this.heap.push(item)
+      this.bubbleUp(this.heap.length - 1)
+      return true
+    }
+
+    // At capacity - check if new item beats the minimum
+    if (this.compare(item, this.heap[0]) > 0) {
+      // New item is "greater" than minimum, replace it
+      this.heap[0] = item
+      this.bubbleDown(0)
+      return true
+    }
+
+    // New item doesn't make the cut
+    return false
+  }
+
+  /**
+   * Get the minimum value (top of heap) without removing it.
+   * Returns undefined if queue is empty.
+   */
+  peekMin(): T | undefined {
+    return this.heap[0]
+  }
+
+  /**
+   * Get the minimum timestamp in ms for early termination checks.
+   * Uses the provided timestamp extractor function.
+   */
+  getMinTimestamp(getTs: (item: T) => number): number {
+    if (this.heap.length === 0) return 0
+    return getTs(this.heap[0])
+  }
+
+  /**
+   * Get all items sorted in descending order (highest first).
+   */
+  toSortedArray(): T[] {
+    // Sort in descending order (reverse of heap's min-first order)
+    return [...this.heap].sort((a, b) => -this.compare(a, b))
+  }
+
+  /**
+   * Get all items unsorted (for cases where caller will sort).
+   */
+  toArray(): T[] {
+    return [...this.heap]
+  }
+
+  get size(): number {
+    return this.heap.length
+  }
+
+  get isFull(): boolean {
+    return this.heap.length >= this.capacity
+  }
+
+  private bubbleUp(index: number): void {
+    while (index > 0) {
+      const parentIndex = Math.floor((index - 1) / 2)
+      if (this.compare(this.heap[index], this.heap[parentIndex]) >= 0) break
+      this.swap(index, parentIndex)
+      index = parentIndex
+    }
+  }
+
+  private bubbleDown(index: number): void {
+    const length = this.heap.length
+    while (true) {
+      const leftChild = 2 * index + 1
+      const rightChild = 2 * index + 2
+      let smallest = index
+
+      if (leftChild < length && this.compare(this.heap[leftChild], this.heap[smallest]) < 0) {
+        smallest = leftChild
+      }
+      if (rightChild < length && this.compare(this.heap[rightChild], this.heap[smallest]) < 0) {
+        smallest = rightChild
+      }
+
+      if (smallest === index) break
+      this.swap(index, smallest)
+      index = smallest
+    }
+  }
+
+  private swap(i: number, j: number): void {
+    const temp = this.heap[i]
+    this.heap[i] = this.heap[j]
+    this.heap[j] = temp
+  }
+}
+
+// ============================================================================
 // Recent Events (Debug)
 // ============================================================================
 
@@ -215,14 +344,46 @@ export async function handleEventsQuery(request: Request, env: Env): Promise<Res
 
   const bucketsTotal = buckets.length
 
-  // Collect events (newest first)
-  const allEvents: Record<string, unknown>[] = []
+  // Use bounded priority queue to keep only top N events (newest first)
+  // +1 to know if there are more results for pagination
+  const targetCount = limit + 1
 
-  // Process buckets until we have enough events (with some buffer for filtering)
-  const targetCount = limit + 1 // +1 to know if there are more
+  // Comparator for min-heap: keeps items with LOWEST timestamps at top
+  // When full, we evict the oldest (lowest ts) to keep the newest
+  const eventQueue = new BoundedPriorityQueue<Record<string, unknown>>(
+    targetCount,
+    (a, b) => getTimestampMs(a.ts) - getTimestampMs(b.ts)
+  )
+
+  // Helper to get timestamp extractor for early termination checks
+  const getEventTs = (e: Record<string, unknown>) => getTimestampMs(e.ts)
+
+  // Track if we can terminate early (all remaining buckets have older events)
+  let canTerminateEarly = false
 
   for (const prefix of buckets) {
-    if (allEvents.length >= targetCount) break
+    // Early termination: if queue is full and current bucket's max possible timestamp
+    // (end of hour) is older than our oldest kept event, we can stop
+    if (eventQueue.isFull && !canTerminateEarly) {
+      // Extract hour from prefix like "events/2024/01/15/14/"
+      const parts = prefix.split('/')
+      if (parts.length >= 5) {
+        const bucketEndMs = new Date(
+          parseInt(parts[1]),
+          parseInt(parts[2]) - 1, // month is 0-indexed
+          parseInt(parts[3]),
+          parseInt(parts[4]),
+          59, 59, 999 // end of hour
+        ).getTime()
+
+        const minKeptTs = eventQueue.getMinTimestamp(getEventTs)
+        if (bucketEndMs < minKeptTs) {
+          canTerminateEarly = true
+        }
+      }
+    }
+
+    if (canTerminateEarly) break
     bucketsScanned++
 
     const listStart = performance.now()
@@ -245,79 +406,72 @@ export async function handleEventsQuery(request: Request, env: Env): Promise<Res
 
     // Read files in parallel batches for speed
     const BATCH_SIZE = 10
-    const filesToRead = targetFiles.slice(0, Math.min(targetFiles.length, targetCount - allEvents.length + 10))
 
-    for (let i = 0; i < filesToRead.length && allEvents.length < targetCount; i += BATCH_SIZE) {
-      const batch = filesToRead.slice(i, i + BATCH_SIZE)
+    for (let i = 0; i < targetFiles.length; i += BATCH_SIZE) {
+      const batch = targetFiles.slice(i, i + BATCH_SIZE)
 
       const readStart = performance.now()
       const results = await Promise.all(
         batch.map(async (file) => {
           try {
             const obj = await env.EVENTS_BUCKET.get(file.key)
-            if (!obj) return { file, events: [] as Record<string, unknown>[] }
+            if (!obj) return { file, scanned: 0 }
 
             filesRead++
             bytesRead += file.size
+
+            let scanned = 0
 
             if (file.key.endsWith('.parquet')) {
               // Primary path: Parquet files (all new data)
               const buffer = await obj.arrayBuffer()
               const records = await readParquetRecords(buffer)
-              const events: Record<string, unknown>[] = []
 
               for (const record of records) {
-                eventsScanned++
+                scanned++
                 if (passesFilters(record, params)) {
-                  events.push(record)
+                  eventQueue.add(record)
                 }
               }
-              return { file, events }
             } else {
               // Legacy fallback: JSONL files (historical data from before Parquet migration)
               const text = await obj.text()
               const lines = text.split('\n').filter(Boolean)
-              const events: Record<string, unknown>[] = []
 
               for (const line of lines) {
-                eventsScanned++
+                scanned++
                 try {
                   const record = JSON.parse(line) as Record<string, unknown>
                   if (passesFilters(record, params)) {
-                    events.push(record)
+                    eventQueue.add(record)
                   }
                 } catch {
                   // Skip malformed
                 }
               }
-              return { file, events }
             }
+            return { file, scanned }
           } catch (err) {
             logError(log, 'Error reading events file', err, { key: file.key })
-            return { file, events: [] as Record<string, unknown>[] }
+            return { file, scanned: 0 }
           }
         })
       )
       readMs += performance.now() - readStart
 
-      // Collect events from batch (maintaining file order = time order)
+      // Update scanned count
       for (const result of results) {
-        allEvents.push(...result.events)
+        eventsScanned += result.scanned
       }
     }
   }
 
-  // Sort all events by timestamp descending
-  // Handle both string (ISO) and BigInt (ms) timestamps
-  allEvents.sort((a, b) => {
-    const tsA = getTimestampMs(a.ts)
-    const tsB = getTimestampMs(b.ts)
-    return tsB - tsA
-  })
+  // Get sorted events from the priority queue (newest first)
+  const sortedEvents = eventQueue.toSortedArray()
 
   // Check if there are more results
-  const hasMore = allEvents.length > limit
-  const events = allEvents.slice(0, limit)
+  const hasMore = sortedEvents.length > limit
+  const events = sortedEvents.slice(0, limit)
 
   // Get cursors for pagination (convert to ISO string for cursor values)
   const firstEvent = events[0]

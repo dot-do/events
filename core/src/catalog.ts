@@ -19,8 +19,10 @@ import {
   getOptionalNumber,
   getJson,
   getOptionalJson,
+  typedExec,
   type SqlRow,
 } from './sql-mapper.js'
+import { runMigrations, type Migration } from './migrations.js'
 
 // Env type - users should extend this for their specific bindings
 // eslint-disable-next-line @typescript-eslint/no-empty-interface
@@ -147,6 +149,104 @@ export interface TableMetadata {
 }
 
 // ============================================================================
+// Migrations
+// ============================================================================
+
+/**
+ * CatalogDO schema migrations
+ * Add new migrations at the end with incrementing version numbers
+ */
+const CATALOG_MIGRATIONS: Migration[] = [
+  {
+    version: 1,
+    description: 'Initial schema - namespaces, tables, snapshots, data_files, schema_history',
+    up: (sql) => {
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS namespaces (
+          name TEXT PRIMARY KEY,
+          properties TEXT DEFAULT '{}',
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+      `)
+
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS tables (
+          id TEXT PRIMARY KEY,
+          namespace TEXT NOT NULL,
+          name TEXT NOT NULL,
+          location TEXT NOT NULL,
+          metadata TEXT NOT NULL,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(namespace, name)
+        )
+      `)
+
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS snapshots (
+          id TEXT PRIMARY KEY,
+          table_id TEXT NOT NULL,
+          parent_id TEXT,
+          timestamp_ms INTEGER NOT NULL,
+          operation TEXT NOT NULL,
+          manifest_list TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          cdc_bookmark TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (table_id) REFERENCES tables(id)
+        )
+      `)
+
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS data_files (
+          path TEXT PRIMARY KEY,
+          table_id TEXT NOT NULL,
+          snapshot_id TEXT NOT NULL,
+          format TEXT NOT NULL,
+          record_count INTEGER NOT NULL,
+          file_size_bytes INTEGER NOT NULL,
+          column_stats TEXT,
+          partition_values TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (table_id) REFERENCES tables(id),
+          FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
+        )
+      `)
+
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS schema_history (
+          id TEXT PRIMARY KEY,
+          table_id TEXT NOT NULL,
+          version INTEGER NOT NULL,
+          fields TEXT NOT NULL,
+          from_version INTEGER,
+          changes TEXT,
+          trigger TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (table_id) REFERENCES tables(id),
+          UNIQUE(table_id, version)
+        )
+      `)
+
+      sql.exec(`CREATE INDEX IF NOT EXISTS idx_tables_namespace ON tables(namespace)`)
+      sql.exec(`CREATE INDEX IF NOT EXISTS idx_snapshots_table ON snapshots(table_id)`)
+      sql.exec(`CREATE INDEX IF NOT EXISTS idx_files_table ON data_files(table_id)`)
+      sql.exec(`CREATE INDEX IF NOT EXISTS idx_files_snapshot ON data_files(snapshot_id)`)
+      sql.exec(`CREATE INDEX IF NOT EXISTS idx_schema_history_table ON schema_history(table_id)`)
+    },
+  },
+  // Add future migrations here with incrementing version numbers
+  // Example:
+  // {
+  //   version: 2,
+  //   description: 'Add retention_policy column to tables',
+  //   up: (sql) => {
+  //     sql.exec(`ALTER TABLE tables ADD COLUMN retention_policy TEXT`)
+  //   },
+  // },
+]
+
+// ============================================================================
 // Catalog DO
 // ============================================================================
 
@@ -157,71 +257,8 @@ export class CatalogDO extends DurableObject<Env> {
     super(ctx, env)
     this.sql = ctx.storage.sql
 
-    // Initialize schema
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS namespaces (
-        name TEXT PRIMARY KEY,
-        properties TEXT DEFAULT '{}',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS tables (
-        id TEXT PRIMARY KEY,
-        namespace TEXT NOT NULL,
-        name TEXT NOT NULL,
-        location TEXT NOT NULL,
-        metadata TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(namespace, name)
-      );
-
-      CREATE TABLE IF NOT EXISTS snapshots (
-        id TEXT PRIMARY KEY,
-        table_id TEXT NOT NULL,
-        parent_id TEXT,
-        timestamp_ms INTEGER NOT NULL,
-        operation TEXT NOT NULL,
-        manifest_list TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        cdc_bookmark TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (table_id) REFERENCES tables(id)
-      );
-
-      CREATE TABLE IF NOT EXISTS data_files (
-        path TEXT PRIMARY KEY,
-        table_id TEXT NOT NULL,
-        snapshot_id TEXT NOT NULL,
-        format TEXT NOT NULL,
-        record_count INTEGER NOT NULL,
-        file_size_bytes INTEGER NOT NULL,
-        column_stats TEXT,
-        partition_values TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (table_id) REFERENCES tables(id),
-        FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
-      );
-
-      CREATE TABLE IF NOT EXISTS schema_history (
-        id TEXT PRIMARY KEY,
-        table_id TEXT NOT NULL,
-        version INTEGER NOT NULL,
-        fields TEXT NOT NULL,
-        from_version INTEGER,
-        changes TEXT,
-        trigger TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (table_id) REFERENCES tables(id),
-        UNIQUE(table_id, version)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_tables_namespace ON tables(namespace);
-      CREATE INDEX IF NOT EXISTS idx_snapshots_table ON snapshots(table_id);
-      CREATE INDEX IF NOT EXISTS idx_files_table ON data_files(table_id);
-      CREATE INDEX IF NOT EXISTS idx_files_snapshot ON data_files(snapshot_id);
-      CREATE INDEX IF NOT EXISTS idx_schema_history_table ON schema_history(table_id);
-    `)
+    // Run migrations to initialize/update schema
+    runMigrations(this.sql, CATALOG_MIGRATIONS)
   }
 
   // ---------------------------------------------------------------------------
@@ -237,17 +274,19 @@ export class CatalogDO extends DurableObject<Env> {
   }
 
   async listNamespaces(): Promise<string[]> {
-    const rows = this.sql.exec(`SELECT name FROM namespaces ORDER BY name`).toArray()
-    return rows.map((r) => getString(r as SqlRow, 'name'))
+    const { rows } = typedExec(this.sql, `SELECT name FROM namespaces ORDER BY name`)
+    return rows.map((r) => getString(r, 'name'))
   }
 
   async dropNamespace(name: string): Promise<void> {
     // Check for tables first
-    const tables = this.sql.exec(
+    const { one } = typedExec(
+      this.sql,
       `SELECT COUNT(*) as count FROM tables WHERE namespace = ?`,
       name
-    ).one()
-    if (tables && getNumber(tables as SqlRow, 'count') > 0) {
+    )
+    const tables = one()
+    if (tables && getNumber(tables, 'count') > 0) {
       throw new Error(`Namespace ${name} is not empty`)
     }
     this.sql.exec(`DELETE FROM namespaces WHERE name = ?`, name)
@@ -301,20 +340,23 @@ export class CatalogDO extends DurableObject<Env> {
   }
 
   async loadTable(namespace: string, name: string): Promise<TableMetadata | null> {
-    const row = this.sql.exec(
+    const { one } = typedExec(
+      this.sql,
       `SELECT metadata FROM tables WHERE namespace = ? AND name = ?`,
       namespace,
       name
-    ).one()
-    return row ? getJson<TableMetadata>(row as SqlRow, 'metadata') : null
+    )
+    const row = one()
+    return row ? getJson<TableMetadata>(row, 'metadata') : null
   }
 
   async listTables(namespace: string): Promise<string[]> {
-    const rows = this.sql.exec(
+    const { rows } = typedExec(
+      this.sql,
       `SELECT name FROM tables WHERE namespace = ? ORDER BY name`,
       namespace
-    ).toArray()
-    return rows.map((r) => getString(r as SqlRow, 'name'))
+    )
+    return rows.map((r) => getString(r, 'name'))
   }
 
   async dropTable(namespace: string, name: string): Promise<void> {
@@ -438,22 +480,24 @@ export class CatalogDO extends DurableObject<Env> {
     const table = await this.loadTable(namespace, tableName)
     if (!table) return null
 
-    const row = this.sql.exec(
+    const { one } = typedExec(
+      this.sql,
       `SELECT * FROM snapshots WHERE table_id = ? AND cdc_bookmark = ? LIMIT 1`,
       table.tableId,
       cdcBookmark
-    ).one()
+    )
+    const row = one()
 
     if (!row) return null
 
     return {
-      snapshotId: getString(row as SqlRow, 'id'),
-      parentSnapshotId: getOptionalString(row as SqlRow, 'parent_id') ?? undefined,
-      timestampMs: getNumber(row as SqlRow, 'timestamp_ms'),
-      operation: getString(row as SqlRow, 'operation') as Snapshot['operation'],
-      manifestList: getJson<string[]>(row as SqlRow, 'manifest_list'),
-      summary: getJson<Snapshot['summary']>(row as SqlRow, 'summary'),
-      cdcBookmark: getOptionalString(row as SqlRow, 'cdc_bookmark') ?? undefined,
+      snapshotId: getString(row, 'id'),
+      parentSnapshotId: getOptionalString(row, 'parent_id') ?? undefined,
+      timestampMs: getNumber(row, 'timestamp_ms'),
+      operation: getString(row, 'operation') as Snapshot['operation'],
+      manifestList: getJson<string[]>(row, 'manifest_list'),
+      summary: getJson<Snapshot['summary']>(row, 'summary'),
+      cdcBookmark: getOptionalString(row, 'cdc_bookmark') ?? undefined,
     }
   }
 
@@ -465,24 +509,26 @@ export class CatalogDO extends DurableObject<Env> {
     const table = await this.loadTable(namespace, tableName)
     if (!table) return null
 
-    const row = this.sql.exec(
+    const { one } = typedExec(
+      this.sql,
       `SELECT * FROM snapshots
        WHERE table_id = ? AND timestamp_ms <= ?
        ORDER BY timestamp_ms DESC LIMIT 1`,
       table.tableId,
       timestampMs
-    ).one()
+    )
+    const row = one()
 
     if (!row) return null
 
     return {
-      snapshotId: getString(row as SqlRow, 'id'),
-      parentSnapshotId: getOptionalString(row as SqlRow, 'parent_id') ?? undefined,
-      timestampMs: getNumber(row as SqlRow, 'timestamp_ms'),
-      operation: getString(row as SqlRow, 'operation') as Snapshot['operation'],
-      manifestList: getJson<string[]>(row as SqlRow, 'manifest_list'),
-      summary: getJson<Snapshot['summary']>(row as SqlRow, 'summary'),
-      cdcBookmark: getOptionalString(row as SqlRow, 'cdc_bookmark') ?? undefined,
+      snapshotId: getString(row, 'id'),
+      parentSnapshotId: getOptionalString(row, 'parent_id') ?? undefined,
+      timestampMs: getNumber(row, 'timestamp_ms'),
+      operation: getString(row, 'operation') as Snapshot['operation'],
+      manifestList: getJson<string[]>(row, 'manifest_list'),
+      summary: getJson<Snapshot['summary']>(row, 'summary'),
+      cdcBookmark: getOptionalString(row, 'cdc_bookmark') ?? undefined,
     }
   }
 
@@ -501,20 +547,21 @@ export class CatalogDO extends DurableObject<Env> {
     const targetSnapshot = snapshotId || table.currentSnapshotId
     if (!targetSnapshot) return []
 
-    const rows = this.sql.exec(
+    const { rows } = typedExec(
+      this.sql,
       `SELECT * FROM data_files WHERE table_id = ? AND snapshot_id = ?`,
       table.tableId,
       targetSnapshot
-    ).toArray()
+    )
 
     return rows.map((r) => ({
-      path: getString(r as SqlRow, 'path'),
-      format: getString(r as SqlRow, 'format') as 'parquet' | 'jsonl',
-      recordCount: getNumber(r as SqlRow, 'record_count'),
-      fileSizeBytes: getNumber(r as SqlRow, 'file_size_bytes'),
-      columnStats: getOptionalJson<Record<string, ColumnStats>>(r as SqlRow, 'column_stats') ?? undefined,
-      partitionValues: getOptionalJson<Record<string, string>>(r as SqlRow, 'partition_values') ?? undefined,
-      createdAt: getOptionalString(r as SqlRow, 'created_at') ?? new Date().toISOString(),
+      path: getString(r, 'path'),
+      format: getString(r, 'format') as 'parquet' | 'jsonl',
+      recordCount: getNumber(r, 'record_count'),
+      fileSizeBytes: getNumber(r, 'file_size_bytes'),
+      columnStats: getOptionalJson<Record<string, ColumnStats>>(r, 'column_stats') ?? undefined,
+      partitionValues: getOptionalJson<Record<string, string>>(r, 'partition_values') ?? undefined,
+      createdAt: getOptionalString(r, 'created_at') ?? new Date().toISOString(),
     }))
   }
 
@@ -605,10 +652,11 @@ export class CatalogDO extends DurableObject<Env> {
     const table = await this.loadTable(namespace, tableName)
     if (!table) return []
 
-    const rows = this.sql.exec(
+    const { rows } = typedExec(
+      this.sql,
       `SELECT * FROM schema_history WHERE table_id = ? ORDER BY version ASC`,
       table.tableId
-    ).toArray()
+    )
 
     // If no history in schema_history table, fall back to table metadata
     if (rows.length === 0) {
@@ -620,18 +668,18 @@ export class CatalogDO extends DurableObject<Env> {
     }
 
     return rows.map((r) => {
-      const change = getOptionalJson<FieldChange[]>(r as SqlRow, 'changes')
+      const change = getOptionalJson<FieldChange[]>(r, 'changes')
       return {
-        version: getNumber(r as SqlRow, 'version'),
-        fields: getJson<SchemaField[]>(r as SqlRow, 'fields'),
-        createdAt: getOptionalString(r as SqlRow, 'created_at') ?? new Date().toISOString(),
+        version: getNumber(r, 'version'),
+        fields: getJson<SchemaField[]>(r, 'fields'),
+        createdAt: getOptionalString(r, 'created_at') ?? new Date().toISOString(),
         change: change ? {
-          changeId: getString(r as SqlRow, 'id'),
-          fromVersion: getOptionalNumber(r as SqlRow, 'from_version') ?? 0,
-          toVersion: getNumber(r as SqlRow, 'version'),
+          changeId: getString(r, 'id'),
+          fromVersion: getOptionalNumber(r, 'from_version') ?? 0,
+          toVersion: getNumber(r, 'version'),
           changes: change,
-          timestamp: getString(r as SqlRow, 'created_at'),
-          trigger: getOptionalString(r as SqlRow, 'trigger') as SchemaChange['trigger'],
+          timestamp: getString(r, 'created_at'),
+          trigger: getOptionalString(r, 'trigger') as SchemaChange['trigger'],
         } : undefined,
       }
     })
@@ -860,6 +908,446 @@ export class CatalogDO extends DurableObject<Env> {
       null,
       'manual'
     )
+  }
+
+  // ---------------------------------------------------------------------------
+  // Quota Management
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Initialize quota tables (called during schema migration)
+   */
+  private initQuotaTables(): void {
+    this.sql.exec(`
+      -- Quota configuration per namespace
+      CREATE TABLE IF NOT EXISTS namespace_quotas (
+        namespace TEXT PRIMARY KEY,
+        max_events_per_day INTEGER NOT NULL DEFAULT 0,
+        max_storage_bytes INTEGER NOT NULL DEFAULT 0,
+        max_subscriptions INTEGER NOT NULL DEFAULT 0,
+        max_schemas INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+
+      -- Usage tracking per namespace
+      CREATE TABLE IF NOT EXISTS namespace_usage (
+        namespace TEXT PRIMARY KEY,
+        events_today INTEGER NOT NULL DEFAULT 0,
+        events_date TEXT NOT NULL,
+        storage_bytes INTEGER NOT NULL DEFAULT 0,
+        subscriptions INTEGER NOT NULL DEFAULT 0,
+        schemas INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      );
+    `)
+  }
+
+  /**
+   * Get current date in YYYY-MM-DD format (UTC)
+   */
+  private getCurrentDateString(): string {
+    return new Date().toISOString().slice(0, 10)
+  }
+
+  /**
+   * Get quota configuration for a namespace
+   */
+  async getQuota(namespace: string): Promise<{
+    maxEventsPerDay: number
+    maxStorageBytes: number
+    maxSubscriptions: number
+    maxSchemas: number
+  }> {
+    // Ensure quota tables exist
+    this.initQuotaTables()
+
+    const { one } = typedExec(
+      this.sql,
+      `SELECT * FROM namespace_quotas WHERE namespace = ?`,
+      namespace
+    )
+    const row = one()
+
+    if (!row) {
+      // Return default (unlimited) quota
+      return {
+        maxEventsPerDay: 0,
+        maxStorageBytes: 0,
+        maxSubscriptions: 0,
+        maxSchemas: 0,
+      }
+    }
+
+    return {
+      maxEventsPerDay: getNumber(row, 'max_events_per_day'),
+      maxStorageBytes: getNumber(row, 'max_storage_bytes'),
+      maxSubscriptions: getNumber(row, 'max_subscriptions'),
+      maxSchemas: getNumber(row, 'max_schemas'),
+    }
+  }
+
+  /**
+   * Set quota configuration for a namespace
+   */
+  async setQuota(
+    namespace: string,
+    quota: {
+      maxEventsPerDay?: number
+      maxStorageBytes?: number
+      maxSubscriptions?: number
+      maxSchemas?: number
+    }
+  ): Promise<void> {
+    // Ensure quota tables exist
+    this.initQuotaTables()
+
+    const now = new Date().toISOString()
+
+    // Check if quota already exists
+    const { one } = typedExec(
+      this.sql,
+      `SELECT namespace FROM namespace_quotas WHERE namespace = ?`,
+      namespace
+    )
+    const existing = one()
+
+    if (existing) {
+      // Update existing quota
+      const updates: string[] = ['updated_at = ?']
+      const values: unknown[] = [now]
+
+      if (quota.maxEventsPerDay !== undefined) {
+        updates.push('max_events_per_day = ?')
+        values.push(quota.maxEventsPerDay)
+      }
+      if (quota.maxStorageBytes !== undefined) {
+        updates.push('max_storage_bytes = ?')
+        values.push(quota.maxStorageBytes)
+      }
+      if (quota.maxSubscriptions !== undefined) {
+        updates.push('max_subscriptions = ?')
+        values.push(quota.maxSubscriptions)
+      }
+      if (quota.maxSchemas !== undefined) {
+        updates.push('max_schemas = ?')
+        values.push(quota.maxSchemas)
+      }
+
+      values.push(namespace)
+      this.sql.exec(
+        `UPDATE namespace_quotas SET ${updates.join(', ')} WHERE namespace = ?`,
+        ...values
+      )
+    } else {
+      // Insert new quota
+      this.sql.exec(
+        `INSERT INTO namespace_quotas (namespace, max_events_per_day, max_storage_bytes, max_subscriptions, max_schemas, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        namespace,
+        quota.maxEventsPerDay ?? 0,
+        quota.maxStorageBytes ?? 0,
+        quota.maxSubscriptions ?? 0,
+        quota.maxSchemas ?? 0,
+        now,
+        now
+      )
+    }
+  }
+
+  /**
+   * Get current usage for a namespace
+   */
+  async getUsage(namespace: string): Promise<{
+    eventsToday: number
+    eventsDate: string
+    storageBytes: number
+    subscriptions: number
+    schemas: number
+  }> {
+    // Ensure quota tables exist
+    this.initQuotaTables()
+
+    const today = this.getCurrentDateString()
+
+    const { one } = typedExec(
+      this.sql,
+      `SELECT * FROM namespace_usage WHERE namespace = ?`,
+      namespace
+    )
+    const row = one()
+
+    if (!row) {
+      return {
+        eventsToday: 0,
+        eventsDate: today,
+        storageBytes: 0,
+        subscriptions: 0,
+        schemas: 0,
+      }
+    }
+
+    const eventsDate = getString(row, 'events_date')
+    const eventsToday = eventsDate === today ? getNumber(row, 'events_today') : 0
+
+    return {
+      eventsToday,
+      eventsDate: today,
+      storageBytes: getNumber(row, 'storage_bytes'),
+      subscriptions: getNumber(row, 'subscriptions'),
+      schemas: getNumber(row, 'schemas'),
+    }
+  }
+
+  /**
+   * Check if ingesting events would exceed quota
+   * Returns { allowed: true } if allowed, or { allowed: false, reason: string } if not
+   */
+  async checkEventQuota(
+    namespace: string,
+    eventCount: number
+  ): Promise<{ allowed: boolean; reason?: string }> {
+    const quota = await this.getQuota(namespace)
+    const usage = await this.getUsage(namespace)
+
+    // Check daily event limit
+    if (quota.maxEventsPerDay > 0) {
+      if (usage.eventsToday + eventCount > quota.maxEventsPerDay) {
+        return {
+          allowed: false,
+          reason: `Daily event quota exceeded: ${usage.eventsToday}/${quota.maxEventsPerDay} events used, cannot add ${eventCount} more`,
+        }
+      }
+    }
+
+    return { allowed: true }
+  }
+
+  /**
+   * Increment event counter for a namespace
+   * Automatically resets the counter if the date has changed
+   */
+  async incrementEventCount(namespace: string, count: number): Promise<void> {
+    // Ensure quota tables exist
+    this.initQuotaTables()
+
+    const today = this.getCurrentDateString()
+    const now = new Date().toISOString()
+
+    // Check if usage record exists
+    const { one } = typedExec(
+      this.sql,
+      `SELECT events_date FROM namespace_usage WHERE namespace = ?`,
+      namespace
+    )
+    const existing = one()
+
+    if (!existing) {
+      // Create new usage record
+      this.sql.exec(
+        `INSERT INTO namespace_usage (namespace, events_today, events_date, storage_bytes, subscriptions, schemas, updated_at)
+         VALUES (?, ?, ?, 0, 0, 0, ?)`,
+        namespace,
+        count,
+        today,
+        now
+      )
+    } else {
+      const existingDate = getString(existing, 'events_date')
+      if (existingDate === today) {
+        // Same day, increment counter
+        this.sql.exec(
+          `UPDATE namespace_usage SET events_today = events_today + ?, updated_at = ? WHERE namespace = ?`,
+          count,
+          now,
+          namespace
+        )
+      } else {
+        // New day, reset counter
+        this.sql.exec(
+          `UPDATE namespace_usage SET events_today = ?, events_date = ?, updated_at = ? WHERE namespace = ?`,
+          count,
+          today,
+          now,
+          namespace
+        )
+      }
+    }
+  }
+
+  /**
+   * Update storage usage for a namespace
+   */
+  async updateStorageUsage(namespace: string, bytes: number): Promise<void> {
+    // Ensure quota tables exist
+    this.initQuotaTables()
+
+    const now = new Date().toISOString()
+    const today = this.getCurrentDateString()
+
+    // Upsert usage record
+    const { one } = typedExec(
+      this.sql,
+      `SELECT namespace FROM namespace_usage WHERE namespace = ?`,
+      namespace
+    )
+    const existing = one()
+
+    if (!existing) {
+      this.sql.exec(
+        `INSERT INTO namespace_usage (namespace, events_today, events_date, storage_bytes, subscriptions, schemas, updated_at)
+         VALUES (?, 0, ?, ?, 0, 0, ?)`,
+        namespace,
+        today,
+        bytes,
+        now
+      )
+    } else {
+      this.sql.exec(
+        `UPDATE namespace_usage SET storage_bytes = ?, updated_at = ? WHERE namespace = ?`,
+        bytes,
+        now,
+        namespace
+      )
+    }
+  }
+
+  /**
+   * Update subscription count for a namespace
+   */
+  async updateSubscriptionCount(namespace: string, count: number): Promise<void> {
+    // Ensure quota tables exist
+    this.initQuotaTables()
+
+    const now = new Date().toISOString()
+    const today = this.getCurrentDateString()
+
+    const { one } = typedExec(
+      this.sql,
+      `SELECT namespace FROM namespace_usage WHERE namespace = ?`,
+      namespace
+    )
+    const existing = one()
+
+    if (!existing) {
+      this.sql.exec(
+        `INSERT INTO namespace_usage (namespace, events_today, events_date, storage_bytes, subscriptions, schemas, updated_at)
+         VALUES (?, 0, ?, 0, ?, 0, ?)`,
+        namespace,
+        today,
+        count,
+        now
+      )
+    } else {
+      this.sql.exec(
+        `UPDATE namespace_usage SET subscriptions = ?, updated_at = ? WHERE namespace = ?`,
+        count,
+        now,
+        namespace
+      )
+    }
+  }
+
+  /**
+   * Update schema count for a namespace
+   */
+  async updateSchemaCount(namespace: string, count: number): Promise<void> {
+    // Ensure quota tables exist
+    this.initQuotaTables()
+
+    const now = new Date().toISOString()
+    const today = this.getCurrentDateString()
+
+    const { one } = typedExec(
+      this.sql,
+      `SELECT namespace FROM namespace_usage WHERE namespace = ?`,
+      namespace
+    )
+    const existing = one()
+
+    if (!existing) {
+      this.sql.exec(
+        `INSERT INTO namespace_usage (namespace, events_today, events_date, storage_bytes, subscriptions, schemas, updated_at)
+         VALUES (?, 0, ?, 0, 0, ?, ?)`,
+        namespace,
+        today,
+        count,
+        now
+      )
+    } else {
+      this.sql.exec(
+        `UPDATE namespace_usage SET schemas = ?, updated_at = ? WHERE namespace = ?`,
+        count,
+        now,
+        namespace
+      )
+    }
+  }
+
+  /**
+   * Check all quota limits for a namespace
+   */
+  async checkAllQuotas(
+    namespace: string,
+    toAdd?: {
+      events?: number
+      storageBytes?: number
+      subscriptions?: number
+      schemas?: number
+    }
+  ): Promise<{ allowed: boolean; reason?: string; usage?: ReturnType<typeof this.getUsage> extends Promise<infer T> ? T : never; quota?: ReturnType<typeof this.getQuota> extends Promise<infer T> ? T : never }> {
+    const quota = await this.getQuota(namespace)
+    const usage = await this.getUsage(namespace)
+
+    // Check daily event limit
+    if (quota.maxEventsPerDay > 0 && toAdd?.events) {
+      if (usage.eventsToday + toAdd.events > quota.maxEventsPerDay) {
+        return {
+          allowed: false,
+          reason: `Daily event quota exceeded: ${usage.eventsToday}/${quota.maxEventsPerDay} events used`,
+          usage,
+          quota,
+        }
+      }
+    }
+
+    // Check storage limit
+    if (quota.maxStorageBytes > 0 && toAdd?.storageBytes) {
+      if (usage.storageBytes + toAdd.storageBytes > quota.maxStorageBytes) {
+        return {
+          allowed: false,
+          reason: `Storage quota exceeded: ${usage.storageBytes}/${quota.maxStorageBytes} bytes used`,
+          usage,
+          quota,
+        }
+      }
+    }
+
+    // Check subscription limit
+    if (quota.maxSubscriptions > 0 && toAdd?.subscriptions) {
+      if (usage.subscriptions + toAdd.subscriptions > quota.maxSubscriptions) {
+        return {
+          allowed: false,
+          reason: `Subscription quota exceeded: ${usage.subscriptions}/${quota.maxSubscriptions} subscriptions used`,
+          usage,
+          quota,
+        }
+      }
+    }
+
+    // Check schema limit
+    if (quota.maxSchemas > 0 && toAdd?.schemas) {
+      if (usage.schemas + toAdd.schemas > quota.maxSchemas) {
+        return {
+          allowed: false,
+          reason: `Schema quota exceeded: ${usage.schemas}/${quota.maxSchemas} schemas used`,
+          usage,
+          quota,
+        }
+      }
+    }
+
+    return { allowed: true, usage, quota }
   }
 }
 

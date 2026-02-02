@@ -100,3 +100,9 @@ export {
   type EncryptionEnv,
   type EncryptedIngestContext,
 } from './encryption'
+
+// Quota middleware
+export {
+  quotaMiddleware,
+  trackEventUsage,
+} from './quota'

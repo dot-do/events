@@ -515,6 +515,7 @@ export async function handleDashboard(request: Request, env: Env, url: URL): Pro
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'",
     },
   })
 }

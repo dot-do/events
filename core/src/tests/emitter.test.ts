@@ -9,6 +9,13 @@ import { EventEmitter } from '../emitter.js'
 import type { DurableEvent } from '../types.js'
 import { EventBufferFullError, CircuitBreakerOpenError } from '../types.js'
 import { createMockCtx, createMockR2Bucket, createMockRequest } from './mocks.js'
+import {
+  sampleRpcCallEvent,
+  sampleCollectionInsertEvent,
+  createRpcCallEvent,
+  createEventBatch,
+  defaultDoIdentity,
+} from './fixtures/index.js'
 
 // ============================================================================
 // Tests

@@ -7,7 +7,9 @@
 
 import type { Env } from '../env'
 import { authCorsHeaders } from '../utils'
+import { successResponse, errorResponse, badRequest, forbidden, internalError, ErrorCodes } from '../utils/response'
 import type { TenantContext } from '../middleware/tenant'
+import { validateNamespace } from '../middleware/tenant'
 import { PayloadTooLargeError } from '../../core/src/errors'
 import { MAX_QUERY_BODY_SIZE } from '../middleware/ingest/types'
 import { readBodyWithLimit } from '../middleware/ingest/validate'
@@ -81,7 +83,11 @@ function validateQueryRequest(query: unknown): query is QueryRequest {
   if (q.doClass !== undefined && (typeof q.doClass !== 'string' || q.doClass.length > MAX_STRING_PARAM_LENGTH)) return false
   if (q.collection !== undefined && (typeof q.collection !== 'string' || q.collection.length > MAX_STRING_PARAM_LENGTH)) return false
   if (q.colo !== undefined && (typeof q.colo !== 'string' || q.colo.length > MAX_STRING_PARAM_LENGTH)) return false
-  if (q.namespace !== undefined && (typeof q.namespace !== 'string' || q.namespace.length > MAX_STRING_PARAM_LENGTH)) return false
+  if (q.namespace !== undefined) {
+    if (typeof q.namespace !== 'string' || q.namespace.length > MAX_STRING_PARAM_LENGTH) return false
+    const nsError = validateNamespace(q.namespace)
+    if (nsError) return false
+  }
 
   // Validate eventTypes if present
   if (q.eventTypes !== undefined) {
@@ -118,13 +124,11 @@ export async function handleQuery(request: Request, env: Env, tenant?: TenantCon
   if (contentLength) {
     const length = parseInt(contentLength, 10)
     if (!isNaN(length) && length > maxSize) {
-      return Response.json(
-        {
-          error: `Request body too large: ${length} bytes exceeds ${maxSize} byte limit`,
-          code: 'PAYLOAD_TOO_LARGE',
-          details: { maxSize, contentLength: length }
-        },
-        { status: 413, headers: authCorsHeaders(request, env) }
+      return errorResponse(
+        ErrorCodes.PAYLOAD_TOO_LARGE,
+        `Request body too large: ${length} bytes exceeds ${maxSize} byte limit`,
+        413,
+        { headers: authCorsHeaders(request, env), details: { maxSize, contentLength: length } }
       )
     }
   }
@@ -136,22 +140,21 @@ export async function handleQuery(request: Request, env: Env, tenant?: TenantCon
     queryBody = JSON.parse(bodyText)
   } catch (error) {
     if (error instanceof PayloadTooLargeError) {
-      return Response.json(
-        {
-          error: error.message,
-          code: 'PAYLOAD_TOO_LARGE',
-          details: error.details
-        },
-        { status: 413, headers: authCorsHeaders(request, env) }
+      return errorResponse(
+        ErrorCodes.PAYLOAD_TOO_LARGE,
+        error.message,
+        413,
+        { headers: authCorsHeaders(request, env), details: error.details }
       )
     }
-    return Response.json({ error: 'Invalid JSON' }, { status: 400, headers: authCorsHeaders(request, env) })
+    return badRequest('Invalid JSON', ErrorCodes.INVALID_JSON, { headers: authCorsHeaders(request, env) })
   }
 
   if (!validateQueryRequest(queryBody)) {
-    return Response.json(
-      { error: 'Invalid query parameters. Check dateRange (valid timestamps, start <= end), limit (1-10000), and string lengths (max 256 chars)' },
-      { status: 400, headers: authCorsHeaders(request, env) }
+    return badRequest(
+      'Invalid query parameters. Check dateRange (valid timestamps, start <= end), limit (1-10000), and string lengths (max 256 chars)',
+      ErrorCodes.INVALID_QUERY,
+      { headers: authCorsHeaders(request, env) }
     )
   }
 
@@ -163,9 +166,9 @@ export async function handleQuery(request: Request, env: Env, tenant?: TenantCon
   if (query.namespace) {
     // Explicit namespace in request - validate access
     if (tenant && !tenant.isAdmin && tenant.namespace !== query.namespace) {
-      return Response.json(
-        { error: 'Access denied: cannot query namespace you do not have access to' },
-        { status: 403, headers: authCorsHeaders(request, env) }
+      return forbidden(
+        'Access denied: cannot query namespace you do not have access to',
+        { headers: authCorsHeaders(request, env) }
       )
     }
     namespace = query.namespace
@@ -245,9 +248,9 @@ export async function handleQuery(request: Request, env: Env, tenant?: TenantCon
   // Validate pathPattern to prevent SQL injection
   // Even though pathPattern is built from Date methods, validate as defense-in-depth
   if (!validatePathPattern(pathPattern)) {
-    return Response.json(
-      { error: 'Invalid path pattern generated' },
-      { status: 500, headers: authCorsHeaders(request, env) }
+    return internalError(
+      'Invalid path pattern generated',
+      { headers: authCorsHeaders(request, env) }
     )
   }
 
@@ -275,7 +278,7 @@ FROM read_json_auto('${jsonlPattern}',
     sql += `\nLIMIT ${query.limit}`
   }
 
-  return Response.json({
+  return successResponse({
     sql,
     namespace: namespace || null,
     isolated: !!namespace,

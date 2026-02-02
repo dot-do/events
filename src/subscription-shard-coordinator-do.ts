@@ -22,6 +22,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { SubscriptionDO } from '../core/src/subscription'
 import { logger, sanitize, logError } from './logger'
+import { simpleHash } from './utils/hash'
 
 const log = logger.child({ component: 'SubscriptionShardCoordinator' })
 
@@ -261,7 +262,7 @@ export class SubscriptionShardCoordinatorDO extends DurableObject<Env> {
     let shardIndex: number
     if (hashKey) {
       // Consistent hashing based on the provided key
-      shardIndex = this.simpleHash(hashKey) % shardCount
+      shardIndex = simpleHash(hashKey) % shardCount
     } else if (state?.metrics && state.metrics.length > 0) {
       // Load-based routing: pick the shard with lowest load
       const lowestLoadShard = state.metrics.reduce((prev, curr) =>
@@ -664,16 +665,88 @@ export class SubscriptionShardCoordinatorDO extends DurableObject<Env> {
     }
   }
 
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // HTTP Fetch Handler - Health Check
+  // ──────────────────────────────────────────────────────────────────────────
+
   /**
-   * Simple string hash for consistent shard distribution
+   * Handle HTTP requests to the DO
+   * GET /health - Returns health diagnostics with internal state metrics
    */
-  private simpleHash(str: string): number {
-    let hash = 0
-    for (let i = 0; i < str.length; i++) {
-      hash = ((hash << 5) - hash) + str.charCodeAt(i)
-      hash |= 0
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+
+    if (url.pathname === '/health' || url.pathname === '/diagnostics') {
+      const now = Date.now()
+
+      // Calculate aggregate metrics across all prefixes
+      let totalShards = 0
+      let totalPendingDeliveries = 0
+      let totalActiveSubscriptions = 0
+      const prefixSummaries: Record<string, {
+        shardCount: number
+        pendingDeliveries: number
+        activeSubscriptions: number
+        lastScaleTime: string
+      }> = {}
+
+      for (const [prefix, state] of this.prefixStates) {
+        totalShards += state.activeShardCount
+
+        const prefixPending = state.metrics.reduce((sum, m) => sum + m.pendingDeliveries, 0)
+        const prefixSubscriptions = state.metrics.reduce((sum, m) => sum + m.activeSubscriptions, 0)
+
+        totalPendingDeliveries += prefixPending
+        totalActiveSubscriptions += prefixSubscriptions
+
+        prefixSummaries[prefix] = {
+          shardCount: state.activeShardCount,
+          pendingDeliveries: prefixPending,
+          activeSubscriptions: prefixSubscriptions,
+          lastScaleTime: new Date(state.lastScaleTime).toISOString(),
+        }
+      }
+
+      const health = {
+        status: 'healthy',
+        initialized: this.initialized,
+        shards: {
+          totalCount: totalShards,
+          prefixCount: this.prefixStates.size,
+          minShardsPerPrefix: this.config.minShardsPerPrefix,
+          maxShardsPerPrefix: this.config.maxShardsPerPrefix,
+        },
+        metrics: {
+          totalPendingDeliveries,
+          totalActiveSubscriptions,
+          scaleUpThreshold: this.config.scaleUpThreshold,
+          scaleDownThreshold: this.config.scaleDownThreshold,
+        },
+        prefixes: prefixSummaries,
+        scaling: {
+          lastScaleTime: new Date(this.lastScaleTime).toISOString(),
+          cooldownMs: this.config.cooldownMs,
+          metricsWindowMs: this.config.metricsWindowMs,
+        },
+        config: {
+          minShardsPerPrefix: this.config.minShardsPerPrefix,
+          maxShardsPerPrefix: this.config.maxShardsPerPrefix,
+          scaleUpThreshold: this.config.scaleUpThreshold,
+          scaleDownThreshold: this.config.scaleDownThreshold,
+          cooldownMs: this.config.cooldownMs,
+          metricsWindowMs: this.config.metricsWindowMs,
+          healthCheckIntervalMs: this.config.healthCheckIntervalMs,
+        },
+        timestamp: new Date(now).toISOString(),
+      }
+
+      return new Response(JSON.stringify(health, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      })
     }
-    return Math.abs(hash)
+
+    return new Response('Not Found', { status: 404 })
   }
 }
 

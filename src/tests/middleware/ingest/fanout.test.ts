@@ -29,6 +29,8 @@ import {
   processSubscriptionFanout,
   executeDirectFanout,
   executeQueueFanout,
+  getCDCProcessorCircuitBreaker,
+  getSubscriptionFanoutCircuitBreaker,
 } from '../../../middleware/ingest/fanout'
 import { logger } from '../../../logger'
 import type { IngestContext } from '../../../middleware/ingest/types'
@@ -36,9 +38,11 @@ import type { DurableEvent, EventBatch } from '@dotdo/events'
 import type { TenantContext } from '../../../middleware/tenant'
 import type { Env } from '../../../env'
 
-// Reset mocks before each test to ensure clean state
+// Reset mocks and circuit breakers before each test to ensure clean state
 beforeEach(() => {
   vi.clearAllMocks()
+  getCDCProcessorCircuitBreaker().reset()
+  getSubscriptionFanoutCircuitBreaker().reset()
 })
 
 // ============================================================================

@@ -5,10 +5,11 @@
  * Tests schema validation against registered JSON schemas
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   validateEventsAgainstSchemas,
   schemaValidationMiddleware,
+  getSchemaRegistryCircuitBreaker,
 } from '../../../middleware/ingest/schema'
 import type { IngestContext, BatchValidationResult } from '../../../middleware/ingest/types'
 import type { Env } from '../../../env'
@@ -209,6 +210,113 @@ describe('validateEventsAgainstSchemas', () => {
 
       expect(result).toBeNull()
       expect(consoleSpy).toHaveBeenCalled()
+      consoleSpy.mockRestore()
+    })
+  })
+
+  describe('timeout protection', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+      getSchemaRegistryCircuitBreaker().reset()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+      getSchemaRegistryCircuitBreaker().reset()
+    })
+
+    it('returns null when schema validation times out', async () => {
+      const registry = {
+        validateEvents: vi.fn().mockImplementation(
+          () => new Promise((resolve) => setTimeout(() => resolve({ valid: true, results: [] }), 5000))
+        ),
+      }
+      const namespace = createMockNamespace(registry)
+      const env = createMockEnv({
+        enableSchemaValidation: true,
+        schemaRegistry: namespace,
+      })
+      const events = [{ type: 'event' }]
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      // Call with a 100ms timeout
+      const resultPromise = validateEventsAgainstSchemas(events, 'namespace', env as Env, 100)
+      vi.advanceTimersByTime(100)
+      const result = await resultPromise
+
+      expect(result).toBeNull()
+      consoleSpy.mockRestore()
+    })
+
+    it('uses custom timeout when provided', async () => {
+      const registry = {
+        validateEvents: vi.fn().mockImplementation(
+          () => new Promise((resolve) => setTimeout(() => resolve({ valid: true, results: [] }), 200))
+        ),
+      }
+      const namespace = createMockNamespace(registry)
+      const env = createMockEnv({
+        enableSchemaValidation: true,
+        schemaRegistry: namespace,
+      })
+      const events = [{ type: 'event' }]
+
+      // Call with a 500ms timeout - should succeed
+      const resultPromise = validateEventsAgainstSchemas(events, 'namespace', env as Env, 500)
+      vi.advanceTimersByTime(200)
+      const result = await resultPromise
+
+      expect(result).toBeNull() // null means validation passed
+    })
+  })
+
+  describe('circuit breaker protection', () => {
+    beforeEach(() => {
+      getSchemaRegistryCircuitBreaker().reset()
+    })
+
+    afterEach(() => {
+      getSchemaRegistryCircuitBreaker().reset()
+    })
+
+    it('returns null when circuit breaker is open', async () => {
+      // Trip the circuit breaker
+      getSchemaRegistryCircuitBreaker().trip(new Error('test'))
+
+      const registry = createMockSchemaRegistry({ valid: true, results: [] })
+      const namespace = createMockNamespace(registry)
+      const env = createMockEnv({
+        enableSchemaValidation: true,
+        schemaRegistry: namespace,
+      })
+      const events = [{ type: 'event' }]
+      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const result = await validateEventsAgainstSchemas(events, 'namespace', env as Env)
+
+      expect(result).toBeNull()
+      expect(registry.validateEvents).not.toHaveBeenCalled()
+      consoleSpy.mockRestore()
+    })
+
+    it('opens circuit after repeated failures', async () => {
+      const registry = {
+        validateEvents: vi.fn().mockRejectedValue(new Error('Registry error')),
+      }
+      const namespace = createMockNamespace(registry)
+      const env = createMockEnv({
+        enableSchemaValidation: true,
+        schemaRegistry: namespace,
+      })
+      const events = [{ type: 'event' }]
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      // Call 5 times to trip the circuit breaker (default threshold)
+      for (let i = 0; i < 5; i++) {
+        await validateEventsAgainstSchemas(events, 'namespace', env as Env)
+      }
+
+      expect(getSchemaRegistryCircuitBreaker().getState()).toBe('open')
       consoleSpy.mockRestore()
     })
   })

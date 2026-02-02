@@ -45,6 +45,38 @@ export interface DeltaRecord {
 }
 
 // ============================================================================
+// Type Validators
+// ============================================================================
+
+/**
+ * Type guard for Record<string, unknown>
+ * Validates that parsed JSON is a plain object (not array, not null)
+ */
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Parse JSON string to Record<string, unknown> with validation
+ * Returns null for empty strings or invalid JSON
+ *
+ * @param str - JSON string to parse
+ * @param fieldName - Field name for error messages
+ * @returns Parsed object or null
+ * @throws Error if JSON is valid but not an object
+ */
+function parseRecordJson(str: string, fieldName: string): Record<string, unknown> | null {
+  if (str === '') {
+    return null
+  }
+  const parsed: unknown = JSON.parse(str)
+  if (!isRecordObject(parsed)) {
+    throw new Error(`${fieldName} must be an object, got ${typeof parsed}`)
+  }
+  return parsed
+}
+
+// ============================================================================
 // Delta Record Creation
 // ============================================================================
 
@@ -174,8 +206,8 @@ export async function readDeltaFile(buffer: ArrayBuffer): Promise<DeltaRecord[]>
     return {
       pk: row.pk as string,
       op: row.op as DeltaRecord['op'],
-      data: dataStr === '' ? null : (JSON.parse(dataStr) as Record<string, unknown>),
-      prev: prevStr === '' ? null : (JSON.parse(prevStr) as Record<string, unknown>),
+      data: parseRecordJson(dataStr, 'data'),
+      prev: parseRecordJson(prevStr, 'prev'),
       ts: row.ts as string,
       bookmark: bookmarkStr === '' ? null : bookmarkStr,
     }

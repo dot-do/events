@@ -195,33 +195,61 @@ export async function handleShardRoutes(request: Request, env: Env, url: URL): P
   const path = url.pathname
 
   // GET /shards - Get stats
-  if (path === '/shards' && request.method === 'GET') {
+  if (path === '/shards') {
+    if (request.method !== 'GET') {
+      return Response.json({ error: 'Method not allowed' }, {
+        status: 405,
+        headers: { ...corsHeaders(), 'Allow': 'GET' }
+      })
+    }
     return handleGetShards(request, env)
   }
 
-  // GET /shards/config - Get config
-  if (path === '/shards/config' && request.method === 'GET') {
-    return handleGetShardConfig(request, env)
-  }
-
-  // PUT /shards/config - Update config
-  if (path === '/shards/config' && request.method === 'PUT') {
-    return handleUpdateShardConfig(request, env)
+  // /shards/config - supports GET and PUT
+  if (path === '/shards/config') {
+    if (request.method === 'GET') {
+      return handleGetShardConfig(request, env)
+    } else if (request.method === 'PUT') {
+      return handleUpdateShardConfig(request, env)
+    } else {
+      return Response.json({ error: 'Method not allowed' }, {
+        status: 405,
+        headers: { ...corsHeaders(), 'Allow': 'GET, PUT' }
+      })
+    }
   }
 
   // POST /shards/scale - Force scale
-  if (path === '/shards/scale' && request.method === 'POST') {
+  if (path === '/shards/scale') {
+    if (request.method !== 'POST') {
+      return Response.json({ error: 'Method not allowed' }, {
+        status: 405,
+        headers: { ...corsHeaders(), 'Allow': 'POST' }
+      })
+    }
     return handleForceScale(request, env)
   }
 
   // POST /shards/health-check - Start health checks
-  if (path === '/shards/health-check' && request.method === 'POST') {
+  if (path === '/shards/health-check') {
+    if (request.method !== 'POST') {
+      return Response.json({ error: 'Method not allowed' }, {
+        status: 405,
+        headers: { ...corsHeaders(), 'Allow': 'POST' }
+      })
+    }
     return handleStartHealthChecks(request, env)
   }
 
   // GET /shards/:shardId - Get specific shard
   const shardMatch = path.match(/^\/shards\/(\d+)$/)
-  if (shardMatch && shardMatch[1] && request.method === 'GET') {
+  if (shardMatch && shardMatch[1]) {
+    if (request.method !== 'GET') {
+      return Response.json({ error: 'Method not allowed' }, {
+        status: 405,
+        headers: { ...corsHeaders(), 'Allow': 'GET' }
+      })
+    }
     const shardId = parseInt(shardMatch[1], 10)
     return handleGetShardById(request, env, shardId)
   }

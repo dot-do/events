@@ -8,6 +8,24 @@
 
 import { describe, it, expect, vi } from 'vitest'
 import { findMatchingSubscriptions, extractPatternPrefix, matchPattern } from '../pattern-matcher.js'
+import {
+  // Sample subscriptions
+  sampleGitHubSubscription,
+  sampleStripeSubscription,
+  sampleCdcSubscription,
+  sampleCatchAllSubscription,
+  sampleInactiveSubscription,
+  // Sample deliveries
+  samplePendingDelivery,
+  sampleDeliveredDelivery,
+  sampleFailedDelivery,
+  sampleDeadDelivery,
+  // Factory functions
+  createSubscriptionConfig,
+  createSubscriptionSet,
+  createDeliveryRecord,
+  createDeliveryBatch,
+} from './fixtures/index.js'
 
 // ============================================================================
 // Pattern Matching Logic Tests
@@ -289,30 +307,29 @@ describe('SubscriptionDO Logic', () => {
 
 describe('Pattern Matcher Integration', () => {
   describe('findMatchingSubscriptions', () => {
+    // Use shared fixtures for subscription configs
     const subscriptions = [
-      { id: 'sub1', pattern: 'webhook.github.*', patternPrefix: 'webhook.github' },
-      { id: 'sub2', pattern: 'webhook.**', patternPrefix: 'webhook' },
-      { id: 'sub3', pattern: 'webhook.stripe.invoice.*', patternPrefix: 'webhook.stripe.invoice' },
-      { id: 'sub4', pattern: 'cdc.*.insert', patternPrefix: 'cdc' },
-      { id: 'sub5', pattern: '**', patternPrefix: '' },
+      { id: sampleGitHubSubscription.id, pattern: sampleGitHubSubscription.pattern, patternPrefix: sampleGitHubSubscription.patternPrefix },
+      { id: sampleStripeSubscription.id, pattern: sampleStripeSubscription.pattern, patternPrefix: sampleStripeSubscription.patternPrefix },
+      { id: sampleCdcSubscription.id, pattern: sampleCdcSubscription.pattern, patternPrefix: sampleCdcSubscription.patternPrefix },
+      { id: sampleCatchAllSubscription.id, pattern: sampleCatchAllSubscription.pattern, patternPrefix: sampleCatchAllSubscription.patternPrefix },
     ]
 
     it('finds all subscriptions matching webhook.github.push', () => {
       const matches = findMatchingSubscriptions('webhook.github.push', subscriptions)
       const matchIds = matches.map(m => m.id)
 
-      expect(matchIds).toContain('sub1') // webhook.github.*
-      expect(matchIds).toContain('sub2') // webhook.**
-      expect(matchIds).toContain('sub5') // **
-      expect(matchIds).not.toContain('sub3') // webhook.stripe.invoice.*
-      expect(matchIds).not.toContain('sub4') // cdc.*.insert
+      expect(matchIds).toContain(sampleGitHubSubscription.id) // webhook.github.*
+      expect(matchIds).toContain(sampleCatchAllSubscription.id) // **
+      expect(matchIds).not.toContain(sampleStripeSubscription.id) // webhook.stripe.**
+      expect(matchIds).not.toContain(sampleCdcSubscription.id) // cdc.**
     })
 
     it('finds ** subscription for any event', () => {
       const matches = findMatchingSubscriptions('some.random.event', subscriptions)
       const matchIds = matches.map(m => m.id)
 
-      expect(matchIds).toContain('sub5') // ** matches everything
+      expect(matchIds).toContain(sampleCatchAllSubscription.id) // ** matches everything
       expect(matches.length).toBe(1)
     })
 
@@ -320,17 +337,31 @@ describe('Pattern Matcher Integration', () => {
       const matches = findMatchingSubscriptions('cdc.users.insert', subscriptions)
       const matchIds = matches.map(m => m.id)
 
-      expect(matchIds).toContain('sub4') // cdc.*.insert
-      expect(matchIds).toContain('sub5') // **
+      expect(matchIds).toContain(sampleCdcSubscription.id) // cdc.**
+      expect(matchIds).toContain(sampleCatchAllSubscription.id) // **
     })
 
     it('returns empty array when no matches', () => {
       const limitedSubs = [
-        { id: 'sub1', pattern: 'webhook.github.*', patternPrefix: 'webhook.github' },
+        { id: sampleGitHubSubscription.id, pattern: sampleGitHubSubscription.pattern, patternPrefix: sampleGitHubSubscription.patternPrefix },
       ]
 
       const matches = findMatchingSubscriptions('email.sent', limitedSubs)
       expect(matches).toHaveLength(0)
+    })
+
+    it('uses createSubscriptionSet factory for multiple subscriptions', () => {
+      // Demonstrate using the factory function
+      const subs = createSubscriptionSet([
+        { pattern: 'api.v1.*' },
+        { pattern: 'api.v2.**' },
+        { pattern: 'rpc.**', workerId: 'rpc-handler' },
+      ])
+
+      expect(subs).toHaveLength(3)
+      expect(subs[0].patternPrefix).toBe('api.v1')
+      expect(subs[1].patternPrefix).toBe('api.v2')
+      expect(subs[2].workerId).toBe('rpc-handler')
     })
   })
 

@@ -112,41 +112,41 @@ describe('Multi-Tenant Isolation', () => {
       DEFAULT_NAMESPACE: options.DEFAULT_NAMESPACE,
     })
 
-    it('rejects requests without authorization', () => {
+    it('rejects requests without authorization', async () => {
       const request = createRequest()
       const env = createEnv({ AUTH_TOKEN: 'secret' })
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
       expect(result).toBeInstanceOf(Response)
       expect((result as Response).status).toBe(401)
     })
 
-    it('accepts valid namespace-scoped API keys', () => {
+    it('accepts valid namespace-scoped API keys', async () => {
       const request = createRequest('Bearer ns_acme_validtoken')
       const env = createEnv({
         NAMESPACE_API_KEYS: JSON.stringify({ 'ns_acme_validtoken': 'acme' }),
       })
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
       expect(result).not.toBeInstanceOf(Response)
       expect((result as TenantContext).namespace).toBe('acme')
       expect((result as TenantContext).isAdmin).toBe(false)
     })
 
-    it('accepts legacy AUTH_TOKEN as admin', () => {
+    it('accepts legacy AUTH_TOKEN as admin', async () => {
       const request = createRequest('Bearer mysecrettoken')
       const env = createEnv({
         AUTH_TOKEN: 'mysecrettoken',
         DEFAULT_NAMESPACE: 'production',
       })
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
       expect(result).not.toBeInstanceOf(Response)
       expect((result as TenantContext).namespace).toBe('production')
       expect((result as TenantContext).isAdmin).toBe(true)
     })
 
-    it('rejects invalid API keys', () => {
+    it('rejects invalid API keys', async () => {
       const request = createRequest('Bearer invalidtoken')
       const env = createEnv({ AUTH_TOKEN: 'correcttoken' })
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
       expect(result).toBeInstanceOf(Response)
       expect((result as Response).status).toBe(401)
     })

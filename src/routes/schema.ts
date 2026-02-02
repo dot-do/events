@@ -13,6 +13,7 @@
 import type { Env } from '../env'
 import type { JsonSchema, SchemaRegistration, ValidationError, NamespaceConfig } from '../../core/src/schema-registry'
 import { corsHeaders } from '../utils'
+import { successResponse, errorResponse, badRequest, notFound, notConfigured, internalError, ErrorCodes } from '../utils/response'
 import { logger, logError } from '../logger'
 
 const log = logger.child({ component: 'SchemaRoutes' })
@@ -39,10 +40,7 @@ interface ValidationResult {
  */
 export async function handleRegisterSchema(request: Request, env: Env): Promise<Response> {
   if (!env.SCHEMA_REGISTRY) {
-    return Response.json(
-      { error: 'Schema registry not configured' },
-      { status: 501, headers: corsHeaders() }
-    )
+    return notConfigured('Schema registry not configured', { headers: corsHeaders() })
   }
 
   let body: {
@@ -57,25 +55,16 @@ export async function handleRegisterSchema(request: Request, env: Env): Promise<
   try {
     body = await request.json()
   } catch {
-    return Response.json(
-      { error: 'Invalid JSON' },
-      { status: 400, headers: corsHeaders() }
-    )
+    return badRequest('Invalid JSON', ErrorCodes.INVALID_JSON, { headers: corsHeaders() })
   }
 
   // Validate required fields
   if (!body.eventType || typeof body.eventType !== 'string') {
-    return Response.json(
-      { error: 'eventType is required and must be a string' },
-      { status: 400, headers: corsHeaders() }
-    )
+    return badRequest('eventType is required and must be a string', ErrorCodes.MISSING_FIELD, { headers: corsHeaders() })
   }
 
   if (!body.schema || typeof body.schema !== 'object') {
-    return Response.json(
-      { error: 'schema is required and must be a valid JSON Schema object' },
-      { status: 400, headers: corsHeaders() }
-    )
+    return badRequest('schema is required and must be a valid JSON Schema object', ErrorCodes.MISSING_FIELD, { headers: corsHeaders() })
   }
 
   const namespace = body.namespace ?? 'default'
@@ -94,13 +83,10 @@ export async function handleRegisterSchema(request: Request, env: Env): Promise<
     })
 
     if (!result.ok) {
-      return Response.json(
-        { error: result.error },
-        { status: 400, headers: corsHeaders() }
-      )
+      return badRequest(result.error || 'Registration failed', ErrorCodes.INVALID_REQUEST, { headers: corsHeaders() })
     }
 
-    return Response.json(
+    return successResponse(
       {
         ok: true,
         schemaId: result.schemaId,
@@ -112,10 +98,7 @@ export async function handleRegisterSchema(request: Request, env: Env): Promise<
     )
   } catch (err) {
     logError(log, 'Registration error', err)
-    return Response.json(
-      { error: 'Failed to register schema' },
-      { status: 500, headers: corsHeaders() }
-    )
+    return internalError('Failed to register schema', { headers: corsHeaders() })
   }
 }
 

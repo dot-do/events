@@ -219,16 +219,34 @@ export async function encryptPayload(
 }
 
 /**
+ * Type guard function signature for validating decrypted payloads
+ */
+export type DecryptionValidator<T> = (value: unknown) => value is T
+
+/**
+ * Error thrown when decrypted payload fails validation
+ */
+export class DecryptionValidationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DecryptionValidationError'
+  }
+}
+
+/**
  * Decrypt an encrypted payload
  *
  * @param encrypted - The encrypted payload structure
  * @param keyBase64 - Base64-encoded encryption key
+ * @param validator - Optional type guard to validate the decrypted payload
  * @returns Decrypted and parsed payload
  * @throws Error if decryption fails (wrong key, tampered data, etc.)
+ * @throws DecryptionValidationError if validator is provided and payload fails validation
  */
 export async function decryptPayload<T = unknown>(
   encrypted: EncryptedPayload,
-  keyBase64: string
+  keyBase64: string,
+  validator?: DecryptionValidator<T>
 ): Promise<T> {
   // Validate version
   if (encrypted.v !== ENCRYPTION_VERSION) {
@@ -249,9 +267,16 @@ export async function decryptPayload<T = unknown>(
     ciphertext
   )
 
-  // Parse and return
+  // Parse JSON
   const text = new TextDecoder().decode(plaintext)
-  return JSON.parse(text) as T
+  const parsed: unknown = JSON.parse(text)
+
+  // Validate if validator provided
+  if (validator && !validator(parsed)) {
+    throw new DecryptionValidationError('Decrypted payload failed validation')
+  }
+
+  return parsed as T
 }
 
 /**

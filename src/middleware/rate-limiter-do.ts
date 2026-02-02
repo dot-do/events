@@ -202,4 +202,86 @@ export class RateLimiterDO extends DurableObject<Record<string, unknown>> {
     this.ensureInitialized()
     this.sql.exec(`DELETE FROM rate_limit_windows`)
   }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // HTTP Fetch Handler - Health Check
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Handle HTTP requests to the DO
+   * GET /health - Returns health diagnostics with internal state metrics
+   */
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+
+    if (url.pathname === '/health' || url.pathname === '/diagnostics') {
+      this.ensureInitialized()
+
+      const now = Date.now()
+      const currentWindowStart = this.getCurrentWindowStart()
+      const resetAt = currentWindowStart + 60000
+
+      // Get current sliding window counts
+      const { requestCount, eventCount } = this.getSlidingWindowCounts()
+
+      // Count total windows stored
+      const windowCountResult = this.sql.exec<Record<string, SqlStorageValue> & { count: number }>(`
+        SELECT COUNT(*) as count FROM rate_limit_windows
+      `)
+      const windowCount = Array.from(windowCountResult)[0]?.count ?? 0
+
+      // Get the oldest and newest window timestamps
+      const windowRangeResult = this.sql.exec<Record<string, SqlStorageValue> & {
+        minWindow: number | null
+        maxWindow: number | null
+      }>(`
+        SELECT MIN(window_start) as minWindow, MAX(window_start) as maxWindow FROM rate_limit_windows
+      `)
+      const windowRange = Array.from(windowRangeResult)[0]
+
+      // Calculate total requests and events across all windows
+      const totalsResult = this.sql.exec<Record<string, SqlStorageValue> & {
+        totalRequests: number
+        totalEvents: number
+      }>(`
+        SELECT
+          COALESCE(SUM(request_count), 0) as totalRequests,
+          COALESCE(SUM(event_count), 0) as totalEvents
+        FROM rate_limit_windows
+      `)
+      const totals = Array.from(totalsResult)[0]
+
+      const health = {
+        status: 'healthy',
+        initialized: this.initialized,
+        currentWindow: {
+          start: new Date(currentWindowStart).toISOString(),
+          requestCount,
+          eventCount,
+          resetAt: new Date(resetAt).toISOString(),
+          timeUntilResetMs: Math.max(0, resetAt - now),
+        },
+        storage: {
+          windowCount,
+          oldestWindow: windowRange?.minWindow
+            ? new Date(windowRange.minWindow).toISOString()
+            : null,
+          newestWindow: windowRange?.maxWindow
+            ? new Date(windowRange.maxWindow).toISOString()
+            : null,
+        },
+        totals: {
+          allTimeRequests: totals?.totalRequests ?? 0,
+          allTimeEvents: totals?.totalEvents ?? 0,
+        },
+        timestamp: new Date(now).toISOString(),
+      }
+
+      return new Response(JSON.stringify(health, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    return new Response('Not Found', { status: 404 })
+  }
 }

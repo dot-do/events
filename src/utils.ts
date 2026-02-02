@@ -215,3 +215,335 @@ export function authCorsHeaders(request: Request, env?: { ALLOWED_ORIGINS?: stri
     'Vary': 'Origin',
   }
 }
+
+// ============================================================================
+// Timeout Utilities
+// ============================================================================
+
+/**
+ * Error thrown when an operation times out
+ */
+export class TimeoutError extends Error {
+  constructor(message: string, public readonly timeoutMs: number) {
+    super(message)
+    this.name = 'TimeoutError'
+  }
+}
+
+/**
+ * Wraps a promise with a timeout. If the promise doesn't resolve within
+ * the specified time, it rejects with a TimeoutError.
+ *
+ * @param promise - The promise to wrap
+ * @param ms - Timeout in milliseconds
+ * @param errorMsg - Error message to use if timeout occurs
+ * @returns The result of the promise if it resolves in time
+ * @throws TimeoutError if the promise doesn't resolve within the timeout
+ *
+ * @example
+ * // Timeout a DO call after 5 seconds
+ * const result = await withTimeout(
+ *   doStub.process(events),
+ *   5000,
+ *   'DO call timed out'
+ * )
+ */
+export async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  errorMsg: string
+): Promise<T> {
+  if (ms <= 0) {
+    return promise
+  }
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new TimeoutError(errorMsg, ms))
+    }, ms)
+  })
+
+  try {
+    const result = await Promise.race([promise, timeoutPromise])
+    return result
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId)
+    }
+  }
+}
+
+// ============================================================================
+// Circuit Breaker
+// ============================================================================
+
+/**
+ * Circuit breaker states
+ */
+export type CircuitState = 'closed' | 'open' | 'half-open'
+
+/**
+ * Configuration options for the circuit breaker
+ */
+export interface CircuitBreakerOptions {
+  /** Number of consecutive failures before opening the circuit (default: 5) */
+  failureThreshold?: number
+  /** Time in ms to wait before attempting to close the circuit (default: 30000) */
+  resetTimeoutMs?: number
+  /** Number of successful calls needed in half-open state to close circuit (default: 2) */
+  successThreshold?: number
+}
+
+/**
+ * Internal state for a circuit breaker
+ */
+interface CircuitBreakerState {
+  state: CircuitState
+  failures: number
+  successes: number
+  lastFailureTime: number
+  lastError?: Error
+}
+
+/**
+ * Circuit breaker for protecting against cascading failures from slow or failing DOs.
+ *
+ * The circuit breaker has three states:
+ * - CLOSED: Normal operation, requests pass through
+ * - OPEN: Circuit is tripped, requests fail immediately
+ * - HALF-OPEN: Testing if the service has recovered
+ *
+ * @example
+ * const breaker = new CircuitBreaker('schema-registry', { failureThreshold: 3 })
+ *
+ * try {
+ *   const result = await breaker.execute(() => registry.validateEvents(events))
+ * } catch (err) {
+ *   if (err instanceof CircuitBreakerOpenError) {
+ *     // Circuit is open, fail fast
+ *   }
+ * }
+ */
+export class CircuitBreaker {
+  private state: CircuitBreakerState
+  private readonly failureThreshold: number
+  private readonly resetTimeoutMs: number
+  private readonly successThreshold: number
+
+  constructor(
+    public readonly name: string,
+    options: CircuitBreakerOptions = {}
+  ) {
+    this.failureThreshold = options.failureThreshold ?? 5
+    this.resetTimeoutMs = options.resetTimeoutMs ?? 30000
+    this.successThreshold = options.successThreshold ?? 2
+
+    this.state = {
+      state: 'closed',
+      failures: 0,
+      successes: 0,
+      lastFailureTime: 0,
+    }
+  }
+
+  /**
+   * Get the current state of the circuit breaker
+   */
+  getState(): CircuitState {
+    this.updateState()
+    return this.state.state
+  }
+
+  /**
+   * Get detailed status of the circuit breaker
+   */
+  getStatus(): {
+    state: CircuitState
+    failures: number
+    successes: number
+    lastError?: string
+  } {
+    this.updateState()
+    return {
+      state: this.state.state,
+      failures: this.state.failures,
+      successes: this.state.successes,
+      lastError: this.state.lastError?.message,
+    }
+  }
+
+  /**
+   * Execute a function with circuit breaker protection
+   *
+   * @param fn - The async function to execute
+   * @returns The result of the function
+   * @throws CircuitBreakerOpenError if the circuit is open
+   */
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    this.updateState()
+
+    if (this.state.state === 'open') {
+      throw new CircuitBreakerOpenError(
+        `Circuit breaker '${this.name}' is open`,
+        this.name,
+        this.state.lastError
+      )
+    }
+
+    try {
+      const result = await fn()
+      this.onSuccess()
+      return result
+    } catch (err) {
+      this.onFailure(err instanceof Error ? err : new Error(String(err)))
+      throw err
+    }
+  }
+
+  /**
+   * Manually reset the circuit breaker to closed state
+   */
+  reset(): void {
+    this.state = {
+      state: 'closed',
+      failures: 0,
+      successes: 0,
+      lastFailureTime: 0,
+    }
+  }
+
+  /**
+   * Force the circuit to open (for testing or manual intervention)
+   */
+  trip(error?: Error): void {
+    this.state.state = 'open'
+    this.state.failures = this.failureThreshold
+    this.state.lastFailureTime = Date.now()
+    this.state.lastError = error
+  }
+
+  private updateState(): void {
+    if (this.state.state === 'open') {
+      // Check if we should transition to half-open
+      const timeSinceLastFailure = Date.now() - this.state.lastFailureTime
+      if (timeSinceLastFailure >= this.resetTimeoutMs) {
+        this.state.state = 'half-open'
+        this.state.successes = 0
+      }
+    }
+  }
+
+  private onSuccess(): void {
+    if (this.state.state === 'half-open') {
+      this.state.successes++
+      if (this.state.successes >= this.successThreshold) {
+        // Enough successes, close the circuit
+        this.state.state = 'closed'
+        this.state.failures = 0
+        this.state.successes = 0
+      }
+    } else if (this.state.state === 'closed') {
+      // Reset failure count on success
+      this.state.failures = 0
+    }
+  }
+
+  private onFailure(error: Error): void {
+    this.state.lastError = error
+    this.state.lastFailureTime = Date.now()
+
+    if (this.state.state === 'half-open') {
+      // Any failure in half-open state reopens the circuit
+      this.state.state = 'open'
+      this.state.failures = this.failureThreshold
+    } else if (this.state.state === 'closed') {
+      this.state.failures++
+      if (this.state.failures >= this.failureThreshold) {
+        this.state.state = 'open'
+      }
+    }
+  }
+}
+
+/**
+ * Error thrown when attempting to execute through an open circuit breaker
+ */
+export class CircuitBreakerOpenError extends Error {
+  constructor(
+    message: string,
+    public readonly circuitName: string,
+    public readonly lastError?: Error
+  ) {
+    super(message)
+    this.name = 'CircuitBreakerOpenError'
+  }
+}
+
+// ============================================================================
+// Combined Timeout + Circuit Breaker
+// ============================================================================
+
+/**
+ * Options for protected DO calls
+ */
+export interface ProtectedCallOptions {
+  /** Timeout in milliseconds (default: 5000) */
+  timeoutMs?: number
+  /** Circuit breaker to use (optional) */
+  circuitBreaker?: CircuitBreaker
+  /** Error message prefix for timeout errors */
+  errorMsg?: string
+}
+
+/**
+ * Execute a DO call with timeout and optional circuit breaker protection.
+ *
+ * This is the recommended way to call Durable Objects from middleware to
+ * prevent slow DOs from causing cascading failures.
+ *
+ * @param fn - The async function to execute (typically a DO method call)
+ * @param options - Protection options (timeout, circuit breaker)
+ * @returns The result of the function
+ * @throws TimeoutError if the operation times out
+ * @throws CircuitBreakerOpenError if the circuit is open
+ *
+ * @example
+ * // Simple timeout protection
+ * const result = await protectedCall(
+ *   () => registry.validateEvents(events),
+ *   { timeoutMs: 5000, errorMsg: 'Schema validation' }
+ * )
+ *
+ * // With circuit breaker
+ * const breaker = new CircuitBreaker('schema-registry')
+ * const result = await protectedCall(
+ *   () => registry.validateEvents(events),
+ *   { timeoutMs: 5000, circuitBreaker: breaker }
+ * )
+ */
+export async function protectedCall<T>(
+  fn: () => Promise<T>,
+  options: ProtectedCallOptions = {}
+): Promise<T> {
+  const {
+    timeoutMs = 5000,
+    circuitBreaker,
+    errorMsg = 'Operation',
+  } = options
+
+  const wrappedFn = async () => {
+    return withTimeout(
+      fn(),
+      timeoutMs,
+      `${errorMsg} timed out after ${timeoutMs}ms`
+    )
+  }
+
+  if (circuitBreaker) {
+    return circuitBreaker.execute(wrappedFn)
+  }
+
+  return wrappedFn()
+}

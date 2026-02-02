@@ -13,6 +13,10 @@ export {
   schemaGenerate,
   type SchemaOptions
 } from './commands/schema.js'
+export { runTail, type TailOptions } from './commands/tail.js'
+export { runQuery, type QueryOptions, type QueryResult } from './commands/query.js'
+export { runStatus, type StatusOptions, type HealthResponse, type ShardStats } from './commands/status.js'
+export { runReplay, type ReplayOptions, type DeadLetter, type ReplayResult } from './commands/replay.js'
 
 // Re-export templates for customization
 export { TEMPLATES } from './templates/index.js'

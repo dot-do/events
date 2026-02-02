@@ -40,6 +40,9 @@ export interface IngestContext {
   /** Whether the batch was deduplicated (already ingested) */
   deduplicated?: boolean
 
+  /** Whether the dedup marker was already written atomically */
+  dedupMarkerWritten?: boolean
+
   /** Events converted to EventRecord format */
   records?: EventRecord[]
 

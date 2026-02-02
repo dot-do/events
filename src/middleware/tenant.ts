@@ -10,6 +10,7 @@
 
 import { corsHeaders } from '../utils'
 import { logger } from '../logger'
+import { timingSafeEqual } from './auth'
 
 // ============================================================================
 // Types
@@ -59,6 +60,26 @@ export interface TenantEnv {
  * - abc123 (legacy) -> namespace: from DEFAULT_NAMESPACE or "default"
  */
 const NAMESPACE_KEY_REGEX = /^ns_([a-z0-9_-]+)_([a-zA-Z0-9_-]+)$/
+
+// ============================================================================
+// Type Validators
+// ============================================================================
+
+/**
+ * Type guard for namespace API keys map: Record<string, string>
+ */
+function isNamespaceApiKeysMap(value: unknown): value is Record<string, string> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+  const v = value as Record<string, unknown>
+  for (const val of Object.values(v)) {
+    if (typeof val !== 'string') {
+      return false
+    }
+  }
+  return true
+}
 
 /**
  * Parse a namespace-scoped API key
@@ -132,10 +153,10 @@ export function validateNamespace(namespace: string): string | null {
  * 2. Legacy AUTH_TOKEN (admin access to all namespaces)
  * 3. OAuth user with admin role (admin access to all namespaces)
  */
-export function extractTenantContext(
+export async function extractTenantContext(
   request: Request,
   env: TenantEnv
-): TenantContext | Response {
+): Promise<TenantContext | Response> {
   const authHeader = request.headers.get('Authorization')
 
   // No authorization header
@@ -168,7 +189,8 @@ export function extractTenantContext(
   }
 
   // Check for legacy AUTH_TOKEN (grants admin access to all namespaces)
-  if (env.AUTH_TOKEN && token === env.AUTH_TOKEN) {
+  // Use timing-safe comparison to prevent timing attacks
+  if (env.AUTH_TOKEN && await timingSafeEqual(token, env.AUTH_TOKEN)) {
     return {
       namespace: env.DEFAULT_NAMESPACE || 'default',
       isAdmin: true,
@@ -203,14 +225,18 @@ function validateNamespaceApiKey(
   // Check against stored namespace API keys
   if (env.NAMESPACE_API_KEYS) {
     try {
-      const keys = JSON.parse(env.NAMESPACE_API_KEYS) as Record<string, string>
-      const expectedNamespace = keys[fullKey]
+      const parsed: unknown = JSON.parse(env.NAMESPACE_API_KEYS)
+      if (!isNamespaceApiKeysMap(parsed)) {
+        logger.child({ component: 'Tenant' }).error('NAMESPACE_API_KEYS failed validation: expected Record<string, string>')
+      } else {
+        const expectedNamespace = parsed[fullKey]
 
-      if (expectedNamespace === namespace) {
-        return {
-          namespace,
-          isAdmin: false,
-          keyId: maskApiKey(fullKey),
+        if (expectedNamespace === namespace) {
+          return {
+            namespace,
+            isAdmin: false,
+            keyId: maskApiKey(fullKey),
+          }
         }
       }
     } catch (err) {
@@ -230,11 +256,11 @@ function validateNamespaceApiKey(
  * Middleware to require tenant context on a request
  * Attaches tenant context to request.tenant
  */
-export function requireTenant(
+export async function requireTenant(
   request: Request,
   env: TenantEnv
-): TenantContext | Response {
-  const result = extractTenantContext(request, env)
+): Promise<TenantContext | Response> {
+  const result = await extractTenantContext(request, env)
   if (result instanceof Response) {
     return result
   }
@@ -246,11 +272,11 @@ export function requireTenant(
 /**
  * Middleware to require admin access (cross-namespace)
  */
-export function requireAdmin(
+export async function requireAdmin(
   request: Request,
   env: TenantEnv
-): TenantContext | Response {
-  const result = extractTenantContext(request, env)
+): Promise<TenantContext | Response> {
+  const result = await extractTenantContext(request, env)
   if (result instanceof Response) {
     return result
   }

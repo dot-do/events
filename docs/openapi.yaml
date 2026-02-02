@@ -1,0 +1,2127 @@
+openapi: 3.0.3
+info:
+  title: events.do API
+  description: |
+    Event streaming, CDC (Change Data Capture), and lakehouse analytics for Durable Objects.
+
+    This API provides endpoints for:
+    - Event ingestion from applications and Durable Objects
+    - Webhook processing from third-party providers
+    - Event subscriptions for real-time event delivery
+    - Schema management for event validation
+    - Query building for DuckDB analytics
+
+    ## Authentication
+
+    The API supports multiple authentication methods:
+
+    ### Bearer Token Authentication
+    For programmatic access, use a Bearer token in the Authorization header:
+    ```
+    Authorization: Bearer <your-api-key>
+    ```
+
+    ### Namespace-Scoped API Keys
+    API keys can be scoped to specific namespaces for multi-tenant isolation.
+    Configure via the `NAMESPACE_API_KEYS` environment variable.
+
+    ### OAuth (Admin Access)
+    Admin endpoints require OAuth authentication via the AUTH RPC binding.
+    Browser requests are redirected to `/login` for authentication.
+
+    ## Rate Limiting
+
+    The API implements rate limiting to protect against abuse:
+    - Ingest: Configurable via `RATE_LIMIT_REQUESTS_PER_MINUTE` and `RATE_LIMIT_EVENTS_PER_MINUTE`
+    - Webhooks: 10,000 requests/minute, 100,000 events/minute (server-to-server)
+
+  version: 1.0.0
+  contact:
+    name: events.do Support
+    url: https://events.do
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://events.do
+    description: Production server
+  - url: https://events.workers.do
+    description: Workers.dev alias
+  - url: http://localhost:8787
+    description: Local development
+
+tags:
+  - name: Health
+    description: Service health and status
+  - name: Ingest
+    description: Event ingestion endpoints
+  - name: Events
+    description: Event query and retrieval
+  - name: Webhooks
+    description: Webhook processing from third-party providers
+  - name: Subscriptions
+    description: Event subscription management
+  - name: Schemas
+    description: JSON schema management for event validation
+  - name: Query
+    description: DuckDB query generation
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Bearer token authentication for API access
+    oauthAdmin:
+      type: http
+      scheme: bearer
+      description: OAuth authentication for admin endpoints (requires admin role)
+
+  schemas:
+    # Core Event Types
+    BaseEvent:
+      type: object
+      required:
+        - type
+        - ts
+        - do
+      properties:
+        type:
+          type: string
+          description: Event type (e.g., "rpc.call", "collection.insert")
+          maxLength: 128
+          pattern: '^[a-zA-Z0-9._-]+$'
+        ts:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp
+        do:
+          type: object
+          required:
+            - id
+          properties:
+            id:
+              type: string
+              description: Durable Object ID
+            name:
+              type: string
+              description: Durable Object name
+            class:
+              type: string
+              description: Durable Object class name
+            colo:
+              type: string
+              description: Cloudflare colo (data center)
+            worker:
+              type: string
+              description: Worker name
+
+    RpcCallEvent:
+      allOf:
+        - $ref: '#/components/schemas/BaseEvent'
+        - type: object
+          required:
+            - method
+            - durationMs
+            - success
+          properties:
+            type:
+              type: string
+              enum: [rpc.call]
+            method:
+              type: string
+              description: RPC method name
+            namespace:
+              type: string
+              description: RPC namespace
+            durationMs:
+              type: number
+              description: Call duration in milliseconds
+            success:
+              type: boolean
+              description: Whether the call succeeded
+            error:
+              type: string
+              description: Error message if call failed
+
+    CollectionChangeEvent:
+      allOf:
+        - $ref: '#/components/schemas/BaseEvent'
+        - type: object
+          required:
+            - collection
+            - docId
+          properties:
+            type:
+              type: string
+              enum: [collection.insert, collection.update, collection.delete]
+            collection:
+              type: string
+              description: Collection name
+            docId:
+              type: string
+              description: Document ID
+            doc:
+              type: object
+              description: The document (for insert/update)
+            prev:
+              type: object
+              description: Previous document state (for updates with tracking)
+            bookmark:
+              type: string
+              description: SQLite bookmark for PITR recovery
+
+    LifecycleEvent:
+      allOf:
+        - $ref: '#/components/schemas/BaseEvent'
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [do.create, do.alarm, do.hibernate, do.evict]
+            reason:
+              type: string
+              description: Reason for the lifecycle event
+
+    WebSocketEvent:
+      allOf:
+        - $ref: '#/components/schemas/BaseEvent'
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [ws.connect, ws.message, ws.close, ws.error]
+            connectionCount:
+              type: integer
+              description: Current connection count
+            code:
+              type: integer
+              description: WebSocket close code
+            reason:
+              type: string
+              description: Close reason
+
+    ClientEvent:
+      allOf:
+        - $ref: '#/components/schemas/BaseEvent'
+        - type: object
+          properties:
+            type:
+              type: string
+              enum: [page, track, identify]
+            event:
+              type: string
+              description: Event name for track events
+            properties:
+              type: object
+              description: Event properties
+            traits:
+              type: object
+              description: User traits for identify events
+            userId:
+              type: string
+              description: User identifier
+            anonymousId:
+              type: string
+              description: Anonymous visitor identifier
+            sessionId:
+              type: string
+              description: Session identifier
+
+    DurableEvent:
+      oneOf:
+        - $ref: '#/components/schemas/RpcCallEvent'
+        - $ref: '#/components/schemas/CollectionChangeEvent'
+        - $ref: '#/components/schemas/LifecycleEvent'
+        - $ref: '#/components/schemas/WebSocketEvent'
+        - $ref: '#/components/schemas/ClientEvent'
+      discriminator:
+        propertyName: type
+
+    # Request/Response Schemas
+    EventBatch:
+      type: object
+      required:
+        - events
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/DurableEvent'
+          minItems: 1
+          maxItems: 1000
+          description: Array of events to ingest
+
+    IngestResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+        received:
+          type: integer
+          description: Number of events received
+          example: 10
+        namespace:
+          type: string
+          description: Namespace the events were ingested into
+          example: default
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        service:
+          type: string
+          example: events.do
+        ts:
+          type: string
+          format: date-time
+        env:
+          type: string
+          description: Environment (production, staging, etc.)
+        cpuTimeMs:
+          type: number
+          description: CPU time spent processing the request
+        providers:
+          type: array
+          items:
+            type: string
+          description: Supported webhook providers (only on webhooks.do)
+
+    # Events Query
+    EventsQueryParams:
+      type: object
+      properties:
+        type:
+          type: string
+          description: Filter by event type (glob pattern supported)
+        before:
+          type: string
+          format: date-time
+          description: Cursor - get events before this timestamp (pagination)
+        after:
+          type: string
+          format: date-time
+          description: Cursor - get events after this timestamp
+        from:
+          type: string
+          format: date-time
+          description: Start of time range (ISO 8601)
+        to:
+          type: string
+          format: date-time
+          description: End of time range (ISO 8601)
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 20
+          description: Maximum number of events to return
+        provider:
+          type: string
+          description: Filter by webhook provider
+        format:
+          type: string
+          enum: [parquet, jsonl]
+          default: parquet
+          description: File format to read from
+        source:
+          type: string
+          enum: [events, tail, all]
+          default: all
+          description: Data source to query
+
+    EventsResponse:
+      type: object
+      properties:
+        links:
+          type: object
+          properties:
+            self:
+              type: string
+              format: uri
+            first:
+              type: string
+              format: uri
+            next:
+              type: string
+              format: uri
+            prev:
+              type: string
+              format: uri
+        meta:
+          type: object
+          properties:
+            query:
+              type: object
+              properties:
+                source:
+                  type: string
+                startTime:
+                  type: string
+                  format: date-time
+                endTime:
+                  type: string
+                  format: date-time
+                durationMs:
+                  type: integer
+            scan:
+              type: object
+              properties:
+                bucketsScanned:
+                  type: integer
+                bucketsTotal:
+                  type: integer
+                filesListed:
+                  type: integer
+                filesRead:
+                  type: integer
+                bytesRead:
+                  type: integer
+                eventsScanned:
+                  type: integer
+                eventsReturned:
+                  type: integer
+            timing:
+              type: object
+              properties:
+                listMs:
+                  type: integer
+                readMs:
+                  type: integer
+                filterMs:
+                  type: integer
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DurableEvent'
+
+    # Query Builder
+    QueryRequest:
+      type: object
+      properties:
+        dateRange:
+          type: object
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+        doId:
+          type: string
+          maxLength: 256
+          description: Filter by Durable Object ID
+        doClass:
+          type: string
+          maxLength: 256
+          description: Filter by Durable Object class
+        eventTypes:
+          type: array
+          items:
+            type: string
+          maxItems: 100
+          description: Filter by event types
+        collection:
+          type: string
+          maxLength: 256
+          description: Filter by collection name
+        colo:
+          type: string
+          maxLength: 256
+          description: Filter by Cloudflare colo
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          description: Maximum rows to return
+        namespace:
+          type: string
+          maxLength: 256
+          description: Namespace for multi-tenant isolation
+
+    QueryResponse:
+      type: object
+      properties:
+        sql:
+          type: string
+          description: Generated DuckDB SQL query
+        namespace:
+          type: string
+          nullable: true
+          description: Namespace used for isolation
+        isolated:
+          type: boolean
+          description: Whether query is namespace-isolated
+
+    # Subscriptions
+    SubscribeRequest:
+      type: object
+      required:
+        - workerId
+        - pattern
+        - rpcMethod
+      properties:
+        workerId:
+          type: string
+          description: Worker ID to receive events
+        workerBinding:
+          type: string
+          description: Service binding name for the worker
+        pattern:
+          type: string
+          maxLength: 256
+          pattern: '^[a-zA-Z0-9.*_-]+$'
+          description: Event type pattern (glob syntax)
+          example: 'collection.insert.*'
+        rpcMethod:
+          type: string
+          description: RPC method to call on the worker
+        maxRetries:
+          type: integer
+          description: Maximum retry attempts for failed deliveries
+        timeoutMs:
+          type: integer
+          description: Delivery timeout in milliseconds
+
+    Subscription:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Subscription ID
+        workerId:
+          type: string
+        workerBinding:
+          type: string
+        pattern:
+          type: string
+        rpcMethod:
+          type: string
+        maxRetries:
+          type: integer
+        timeoutMs:
+          type: integer
+        active:
+          type: boolean
+        createdAt:
+          type: integer
+          description: Unix timestamp of creation
+        _shard:
+          type: string
+          description: Shard key for the subscription
+
+    SubscriptionStatus:
+      type: object
+      properties:
+        subscription:
+          $ref: '#/components/schemas/Subscription'
+        stats:
+          type: object
+          properties:
+            pendingDeliveries:
+              type: integer
+            failedDeliveries:
+              type: integer
+            deadLetters:
+              type: integer
+            successRate:
+              type: number
+            totalDelivered:
+              type: integer
+            totalAttempts:
+              type: integer
+
+    DeadLetter:
+      type: object
+      properties:
+        id:
+          type: string
+        subscriptionId:
+          type: string
+        event:
+          $ref: '#/components/schemas/DurableEvent'
+        error:
+          type: string
+        attempts:
+          type: integer
+        createdAt:
+          type: integer
+
+    # Schemas
+    JsonSchema:
+      type: object
+      description: JSON Schema object (draft-07)
+      additionalProperties: true
+
+    SchemaRegistration:
+      type: object
+      properties:
+        schemaId:
+          type: string
+        eventType:
+          type: string
+        namespace:
+          type: string
+        schema:
+          $ref: '#/components/schemas/JsonSchema'
+        version:
+          type: integer
+        validationEnabled:
+          type: boolean
+        strictMode:
+          type: boolean
+        description:
+          type: string
+        createdAt:
+          type: integer
+        updatedAt:
+          type: integer
+
+    RegisterSchemaRequest:
+      type: object
+      required:
+        - eventType
+        - schema
+      properties:
+        eventType:
+          type: string
+          description: Event type this schema validates
+        namespace:
+          type: string
+          default: default
+          description: Namespace for the schema
+        schema:
+          $ref: '#/components/schemas/JsonSchema'
+        validationEnabled:
+          type: boolean
+          default: true
+        strictMode:
+          type: boolean
+          default: false
+        description:
+          type: string
+
+    NamespaceConfig:
+      type: object
+      properties:
+        namespace:
+          type: string
+        validationEnabled:
+          type: boolean
+        strictMode:
+          type: boolean
+        configured:
+          type: boolean
+
+    ValidateEventsRequest:
+      type: object
+      required:
+        - events
+      properties:
+        events:
+          type: array
+          items:
+            type: object
+            required:
+              - type
+            properties:
+              type:
+                type: string
+            additionalProperties: true
+        namespace:
+          type: string
+          default: default
+
+    ValidationResult:
+      type: object
+      properties:
+        valid:
+          type: boolean
+        totalEvents:
+          type: integer
+        invalidCount:
+          type: integer
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              eventType:
+                type: string
+              valid:
+                type: boolean
+              errors:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    path:
+                      type: string
+                    message:
+                      type: string
+
+    # Webhooks
+    WebhookResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        event:
+          type: object
+          properties:
+            type:
+              type: string
+            ts:
+              type: string
+              format: date-time
+            source:
+              type: string
+            webhook:
+              type: object
+              properties:
+                provider:
+                  type: string
+                  enum: [github, stripe, workos, slack, linear, svix]
+                eventType:
+                  type: string
+                verified:
+                  type: boolean
+            payload:
+              type: object
+
+    # Error Responses
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error message
+        code:
+          type: string
+          description: Error code
+        details:
+          type: object
+          description: Additional error details
+        ok:
+          type: boolean
+          example: false
+
+    UnauthorizedError:
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          properties:
+            error:
+              example: Unauthorized
+
+    ForbiddenError:
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          properties:
+            error:
+              example: Admin access required
+            authenticated:
+              type: boolean
+              example: true
+            message:
+              type: string
+              example: You are logged in but do not have admin privileges
+
+    NotFoundError:
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          properties:
+            error:
+              example: Not found
+
+    RateLimitError:
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          properties:
+            error:
+              example: Rate limit exceeded
+            retryAfter:
+              type: integer
+              description: Seconds until retry is allowed
+
+    PayloadTooLargeError:
+      allOf:
+        - $ref: '#/components/schemas/ErrorResponse'
+        - type: object
+          properties:
+            error:
+              example: Request body too large
+            code:
+              example: PAYLOAD_TOO_LARGE
+            details:
+              type: object
+              properties:
+                maxSize:
+                  type: integer
+                contentLength:
+                  type: integer
+
+  responses:
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UnauthorizedError'
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ForbiddenError'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/NotFoundError'
+    RateLimited:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/RateLimitError'
+    PayloadTooLarge:
+      description: Request body exceeds size limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PayloadTooLargeError'
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check
+      description: Returns the service health status and metadata
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /ingest:
+    post:
+      tags:
+        - Ingest
+      summary: Ingest events
+      description: |
+        Receives a batch of events for ingestion into the lakehouse.
+        Events are validated, deduplicated, and stored in Parquet format.
+
+        Supports batch deduplication via the `batchId` field in the request body.
+      operationId: ingestEvents
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/EventBatch'
+                - type: object
+                  properties:
+                    batchId:
+                      type: string
+                      description: Optional batch ID for deduplication
+            example:
+              events:
+                - type: collection.insert
+                  ts: '2024-01-15T10:30:00Z'
+                  do:
+                    id: abc123
+                    class: UserDO
+                  collection: users
+                  docId: user-1
+                  doc:
+                    name: John Doe
+                    email: john@example.com
+      responses:
+        '200':
+          description: Events ingested successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /events:
+    get:
+      tags:
+        - Events
+      summary: Query events
+      description: |
+        Query stored events with filtering and pagination.
+        Reads from both Parquet (primary) and JSONL (legacy) files.
+
+        Supports cursor-based pagination via `before` and `after` parameters.
+      operationId: queryEvents
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: type
+          in: query
+          schema:
+            type: string
+          description: Filter by event type (glob pattern supported)
+        - name: before
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Get events before this timestamp (cursor)
+        - name: after
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Get events after this timestamp (cursor)
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start of time range
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End of time range
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 20
+          description: Maximum events to return
+        - name: provider
+          in: query
+          schema:
+            type: string
+          description: Filter by webhook provider
+        - name: source
+          in: query
+          schema:
+            type: string
+            enum: [events, tail, all]
+            default: all
+          description: Data source to query
+      responses:
+        '200':
+          description: Events retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /query:
+    post:
+      tags:
+        - Query
+      summary: Generate DuckDB query
+      description: |
+        Generates a DuckDB SQL query for querying events stored in R2.
+        The query includes namespace isolation for multi-tenant deployments.
+      operationId: generateQuery
+      security:
+        - oauthAdmin: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+            example:
+              dateRange:
+                start: '2024-01-01T00:00:00Z'
+                end: '2024-01-31T23:59:59Z'
+              eventTypes:
+                - collection.insert
+                - collection.update
+              collection: users
+              limit: 1000
+      responses:
+        '200':
+          description: Query generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+        '400':
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /webhooks:
+    post:
+      tags:
+        - Webhooks
+      summary: Receive webhook
+      description: |
+        Receives and verifies webhooks from third-party providers.
+
+        Supported providers: github, stripe, workos, slack, linear, svix
+
+        Each provider has specific signature verification requirements.
+        See provider documentation for webhook secret configuration.
+      operationId: receiveWebhook
+      parameters:
+        - name: provider
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [github, stripe, workos, slack, linear, svix]
+          description: Webhook provider name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Provider-specific webhook payload
+      responses:
+        '200':
+          description: Webhook processed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+        '400':
+          description: Invalid webhook or missing provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Signature verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # Subscription Routes
+  /subscriptions/subscribe:
+    post:
+      tags:
+        - Subscriptions
+      summary: Create subscription
+      description: |
+        Creates a new event subscription.
+        Events matching the pattern will be delivered to the specified worker via RPC.
+      operationId: createSubscription
+      security:
+        - oauthAdmin: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscribeRequest'
+            example:
+              workerId: my-worker
+              pattern: 'collection.insert.*'
+              rpcMethod: handleEvent
+              maxRetries: 3
+              timeoutMs: 5000
+      responses:
+        '200':
+          description: Subscription created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  id:
+                    type: string
+                  shard:
+                    type: string
+                  namespace:
+                    type: string
+                    nullable: true
+                  dynamicSharding:
+                    type: boolean
+        '400':
+          description: Invalid subscription parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /subscriptions/unsubscribe:
+    post:
+      tags:
+        - Subscriptions
+      summary: Deactivate subscription
+      description: Deactivates (soft-deletes) a subscription. Use DELETE to permanently remove.
+      operationId: unsubscribe
+      security:
+        - oauthAdmin: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - subscriptionId
+              properties:
+                subscriptionId:
+                  type: string
+                shard:
+                  type: string
+                  description: Optional shard hint for faster lookup
+      responses:
+        '200':
+          description: Subscription deactivated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/reactivate:
+    post:
+      tags:
+        - Subscriptions
+      summary: Reactivate subscription
+      description: Reactivates a previously deactivated subscription
+      operationId: reactivateSubscription
+      security:
+        - oauthAdmin: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - subscriptionId
+              properties:
+                subscriptionId:
+                  type: string
+                shard:
+                  type: string
+      responses:
+        '200':
+          description: Subscription reactivated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/list:
+    get:
+      tags:
+        - Subscriptions
+      summary: List subscriptions
+      description: Lists all subscriptions, optionally filtered by various criteria
+      operationId: listSubscriptions
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: active
+          in: query
+          schema:
+            type: boolean
+          description: Filter by active status
+        - name: workerId
+          in: query
+          schema:
+            type: string
+          description: Filter by worker ID
+        - name: patternPrefix
+          in: query
+          schema:
+            type: string
+          description: Filter by pattern prefix
+        - name: shard
+          in: query
+          schema:
+            type: string
+          description: Query specific shard only
+        - name: limit
+          in: query
+          schema:
+            type: integer
+          description: Maximum subscriptions to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+          description: Pagination offset
+      responses:
+        '200':
+          description: Subscriptions retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Subscription'
+                  shard:
+                    type: string
+                  namespace:
+                    type: string
+                    nullable: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/match:
+    get:
+      tags:
+        - Subscriptions
+      summary: Find matching subscriptions
+      description: Finds all subscriptions that match a given event type
+      operationId: matchSubscriptions
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: eventType
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Event type to match against
+      responses:
+        '200':
+          description: Matching subscriptions found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Subscription'
+                  namespace:
+                    type: string
+                    nullable: true
+        '400':
+          description: Missing eventType parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/status/{subscriptionId}:
+    get:
+      tags:
+        - Subscriptions
+      summary: Get subscription status
+      description: Gets detailed status and statistics for a subscription
+      operationId: getSubscriptionStatus
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Subscription status retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/{subscriptionId}:
+    get:
+      tags:
+        - Subscriptions
+      summary: Get subscription
+      description: Gets a single subscription by ID
+      operationId: getSubscription
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Subscription retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription:
+                    $ref: '#/components/schemas/Subscription'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    put:
+      tags:
+        - Subscriptions
+      summary: Update subscription
+      description: Updates subscription settings
+      operationId: updateSubscription
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                maxRetries:
+                  type: integer
+                timeoutMs:
+                  type: integer
+                rpcMethod:
+                  type: string
+      responses:
+        '200':
+          description: Subscription updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  subscription:
+                    $ref: '#/components/schemas/Subscription'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    delete:
+      tags:
+        - Subscriptions
+      summary: Delete subscription
+      description: Permanently deletes a subscription
+      operationId: deleteSubscription
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Subscription deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/{subscriptionId}/dead-letters:
+    get:
+      tags:
+        - Subscriptions
+      summary: Get dead letters
+      description: Gets dead-lettered events for a subscription
+      operationId: getDeadLetters
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+          description: Maximum dead letters to return
+      responses:
+        '200':
+          description: Dead letters retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deadLetters:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeadLetter'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/{subscriptionId}/dead-letters/{deadLetterId}/retry:
+    post:
+      tags:
+        - Subscriptions
+      summary: Retry dead letter
+      description: Retries delivery of a dead-lettered event
+      operationId: retryDeadLetter
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: deadLetterId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Dead letter queued for retry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/deliveries/{deliveryId}/logs:
+    get:
+      tags:
+        - Subscriptions
+      summary: Get delivery logs
+      description: Gets delivery attempt logs for a delivery
+      operationId: getDeliveryLogs
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: deliveryId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Delivery logs retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        timestamp:
+                          type: integer
+                        status:
+                          type: string
+                        error:
+                          type: string
+                        durationMs:
+                          type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/shards:
+    get:
+      tags:
+        - Subscriptions
+      summary: Get shard statistics
+      description: Gets statistics for subscription shards (dynamic sharding)
+      operationId: getShardStats
+      security:
+        - oauthAdmin: []
+      responses:
+        '200':
+          description: Shard statistics retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dynamicShardingEnabled:
+                    type: boolean
+                  shards:
+                    type: object
+                    additionalProperties:
+                      type: object
+                  fallbackShards:
+                    type: array
+                    items:
+                      type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/shards/config:
+    get:
+      tags:
+        - Subscriptions
+      summary: Get shard coordinator config
+      description: Gets the dynamic shard coordinator configuration
+      operationId: getShardConfig
+      security:
+        - oauthAdmin: []
+      responses:
+        '200':
+          description: Shard config retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dynamicShardingEnabled:
+                    type: boolean
+                  config:
+                    type: object
+                    properties:
+                      minShardsPerPrefix:
+                        type: integer
+                      maxShardsPerPrefix:
+                        type: integer
+                      scaleUpThreshold:
+                        type: number
+                      scaleDownThreshold:
+                        type: number
+                      cooldownMs:
+                        type: integer
+                      metricsWindowMs:
+                        type: integer
+                      healthCheckIntervalMs:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    put:
+      tags:
+        - Subscriptions
+      summary: Update shard coordinator config
+      description: Updates the dynamic shard coordinator configuration
+      operationId: updateShardConfig
+      security:
+        - oauthAdmin: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                minShardsPerPrefix:
+                  type: integer
+                maxShardsPerPrefix:
+                  type: integer
+                scaleUpThreshold:
+                  type: number
+                scaleDownThreshold:
+                  type: number
+                cooldownMs:
+                  type: integer
+                metricsWindowMs:
+                  type: integer
+                healthCheckIntervalMs:
+                  type: integer
+      responses:
+        '200':
+          description: Shard config updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  config:
+                    type: object
+        '400':
+          description: Invalid configuration keys
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /subscriptions/shards/scale:
+    post:
+      tags:
+        - Subscriptions
+      summary: Force scale shards
+      description: Forces a prefix to scale to a specific shard count
+      operationId: forceScaleShards
+      security:
+        - oauthAdmin: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - prefix
+                - targetCount
+              properties:
+                prefix:
+                  type: string
+                  description: The prefix to scale (e.g., "collection")
+                targetCount:
+                  type: integer
+                  minimum: 1
+                  description: Target number of shards
+      responses:
+        '200':
+          description: Scaling initiated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  previousCount:
+                    type: integer
+                  newCount:
+                    type: integer
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # Schema Routes
+  /schemas:
+    post:
+      tags:
+        - Schemas
+      summary: Register schema
+      description: Registers or updates a JSON schema for event validation
+      operationId: registerSchema
+      security:
+        - oauthAdmin: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterSchemaRequest'
+            example:
+              eventType: collection.insert
+              namespace: default
+              schema:
+                type: object
+                required:
+                  - type
+                  - ts
+                  - do
+                  - collection
+                  - docId
+                properties:
+                  type:
+                    type: string
+                  ts:
+                    type: string
+                    format: date-time
+                  do:
+                    type: object
+                  collection:
+                    type: string
+                  docId:
+                    type: string
+                  doc:
+                    type: object
+              validationEnabled: true
+              strictMode: false
+              description: Schema for collection insert events
+      responses:
+        '201':
+          description: Schema registered successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  schemaId:
+                    type: string
+                  version:
+                    type: integer
+                  namespace:
+                    type: string
+                  eventType:
+                    type: string
+        '400':
+          description: Invalid schema
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          description: Schema registry not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      tags:
+        - Schemas
+      summary: List schemas
+      description: Lists all registered schemas
+      operationId: listSchemas
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: namespace
+          in: query
+          schema:
+            type: string
+          description: Filter by namespace
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+          description: Maximum schemas to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Pagination offset
+      responses:
+        '200':
+          description: Schemas retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schemas:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SchemaRegistration'
+                  count:
+                    type: integer
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          description: Schema registry not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /schemas/validate:
+    post:
+      tags:
+        - Schemas
+      summary: Validate events
+      description: Validates events against registered schemas (testing endpoint)
+      operationId: validateEvents
+      security:
+        - oauthAdmin: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidateEventsRequest'
+      responses:
+        '200':
+          description: Validation completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResult'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          description: Schema registry not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /schemas/{namespace}/{eventType}:
+    get:
+      tags:
+        - Schemas
+      summary: Get schema
+      description: Gets a specific schema by namespace and event type
+      operationId: getSchema
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: eventType
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Schema retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaRegistration'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          description: Schema registry not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      tags:
+        - Schemas
+      summary: Delete schema
+      description: Deletes a schema
+      operationId: deleteSchema
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: eventType
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Schema deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: boolean
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          description: Schema registry not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /schemas/{namespace}/{eventType}/history:
+    get:
+      tags:
+        - Schemas
+      summary: Get schema history
+      description: Gets the version history for a schema
+      operationId: getSchemaHistory
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: eventType
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Schema history retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  history:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        version:
+                          type: integer
+                        schema:
+                          $ref: '#/components/schemas/JsonSchema'
+                        createdAt:
+                          type: integer
+                  count:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          description: Schema registry not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /schemas/namespace/{namespace}/config:
+    get:
+      tags:
+        - Schemas
+      summary: Get namespace config
+      description: Gets validation configuration for a namespace
+      operationId: getNamespaceConfig
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Namespace config retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NamespaceConfig'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          description: Schema registry not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    put:
+      tags:
+        - Schemas
+      summary: Configure namespace
+      description: Configures validation settings for a namespace
+      operationId: configureNamespace
+      security:
+        - oauthAdmin: []
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                validationEnabled:
+                  type: boolean
+                strictMode:
+                  type: boolean
+      responses:
+        '200':
+          description: Namespace configured
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  namespace:
+                    type: string
+        '400':
+          description: Invalid configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          description: Schema registry not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'

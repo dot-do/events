@@ -12,6 +12,7 @@
  * 3. Event Stream Compaction: Compacts hourly Parquet files into daily files (daily at 1:30 UTC)
  * 4. Dead Letter Cleanup: Prunes R2 dead-letter messages older than 30 days (daily at 2:30 UTC)
  * 5. Subscription Dead Letter Cleanup: Triggers cleanup of old dead letters in SubscriptionDO shards (daily at 3:30 UTC)
+ * 6. Reconciliation: Detects and repairs missed event deliveries (daily at 4:30 UTC)
  */
 
 import type { Env } from '../env'
@@ -20,6 +21,7 @@ import { compactEventStream } from '../../core/src/event-compaction'
 import { withSchedulerLock } from '../scheduler-lock'
 import { KNOWN_SUBSCRIPTION_SHARDS } from '../subscription-routes'
 import { createLogger, logError, generateCorrelationId, type Logger } from '../logger'
+import { runReconciliation, getReconciliationConfig } from '../jobs/reconciliation'
 
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
 const DEAD_LETTER_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
@@ -329,6 +331,49 @@ async function cleanupSubscriptionDeadLetters(env: Env, log: Logger): Promise<vo
 }
 
 /**
+ * Task 6: Reconciliation Job (daily at 4:30 UTC only)
+ * Detects and repairs missed event deliveries by comparing R2 event files
+ * against delivery records in SubscriptionDO.
+ *
+ * This handles the lack of end-to-end transaction semantics - events may be
+ * written to R2 but fail to be delivered to subscribers due to network issues,
+ * DO crashes, or queue failures.
+ */
+async function runReconciliationJob(env: Env, log: Logger): Promise<void> {
+  const currentHour = new Date().getUTCHours()
+  if (currentHour !== 4) {
+    return
+  }
+
+  if (!env.SUBSCRIPTIONS) {
+    log.info('Skipping reconciliation - SUBSCRIPTIONS binding not available')
+    return
+  }
+
+  try {
+    log.info('Starting reconciliation job')
+
+    const config = getReconciliationConfig(env)
+    const result = await runReconciliation(env, log, config)
+
+    log.info('Reconciliation completed', {
+      eventsScanned: result.eventsScanned,
+      eventsMatched: result.eventsMatched,
+      eventsMissed: result.eventsMissed,
+      eventsRequeued: result.eventsRequeued,
+      filesScanned: result.filesScanned,
+      durationMs: result.durationMs,
+    })
+
+    if (result.errors.length > 0) {
+      log.warn('Reconciliation had errors', { errorCount: result.errors.length, errors: result.errors.slice(0, 10) })
+    }
+  } catch (err) {
+    logError(log, 'Error during reconciliation', err)
+  }
+}
+
+/**
  * Scheduled handler - runs all cleanup and compaction tasks.
  * Tasks are scheduled at different hours to spread load:
  * - Dedup cleanup: every hour
@@ -336,6 +381,7 @@ async function cleanupSubscriptionDeadLetters(env: Env, log: Logger): Promise<vo
  * - Event stream compaction: 1:30 UTC daily
  * - Dead letter cleanup: 2:30 UTC daily
  * - Subscription dead letter cleanup: 3:30 UTC daily
+ * - Reconciliation: 4:30 UTC daily
  */
 export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
   const startTime = Date.now()
@@ -364,6 +410,9 @@ export async function handleScheduled(event: ScheduledEvent, env: Env, ctx: Exec
 
         // Task 5: Subscription Dead Letter Cleanup (only at 3:30 UTC)
         await cleanupSubscriptionDeadLetters(env, log)
+
+        // Task 6: Reconciliation Job (only at 4:30 UTC)
+        await runReconciliationJob(env, log)
 
         const durationMs = Date.now() - startTime
         log.info('All scheduled tasks completed', { durationMs })

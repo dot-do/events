@@ -292,11 +292,11 @@ describe('validateNamespace', () => {
 
 describe('extractTenantContext', () => {
   describe('no authorization', () => {
-    it('returns 401 when no authorization header', () => {
+    it('returns 401 when no authorization header', async () => {
       const env = createMockEnv()
       const request = createRequest()
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
 
       expect(result).toBeInstanceOf(Response)
       expect((result as Response).status).toBe(401)
@@ -306,7 +306,7 @@ describe('extractTenantContext', () => {
       const env = createMockEnv()
       const request = createRequest()
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
       const json = await (result as Response).json()
 
       expect(json.code).toBe('AUTH_REQUIRED')
@@ -314,11 +314,11 @@ describe('extractTenantContext', () => {
   })
 
   describe('invalid authorization format', () => {
-    it('returns 401 for Basic auth', () => {
+    it('returns 401 for Basic auth', async () => {
       const env = createMockEnv()
       const request = createRequest('Basic dXNlcjpwYXNz')
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
 
       expect(result).toBeInstanceOf(Response)
       expect((result as Response).status).toBe(401)
@@ -328,7 +328,7 @@ describe('extractTenantContext', () => {
       const env = createMockEnv()
       const request = createRequest('Basic abc')
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
       const json = await (result as Response).json()
 
       expect(json.code).toBe('INVALID_AUTH_FORMAT')
@@ -336,38 +336,38 @@ describe('extractTenantContext', () => {
   })
 
   describe('namespace-scoped API keys', () => {
-    it('extracts tenant from valid namespace key', () => {
+    it('extracts tenant from valid namespace key', async () => {
       const env = createMockEnv({
         NAMESPACE_API_KEYS: JSON.stringify({ 'ns_acme_token123': 'acme' }),
       })
       const request = createRequest('Bearer ns_acme_token123')
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
 
       expect(result).not.toBeInstanceOf(Response)
       expect((result as TenantContext).namespace).toBe('acme')
       expect((result as TenantContext).isAdmin).toBe(false)
     })
 
-    it('returns 401 for unregistered namespace key', () => {
+    it('returns 401 for unregistered namespace key', async () => {
       const env = createMockEnv({
         NAMESPACE_API_KEYS: JSON.stringify({ 'ns_acme_token123': 'acme' }),
       })
       const request = createRequest('Bearer ns_acme_wrong-token')
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
 
       expect(result).toBeInstanceOf(Response)
       expect((result as Response).status).toBe(401)
     })
 
-    it('returns 400 for reserved namespace', () => {
+    it('returns 400 for reserved namespace', async () => {
       const env = createMockEnv({
         NAMESPACE_API_KEYS: JSON.stringify({ 'ns_admin_token123': 'admin' }),
       })
       const request = createRequest('Bearer ns_admin_token123')
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
 
       expect(result).toBeInstanceOf(Response)
       expect((result as Response).status).toBe(400)
@@ -375,38 +375,38 @@ describe('extractTenantContext', () => {
   })
 
   describe('legacy AUTH_TOKEN', () => {
-    it('authenticates with legacy AUTH_TOKEN', () => {
+    it('authenticates with legacy AUTH_TOKEN', async () => {
       const env = createMockEnv({
         AUTH_TOKEN: 'legacy-secret-token',
       })
       const request = createRequest('Bearer legacy-secret-token')
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
 
       expect(result).not.toBeInstanceOf(Response)
       expect((result as TenantContext).isAdmin).toBe(true)
       expect((result as TenantContext).namespace).toBe('default')
     })
 
-    it('uses DEFAULT_NAMESPACE for legacy token', () => {
+    it('uses DEFAULT_NAMESPACE for legacy token', async () => {
       const env = createMockEnv({
         AUTH_TOKEN: 'legacy-token',
         DEFAULT_NAMESPACE: 'my-default',
       })
       const request = createRequest('Bearer legacy-token')
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
 
       expect((result as TenantContext).namespace).toBe('my-default')
     })
 
-    it('returns 401 for invalid legacy token', () => {
+    it('returns 401 for invalid legacy token', async () => {
       const env = createMockEnv({
         AUTH_TOKEN: 'correct-token',
       })
       const request = createRequest('Bearer wrong-token')
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
 
       expect(result).toBeInstanceOf(Response)
       expect((result as Response).status).toBe(401)
@@ -414,13 +414,13 @@ describe('extractTenantContext', () => {
   })
 
   describe('error handling', () => {
-    it('handles malformed NAMESPACE_API_KEYS JSON', () => {
+    it('handles malformed NAMESPACE_API_KEYS JSON', async () => {
       const env = createMockEnv({
         NAMESPACE_API_KEYS: 'not-json',
       })
       const request = createRequest('Bearer ns_acme_token')
 
-      const result = extractTenantContext(request, env)
+      const result = await extractTenantContext(request, env)
 
       expect(result).toBeInstanceOf(Response)
       expect((result as Response).status).toBe(401)
@@ -433,33 +433,33 @@ describe('extractTenantContext', () => {
 // ============================================================================
 
 describe('requireTenant', () => {
-  it('returns tenant context for valid key', () => {
+  it('returns tenant context for valid key', async () => {
     const env = createMockEnv({
       NAMESPACE_API_KEYS: JSON.stringify({ 'ns_team_abc': 'team' }),
     })
     const request = createRequest('Bearer ns_team_abc')
 
-    const result = requireTenant(request, env)
+    const result = await requireTenant(request, env)
 
     expect((result as TenantContext).namespace).toBe('team')
   })
 
-  it('attaches tenant to request object', () => {
+  it('attaches tenant to request object', async () => {
     const env = createMockEnv({
       NAMESPACE_API_KEYS: JSON.stringify({ 'ns_team_abc': 'team' }),
     })
     const request = createRequest('Bearer ns_team_abc') as TenantRequest
 
-    requireTenant(request, env)
+    await requireTenant(request, env)
 
     expect(request.tenant?.namespace).toBe('team')
   })
 
-  it('returns Response for invalid authentication', () => {
+  it('returns Response for invalid authentication', async () => {
     const env = createMockEnv()
     const request = createRequest()
 
-    const result = requireTenant(request, env)
+    const result = await requireTenant(request, env)
 
     expect(result).toBeInstanceOf(Response)
   })
@@ -470,25 +470,25 @@ describe('requireTenant', () => {
 // ============================================================================
 
 describe('requireAdmin', () => {
-  it('returns tenant context for admin', () => {
+  it('returns tenant context for admin', async () => {
     const env = createMockEnv({
       AUTH_TOKEN: 'admin-token',
     })
     const request = createRequest('Bearer admin-token')
 
-    const result = requireAdmin(request, env)
+    const result = await requireAdmin(request, env)
 
     expect(result).not.toBeInstanceOf(Response)
     expect((result as TenantContext).isAdmin).toBe(true)
   })
 
-  it('returns 403 for non-admin tenant', () => {
+  it('returns 403 for non-admin tenant', async () => {
     const env = createMockEnv({
       NAMESPACE_API_KEYS: JSON.stringify({ 'ns_team_abc': 'team' }),
     })
     const request = createRequest('Bearer ns_team_abc')
 
-    const result = requireAdmin(request, env)
+    const result = await requireAdmin(request, env)
 
     expect(result).toBeInstanceOf(Response)
     expect((result as Response).status).toBe(403)
@@ -500,17 +500,17 @@ describe('requireAdmin', () => {
     })
     const request = createRequest('Bearer ns_team_abc')
 
-    const result = requireAdmin(request, env)
+    const result = await requireAdmin(request, env)
     const json = await (result as Response).json()
 
     expect(json.code).toBe('ADMIN_REQUIRED')
   })
 
-  it('returns 401 for missing auth', () => {
+  it('returns 401 for missing auth', async () => {
     const env = createMockEnv()
     const request = createRequest()
 
-    const result = requireAdmin(request, env)
+    const result = await requireAdmin(request, env)
 
     expect(result).toBeInstanceOf(Response)
     expect((result as Response).status).toBe(401)

@@ -120,104 +120,117 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
   const path = url.pathname.replace('/catalog', '') || '/'
 
   try {
-    // GET /catalog/namespaces - list all namespaces across all shards
-    // For backwards compatibility, we check both legacy and known namespaces
-    if (path === '/namespaces' && request.method === 'GET') {
-      // First check legacy catalog for any existing namespaces
-      const legacyCatalog = getLegacyCatalog(env)
-      const legacyNamespaces = await legacyCatalog.listNamespaces()
-
-      // For sharded catalogs, we need a registry or query R2 for known namespaces
-      // For now, return legacy namespaces plus 'default' if not present
-      const namespaces = new Set(legacyNamespaces)
-      namespaces.add('default')
-
-      return Response.json({ namespaces: [...namespaces].sort() }, { headers: authCorsHeaders(request, env) })
-    }
-
-    // POST /catalog/namespaces - create namespace in the namespace-sharded catalog
-    if (path === '/namespaces' && request.method === 'POST') {
-      let body: unknown
-      try {
-        body = await request.json()
-      } catch {
-        return Response.json({ error: 'Invalid JSON body' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      if (!body || typeof body !== 'object' || Array.isArray(body)) {
-        return Response.json({ error: 'Invalid JSON body' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      const { name, properties } = body as Record<string, unknown>
-      if (!name || typeof name !== 'string') {
-        return Response.json({ error: 'Missing required field: name (string)' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      if (properties !== undefined && (typeof properties !== 'object' || properties === null || Array.isArray(properties))) {
-        return Response.json({ error: 'Invalid field: properties must be an object' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      // Create namespace in the namespace-sharded catalog
-      const catalog = getCatalog(env, name)
-      await catalog.createNamespace(name, properties as Record<string, string> | undefined)
-      return Response.json({ ok: true, namespace: name }, { headers: authCorsHeaders(request, env) })
-    }
-
-    // GET /catalog/tables?namespace=xxx
-    if (path === '/tables' && request.method === 'GET') {
-      const namespace = url.searchParams.get('namespace') ?? 'default'
-      const catalog = getCatalog(env, namespace)
-
-      // First try sharded catalog
-      let tables = await catalog.listTables(namespace)
-
-      // If no tables found and this is default namespace, also check legacy catalog
-      if (tables.length === 0 && namespace === 'default') {
+    // /catalog/namespaces - supports GET and POST
+    if (path === '/namespaces') {
+      if (request.method === 'GET') {
+        // First check legacy catalog for any existing namespaces
         const legacyCatalog = getLegacyCatalog(env)
-        tables = await legacyCatalog.listTables(namespace)
-      }
+        const legacyNamespaces = await legacyCatalog.listNamespaces()
 
-      return Response.json({ namespace, tables }, { headers: authCorsHeaders(request, env) })
+        // For sharded catalogs, we need a registry or query R2 for known namespaces
+        // For now, return legacy namespaces plus 'default' if not present
+        const namespaces = new Set(legacyNamespaces)
+        namespaces.add('default')
+
+        return Response.json({ namespaces: [...namespaces].sort() }, { headers: authCorsHeaders(request, env) })
+      } else if (request.method === 'POST') {
+        let body: unknown
+        try {
+          body = await request.json()
+        } catch {
+          return Response.json({ error: 'Invalid JSON body' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          return Response.json({ error: 'Invalid JSON body' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        const { name, properties } = body as Record<string, unknown>
+        if (!name || typeof name !== 'string') {
+          return Response.json({ error: 'Missing required field: name (string)' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        if (properties !== undefined && (typeof properties !== 'object' || properties === null || Array.isArray(properties))) {
+          return Response.json({ error: 'Invalid field: properties must be an object' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        // Create namespace in the namespace-sharded catalog
+        const catalog = getCatalog(env, name)
+        await catalog.createNamespace(name, properties as Record<string, string> | undefined)
+        return Response.json({ ok: true, namespace: name }, { headers: authCorsHeaders(request, env) })
+      } else {
+        return Response.json({ error: 'Method not allowed' }, {
+          status: 405,
+          headers: { ...authCorsHeaders(request, env), 'Allow': 'GET, POST' }
+        })
+      }
     }
 
-    // POST /catalog/tables - create table in namespace-sharded catalog
-    if (path === '/tables' && request.method === 'POST') {
-      let body: unknown
-      try {
-        body = await request.json()
-      } catch {
-        return Response.json({ error: 'Invalid JSON body' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      if (!body || typeof body !== 'object' || Array.isArray(body)) {
-        return Response.json({ error: 'Invalid JSON body' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      const { namespace, name, schema, location } = body as Record<string, unknown>
-      if (!namespace || typeof namespace !== 'string') {
-        return Response.json({ error: 'Missing required field: namespace (string)' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      if (!name || typeof name !== 'string') {
-        return Response.json({ error: 'Missing required field: name (string)' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      if (!Array.isArray(schema)) {
-        return Response.json({ error: 'Missing required field: schema (array)' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      for (let i = 0; i < schema.length; i++) {
-        const col = schema[i]
-        if (!col || typeof col !== 'object' || typeof col.name !== 'string' || typeof col.type !== 'string') {
-          return Response.json({ error: `Invalid schema entry at index ${i}: must have name (string) and type (string)` }, { status: 400, headers: authCorsHeaders(request, env) })
+    // /catalog/tables - supports GET and POST
+    if (path === '/tables') {
+      if (request.method === 'GET') {
+        const namespace = url.searchParams.get('namespace') ?? 'default'
+        const catalog = getCatalog(env, namespace)
+
+        // First try sharded catalog
+        let tables = await catalog.listTables(namespace)
+
+        // If no tables found and this is default namespace, also check legacy catalog
+        if (tables.length === 0 && namespace === 'default') {
+          const legacyCatalog = getLegacyCatalog(env)
+          tables = await legacyCatalog.listTables(namespace)
         }
+
+        return Response.json({ namespace, tables }, { headers: authCorsHeaders(request, env) })
+      } else if (request.method === 'POST') {
+        let body: unknown
+        try {
+          body = await request.json()
+        } catch {
+          return Response.json({ error: 'Invalid JSON body' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          return Response.json({ error: 'Invalid JSON body' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        const { namespace, name, schema, location } = body as Record<string, unknown>
+        if (!namespace || typeof namespace !== 'string') {
+          return Response.json({ error: 'Missing required field: namespace (string)' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        if (!name || typeof name !== 'string') {
+          return Response.json({ error: 'Missing required field: name (string)' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        if (!Array.isArray(schema)) {
+          return Response.json({ error: 'Missing required field: schema (array)' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        for (let i = 0; i < schema.length; i++) {
+          const col = schema[i]
+          if (!col || typeof col !== 'object' || typeof col.name !== 'string' || typeof col.type !== 'string') {
+            return Response.json({ error: `Invalid schema entry at index ${i}: must have name (string) and type (string)` }, { status: 400, headers: authCorsHeaders(request, env) })
+          }
+        }
+        if (location !== undefined && typeof location !== 'string') {
+          return Response.json({ error: 'Invalid field: location must be a string' }, { status: 400, headers: authCorsHeaders(request, env) })
+        }
+        const catalog = getCatalog(env, namespace)
+        const table = await catalog.createTable(
+          namespace,
+          name,
+          schema as { name: string; type: 'string' | 'int32' | 'int64' | 'float' | 'double' | 'boolean' | 'timestamp' | 'json'; nullable?: boolean }[],
+          { location: location as string | undefined },
+        )
+        return Response.json({ ok: true, table }, { headers: authCorsHeaders(request, env) })
+      } else {
+        return Response.json({ error: 'Method not allowed' }, {
+          status: 405,
+          headers: { ...authCorsHeaders(request, env), 'Allow': 'GET, POST' }
+        })
       }
-      if (location !== undefined && typeof location !== 'string') {
-        return Response.json({ error: 'Invalid field: location must be a string' }, { status: 400, headers: authCorsHeaders(request, env) })
-      }
-      const catalog = getCatalog(env, namespace)
-      const table = await catalog.createTable(
-        namespace,
-        name,
-        schema as { name: string; type: 'string' | 'int32' | 'int64' | 'float' | 'double' | 'boolean' | 'timestamp' | 'json'; nullable?: boolean }[],
-        { location: location as string | undefined },
-      )
-      return Response.json({ ok: true, table }, { headers: authCorsHeaders(request, env) })
     }
 
     // GET /catalog/table?namespace=xxx&name=yyy
-    if (path === '/table' && request.method === 'GET') {
+    if (path === '/table') {
+      if (request.method !== 'GET') {
+        return Response.json({ error: 'Method not allowed' }, {
+          status: 405,
+          headers: { ...authCorsHeaders(request, env), 'Allow': 'GET' }
+        })
+      }
       const namespace = url.searchParams.get('namespace') ?? 'default'
       const name = url.searchParams.get('name')
       if (!name) {
@@ -241,7 +254,13 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
     }
 
     // POST /catalog/commit - commit a snapshot to namespace-sharded catalog
-    if (path === '/commit' && request.method === 'POST') {
+    if (path === '/commit') {
+      if (request.method !== 'POST') {
+        return Response.json({ error: 'Method not allowed' }, {
+          status: 405,
+          headers: { ...authCorsHeaders(request, env), 'Allow': 'POST' }
+        })
+      }
       let body: unknown
       try {
         body = await request.json()
@@ -296,7 +315,13 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
     }
 
     // GET /catalog/query?namespace=xxx&table=yyy
-    if (path === '/query' && request.method === 'GET') {
+    if (path === '/query') {
+      if (request.method !== 'GET') {
+        return Response.json({ error: 'Method not allowed' }, {
+          status: 405,
+          headers: { ...authCorsHeaders(request, env), 'Allow': 'GET' }
+        })
+      }
       const namespace = url.searchParams.get('namespace') ?? 'default'
       const name = url.searchParams.get('table')
       const where = url.searchParams.get('where') ?? undefined
@@ -337,7 +362,13 @@ export async function handleCatalog(request: Request, env: Env, url: URL): Promi
     }
 
     // GET /catalog/files?namespace=xxx&table=yyy
-    if (path === '/files' && request.method === 'GET') {
+    if (path === '/files') {
+      if (request.method !== 'GET') {
+        return Response.json({ error: 'Method not allowed' }, {
+          status: 405,
+          headers: { ...authCorsHeaders(request, env), 'Allow': 'GET' }
+        })
+      }
       const namespace = url.searchParams.get('namespace') ?? 'default'
       const name = url.searchParams.get('table')
       if (!name) {

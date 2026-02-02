@@ -10,8 +10,10 @@ import type { Env } from '../env'
 import type { EventRecord } from '../event-writer'
 import { ingestWithOverflow } from '../event-writer-do'
 import { corsHeaders } from '../utils'
+import { successResponse, errorResponse, internalError, ErrorCodes } from '../utils/response'
 import { checkRateLimit } from '../middleware/rate-limit'
 import { recordIngestMetric, MetricTimer } from '../metrics'
+import { incrementEventsIngested } from './metrics'
 import {
   extractTenantContext,
   buildNamespacedR2Path,
@@ -29,6 +31,8 @@ import {
   validateEventsMiddleware,
   dedupMiddleware,
   schemaValidationMiddleware,
+  quotaMiddleware,
+  trackEventUsage,
   writeDedupMarker,
   determineFanoutMode,
   executeDirectFanout,
@@ -81,17 +85,17 @@ async function rateLimitMiddleware(
  * Handle authentication and tenant extraction
  * Returns tenant context or error response
  */
-function handleAuthentication(
+async function handleAuthentication(
   request: Request,
   env: Env,
   timer: MetricTimer
-): TenantContext | Response {
+): Promise<TenantContext | Response> {
   // Check if namespace-scoped API keys are configured
   const hasNamespaceKeys = !!env.NAMESPACE_API_KEYS
 
   if (hasNamespaceKeys || env.AUTH_TOKEN) {
     // Tenant extraction handles both namespace-scoped keys and legacy AUTH_TOKEN
-    const tenantResult = extractTenantContext(request, env)
+    const tenantResult = await extractTenantContext(request, env)
     if (tenantResult instanceof Response) {
       recordIngestMetric(env.ANALYTICS, 'error', 0, timer.elapsed(), 'unauthorized')
       return tenantResult
@@ -104,9 +108,9 @@ function handleAuthentication(
     log.warn('Authentication not configured', {
       hint: 'Set AUTH_TOKEN secret, NAMESPACE_API_KEYS, or ALLOW_UNAUTHENTICATED_INGEST=true',
     })
-    return Response.json(
-      { error: 'Server misconfiguration: authentication not configured' },
-      { status: 500, headers: corsHeaders() }
+    return internalError(
+      'Server misconfiguration: authentication not configured',
+      { headers: corsHeaders() }
     )
   }
 
@@ -134,7 +138,7 @@ export async function handleIngest(
   const timer = new MetricTimer()
 
   // Authentication (before middleware chain)
-  const authResult = handleAuthentication(request, env, timer)
+  const authResult = await handleAuthentication(request, env, timer)
   if (authResult instanceof Response) {
     return authResult
   }
@@ -150,11 +154,12 @@ export async function handleIngest(
   }
 
   // Compose and execute middleware pipeline
-  // Order matters: parse -> validate batch -> rate limit -> dedup -> validate events -> schema
+  // Order matters: parse -> validate batch -> rate limit -> quota -> dedup -> validate events -> schema
   const pipeline = composeMiddleware([
     parseJsonMiddleware,
     validateBatchMiddleware,
     rateLimitMiddleware,
+    quotaMiddleware,
     dedupMiddleware,
     validateEventsMiddleware,
     schemaValidationMiddleware,
@@ -230,9 +235,11 @@ export async function handleIngest(
   }
 
   // Record successful ingest metric
-  recordIngestMetric(env.ANALYTICS, 'success', validatedBatch.events.length, timer.elapsed())
+  const elapsedMs = timer.elapsed()
+  recordIngestMetric(env.ANALYTICS, 'success', validatedBatch.events.length, elapsedMs)
+  incrementEventsIngested(validatedBatch.events.length, elapsedMs)
 
-  return Response.json(
+  return successResponse(
     {
       ok: true,
       received: validatedBatch.events.length,

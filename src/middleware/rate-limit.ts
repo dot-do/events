@@ -10,13 +10,41 @@
  */
 
 import type { RateLimiterDO } from './rate-limiter-do'
-import { corsHeaders } from '../utils'
+import {
+  corsHeaders,
+  withTimeout,
+  CircuitBreaker,
+  CircuitBreakerOpenError,
+  TimeoutError,
+} from '../utils'
 import {
   DEFAULT_RATE_LIMIT_REQUESTS_PER_MINUTE,
   DEFAULT_RATE_LIMIT_EVENTS_PER_MINUTE,
   DEFAULT_RATE_LIMIT_RETRY_AFTER,
+  RATE_LIMITER_TIMEOUT_MS,
 } from '../config'
 import { logger, logError } from '../logger'
+
+// ============================================================================
+// Circuit Breaker for Rate Limiter
+// ============================================================================
+
+/**
+ * Circuit breaker for rate limiter DO calls.
+ * Shared across all requests to track failures globally.
+ */
+const rateLimiterCircuitBreaker = new CircuitBreaker('rate-limiter', {
+  failureThreshold: 5,
+  resetTimeoutMs: 30000,
+  successThreshold: 2,
+})
+
+/**
+ * Get the rate limiter circuit breaker (for testing/monitoring)
+ */
+export function getRateLimiterCircuitBreaker(): CircuitBreaker {
+  return rateLimiterCircuitBreaker
+}
 
 /** Environment variables for rate limiting */
 export interface RateLimitEnv {
@@ -71,18 +99,32 @@ export function getRateLimitKey(request: Request): string {
 /**
  * Check rate limit for an ingest request.
  *
+ * Uses timeout protection and circuit breaker to prevent slow rate limiter DO
+ * from causing cascading failures. If rate limiting fails, the request is allowed
+ * to proceed (fail-open behavior).
+ *
  * @param request - The incoming request
  * @param env - Environment with RATE_LIMITER binding
  * @param eventCount - Number of events in the batch
+ * @param timeoutMs - Timeout for the DO call (default: RATE_LIMITER_TIMEOUT_MS)
  * @returns Response if rate limited (429), null if allowed
  */
 export async function checkRateLimit(
   request: Request,
   env: RateLimitEnv,
   eventCount: number,
+  timeoutMs: number = RATE_LIMITER_TIMEOUT_MS,
 ): Promise<Response | null> {
   // Skip rate limiting if RATE_LIMITER is not configured
   if (!env.RATE_LIMITER) {
+    return null
+  }
+
+  // Check circuit breaker state before making the call
+  if (rateLimiterCircuitBreaker.getState() === 'open') {
+    logger.warn('Rate limiter circuit breaker is open, allowing request through', {
+      component: 'RateLimit',
+    })
     return null
   }
 
@@ -95,12 +137,18 @@ export async function checkRateLimit(
     const rateLimiterId = env.RATE_LIMITER.idFromName(key)
     const rateLimiter = env.RATE_LIMITER.get(rateLimiterId)
 
-    // Check and increment the rate limit
-    const result = await rateLimiter.checkAndIncrement(
-      requestsPerMinute,
-      eventsPerMinute,
-      eventCount,
-    )
+    // Check and increment the rate limit with timeout and circuit breaker protection
+    const result = await rateLimiterCircuitBreaker.execute(async () => {
+      return withTimeout(
+        rateLimiter.checkAndIncrement(
+          requestsPerMinute,
+          eventsPerMinute,
+          eventCount,
+        ),
+        timeoutMs,
+        `Rate limit check timed out after ${timeoutMs}ms`
+      )
+    })
 
     if (!result.allowed) {
       const retryAfter = result.retryAfterSeconds || DEFAULT_RATE_LIMIT_RETRY_AFTER
@@ -138,8 +186,22 @@ export async function checkRateLimit(
     // Request allowed - return null (continue processing)
     return null
   } catch (err) {
-    // Log the error but don't block the request on rate limiter failures
-    logError(logger.child({ component: 'RateLimit' }), 'Error checking rate limit - allowing request', err)
+    // Handle timeout and circuit breaker errors specifically
+    if (err instanceof TimeoutError) {
+      logError(
+        logger.child({ component: 'RateLimit' }),
+        'Rate limit check timed out - allowing request',
+        err,
+        { timeoutMs }
+      )
+    } else if (err instanceof CircuitBreakerOpenError) {
+      logger.warn('Rate limiter circuit breaker open - allowing request', {
+        component: 'RateLimit',
+      })
+    } else {
+      // Log the error but don't block the request on rate limiter failures
+      logError(logger.child({ component: 'RateLimit' }), 'Error checking rate limit - allowing request', err)
+    }
     return null
   }
 }

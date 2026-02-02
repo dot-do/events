@@ -282,11 +282,6 @@ export function validateWebhookConfig(config: unknown): string[] {
   // Provider-specific validation
   switch (c.provider) {
     case 'stripe':
-      // Stripe secrets typically start with whsec_
-      if (isNonEmptyString(c.secret) && !c.secret.startsWith('whsec_')) {
-        // This is a warning, not an error - some test secrets may not have the prefix
-        // errors.push('Stripe webhook secret should start with "whsec_"')
-      }
       if (c.toleranceSeconds !== undefined && typeof c.toleranceSeconds !== 'number') {
         errors.push('Field "toleranceSeconds" must be a number')
       }

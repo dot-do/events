@@ -28,10 +28,82 @@ import {
   isEncryptedPayload,
   type PayloadEncryptionConfig,
   type EncryptionKeyStore,
+  type EncryptionKeyInfo,
   type EncryptedPayload,
 } from '../../../core/src/encryption'
 
 const log = createLogger({ component: 'encryption-middleware' })
+
+// ============================================================================
+// Type Validators
+// ============================================================================
+
+/**
+ * Type guard for EncryptionKeyInfo
+ */
+function isEncryptionKeyInfo(value: unknown): value is EncryptionKeyInfo {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  return (
+    typeof v.keyId === 'string' &&
+    typeof v.keyBase64 === 'string' &&
+    typeof v.createdAt === 'string' &&
+    typeof v.isActive === 'boolean' &&
+    (v.expiresAt === undefined || typeof v.expiresAt === 'string')
+  )
+}
+
+/**
+ * Type guard for EncryptionKeyStore
+ */
+function isEncryptionKeyStore(value: unknown): value is EncryptionKeyStore {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (typeof v.activeKeyId !== 'string') return false
+  if (typeof v.keys !== 'object' || v.keys === null) return false
+
+  // Validate each key in the store
+  const keys = v.keys as Record<string, unknown>
+  for (const keyInfo of Object.values(keys)) {
+    if (!isEncryptionKeyInfo(keyInfo)) return false
+  }
+  return true
+}
+
+/**
+ * Type guard for PayloadEncryptionConfig
+ */
+function isPayloadEncryptionConfig(value: unknown): value is PayloadEncryptionConfig {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+  if (typeof v.enabled !== 'boolean') return false
+
+  // Optional fields
+  if (v.eventTypes !== undefined) {
+    if (!Array.isArray(v.eventTypes)) return false
+    if (!v.eventTypes.every((t) => typeof t === 'string')) return false
+  }
+  if (v.fields !== undefined) {
+    if (!Array.isArray(v.fields)) return false
+    if (!v.fields.every((f) => typeof f === 'string')) return false
+  }
+  if (v.keyId !== undefined && typeof v.keyId !== 'string') return false
+
+  return true
+}
+
+/**
+ * Type guard for namespace encryption configs map
+ */
+function isNamespaceEncryptionConfigsMap(value: unknown): value is Record<string, PayloadEncryptionConfig> {
+  if (typeof value !== 'object' || value === null) return false
+  const v = value as Record<string, unknown>
+
+  for (const config of Object.values(v)) {
+    if (!isPayloadEncryptionConfig(config)) return false
+  }
+  return true
+}
 
 // ============================================================================
 // Types
@@ -74,7 +146,12 @@ export function loadKeyStore(env: Env & EncryptionEnv): EncryptionKeyStore | nul
   }
 
   try {
-    return JSON.parse(env.ENCRYPTION_KEYS) as EncryptionKeyStore
+    const parsed: unknown = JSON.parse(env.ENCRYPTION_KEYS)
+    if (!isEncryptionKeyStore(parsed)) {
+      log.error('ENCRYPTION_KEYS failed validation: invalid structure')
+      return null
+    }
+    return parsed
   } catch (error) {
     log.error('Failed to parse ENCRYPTION_KEYS', { error })
     return null
@@ -83,6 +160,7 @@ export function loadKeyStore(env: Env & EncryptionEnv): EncryptionKeyStore | nul
 
 /**
  * Load encryption configuration for a namespace
+ * @alias loadEncryptionConfig - exported for backwards compatibility
  */
 export function loadPayloadEncryptionConfig(
   env: Env & EncryptionEnv,
@@ -91,9 +169,11 @@ export function loadPayloadEncryptionConfig(
   // Check namespace-specific config first
   if (env.NAMESPACE_ENCRYPTION_CONFIGS) {
     try {
-      const configs = JSON.parse(env.NAMESPACE_ENCRYPTION_CONFIGS) as Record<string, PayloadEncryptionConfig>
-      if (configs[namespace]) {
-        return configs[namespace]
+      const parsed: unknown = JSON.parse(env.NAMESPACE_ENCRYPTION_CONFIGS)
+      if (!isNamespaceEncryptionConfigsMap(parsed)) {
+        log.error('NAMESPACE_ENCRYPTION_CONFIGS failed validation: invalid structure')
+      } else if (parsed[namespace]) {
+        return parsed[namespace]
       }
     } catch (error) {
       log.error('Failed to parse NAMESPACE_ENCRYPTION_CONFIGS', { error })
@@ -103,7 +183,12 @@ export function loadPayloadEncryptionConfig(
   // Fall back to default config
   if (env.DEFAULT_ENCRYPTION_CONFIG) {
     try {
-      return JSON.parse(env.DEFAULT_ENCRYPTION_CONFIG) as PayloadEncryptionConfig
+      const parsed: unknown = JSON.parse(env.DEFAULT_ENCRYPTION_CONFIG)
+      if (!isPayloadEncryptionConfig(parsed)) {
+        log.error('DEFAULT_ENCRYPTION_CONFIG failed validation: invalid structure')
+        return null
+      }
+      return parsed
     } catch (error) {
       log.error('Failed to parse DEFAULT_ENCRYPTION_CONFIG', { error })
     }
@@ -363,3 +448,8 @@ export function validateClientEncryption(
 
   return { valid: true }
 }
+
+/**
+ * Alias for loadPayloadEncryptionConfig - exported for backwards compatibility
+ */
+export const loadEncryptionConfig = loadPayloadEncryptionConfig

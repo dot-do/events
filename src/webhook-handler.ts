@@ -29,7 +29,7 @@ import {
   WebhookConfigError,
   WebhookSignatureError,
 } from '../core/src/webhooks'
-import { PayloadTooLargeError } from '../core/src/errors'
+import { PayloadTooLargeError, InvalidJsonError, ValidationError } from '../core/src/errors'
 import { MAX_WEBHOOK_BODY_SIZE } from './middleware/ingest/types'
 import { readBodyWithLimit } from './middleware/ingest/validate'
 import { logger, sanitize } from './logger'
@@ -122,6 +122,29 @@ function getSecretForProvider(env: WebhookEnv, provider: WebhookProvider): strin
 }
 
 /**
+ * Creates a type-safe provider configuration using an exhaustive switch pattern
+ * @param provider - The validated webhook provider
+ * @param secret - The webhook secret
+ * @returns The properly typed provider configuration
+ */
+function createProviderConfig(provider: WebhookProvider, secret: string): WebhookProviderConfig {
+  switch (provider) {
+    case 'github':
+      return { provider: 'github', secret, enabled: true }
+    case 'stripe':
+      return { provider: 'stripe', secret, enabled: true }
+    case 'workos':
+      return { provider: 'workos', secret, enabled: true }
+    case 'slack':
+      return { provider: 'slack', secret, enabled: true }
+    case 'linear':
+      return { provider: 'linear', secret, enabled: true }
+    case 'svix':
+      return { provider: 'svix', secret, enabled: true }
+  }
+}
+
+/**
  * Creates a webhook configuration from environment variables
  * @param env - The environment containing webhook secrets
  * @param provider - The validated webhook provider
@@ -133,22 +156,17 @@ function createProviderConfigFromEnv(env: WebhookEnv, provider: WebhookProvider)
     return null
   }
 
-  // Build configuration based on provider - use a type-safe approach
-  const baseConfig = {
-    provider,
-    secret,
-    enabled: true as const,
-  }
+  // Build configuration using type-safe builder pattern
+  const config = createProviderConfig(provider, secret)
 
   // Validate the configuration
-  const errors = validateWebhookConfig(baseConfig)
+  const errors = validateWebhookConfig(config)
   if (errors.length > 0) {
     log.error('Invalid webhook configuration', { provider, errorCount: errors.length })
     return null
   }
 
-  // After validation, we know this is a valid config - use type assertion through unknown
-  return baseConfig as unknown as WebhookProviderConfig
+  return config
 }
 
 // ============================================================================
@@ -412,13 +430,25 @@ export async function handleWebhook(
         413,
         { maxSize: MAX_WEBHOOK_BODY_SIZE }
       )
+    } else if (error instanceof InvalidJsonError) {
+      log.warn('Invalid JSON in webhook body', { provider })
+      return createErrorResponse(
+        error.message,
+        'INVALID_JSON',
+        400
+      )
+    } else if (error instanceof ValidationError) {
+      log.warn('Validation error reading webhook body', { provider })
+      return createErrorResponse(
+        error.message,
+        'INVALID_JSON',
+        400,
+        error.details
+      )
+    } else {
+      log.error('Unexpected error reading body', { error })
+      return createErrorResponse('Failed to read request body', 'UNKNOWN_ERROR', 500)
     }
-    log.error('Failed to read request body', { provider, error: sanitize.errorMessage(String(error)) })
-    return createErrorResponse(
-      'Failed to read request body',
-      'UNKNOWN_ERROR',
-      400
-    )
   }
 
   // Verify signature - always required when secret is configured

@@ -103,8 +103,10 @@ export class EventEmitter {
   }
 
   /**
-   * Enrich identity from incoming request
-   * Call this in fetch() to capture DO context
+   * Enrich identity from incoming request.
+   * Call this in fetch() to capture DO context like colo, worker name, and DO class.
+   *
+   * @param request - The incoming HTTP request containing CF properties
    */
   enrichFromRequest(request: Request): void {
     const cf = (request as CfRequest).cf
@@ -117,9 +119,12 @@ export class EventEmitter {
   }
 
   /**
-   * Emit an event (batched, non-blocking)
+   * Emit an event to be batched and sent to the events endpoint.
+   * Events are batched based on `batchSize` and `flushIntervalMs` options.
+   * This method is non-blocking; events are queued and flushed asynchronously.
    *
-   * @throws {CircuitBreakerOpenError} When circuit breaker is open due to repeated failures
+   * @param event - The event data to emit (type, collection, docId, etc.)
+   * @throws {CircuitBreakerOpenError} When circuit breaker is open due to repeated delivery failures
    */
   emit(event: EmitInput): void {
     // Check circuit breaker before accepting events
@@ -175,8 +180,15 @@ export class EventEmitter {
   }
 
   /**
-   * Emit CDC event for collection change
-   * Captures SQLite bookmark for PITR (point-in-time recovery)
+   * Emit a CDC (Change Data Capture) event for a collection change.
+   * Automatically captures the SQLite bookmark for PITR (point-in-time recovery).
+   * Only emits if the `cdc` option is enabled.
+   *
+   * @param type - The type of change: 'insert', 'update', or 'delete'
+   * @param collection - The name of the collection being changed
+   * @param docId - The unique identifier of the document being changed
+   * @param doc - The current document state (for insert/update operations)
+   * @param prev - The previous document state (for update/delete, if trackPrevious is enabled)
    */
   emitChange(
     type: 'insert' | 'update' | 'delete',
@@ -222,7 +234,11 @@ export class EventEmitter {
   }
 
   /**
-   * Flush events to endpoint
+   * Immediately flush all pending events to the events endpoint.
+   * Clears the current batch and sends events via HTTP POST.
+   * On failure, events are queued for retry via the alarm system.
+   *
+   * @returns A promise that resolves when the flush attempt completes
    */
   async flush(): Promise<void> {
     if (this.flushTimeout) {
@@ -374,8 +390,18 @@ export class EventEmitter {
   }
 
   /**
-   * Handle alarm - retry failed events
-   * Call this from your DO's alarm() method
+   * Handle the Durable Object alarm to retry failed event deliveries.
+   * Must be called from your DO's alarm() method to enable automatic retries.
+   * Uses exponential backoff with jitter for retry scheduling.
+   *
+   * @returns A promise that resolves when retry processing completes
+   *
+   * @example
+   * ```typescript
+   * async alarm() {
+   *   await this.events.handleAlarm()
+   * }
+   * ```
    */
   async handleAlarm(): Promise<void> {
     // Load circuit breaker state
@@ -475,8 +501,11 @@ export class EventEmitter {
   }
 
   /**
-   * Persist batch before hibernation
-   * Call this in webSocketClose or when expecting hibernation
+   * Persist the current event batch to storage before hibernation.
+   * Call this in webSocketClose or when expecting the DO to hibernate.
+   * The batch will be restored automatically when the DO wakes up.
+   *
+   * @returns A promise that resolves when the batch is persisted
    */
   async persistBatch(): Promise<void> {
     if (this.batch.length > 0) {
@@ -543,7 +572,13 @@ export class EventEmitter {
   }
 
   /**
-   * Get detailed circuit breaker information
+   * Get detailed information about the circuit breaker state.
+   *
+   * @returns A promise resolving to circuit breaker status including:
+   *   - isOpen: whether the circuit breaker is currently open
+   *   - consecutiveFailures: number of consecutive delivery failures
+   *   - openedAt: when the circuit breaker opened (if open)
+   *   - resetAt: when the circuit breaker will attempt to reset (if open)
    */
   async getCircuitBreakerInfo(): Promise<{
     isOpen: boolean
@@ -571,8 +606,11 @@ export class EventEmitter {
   }
 
   /**
-   * Manually reset the circuit breaker
-   * Use this to force retry after fixing the underlying issue
+   * Manually reset the circuit breaker to allow event delivery to resume.
+   * Use this after fixing the underlying issue that caused repeated failures.
+   * If there are pending events in the retry queue, schedules an immediate retry.
+   *
+   * @returns A promise that resolves when the circuit breaker is reset
    */
   async resetCircuitBreaker(): Promise<void> {
     const newState: CircuitBreakerState = {
@@ -593,7 +631,13 @@ export class EventEmitter {
   }
 
   /**
-   * Get retry queue statistics
+   * Get statistics about the retry queue for monitoring and debugging.
+   *
+   * @returns A promise resolving to retry queue statistics including:
+   *   - queueSize: current number of events in the retry queue
+   *   - maxSize: maximum allowed queue size (from options)
+   *   - droppedTotal: total events dropped due to buffer overflow
+   *   - retryCount: number of retry attempts made
    */
   async getRetryQueueStats(): Promise<{
     queueSize: number

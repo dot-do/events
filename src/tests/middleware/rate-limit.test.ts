@@ -5,11 +5,12 @@
  * Tests getRateLimitKey, checkRateLimit, and addRateLimitHeaders
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   getRateLimitKey,
   checkRateLimit,
   addRateLimitHeaders,
+  getRateLimiterCircuitBreaker,
   type RateLimitEnv,
   type RateLimitResult,
 } from '../../middleware/rate-limit'
@@ -415,6 +416,111 @@ describe('checkRateLimit', () => {
       expect(consoleSpy).toHaveBeenCalledWith(
         expect.stringContaining('Error checking rate limit')
       )
+      consoleSpy.mockRestore()
+    })
+  })
+
+  describe('timeout protection', () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+      getRateLimiterCircuitBreaker().reset()
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+      getRateLimiterCircuitBreaker().reset()
+    })
+
+    it('allows request through when rate limit check times out', async () => {
+      const rateLimiter = createMockRateLimiter({
+        checkAndIncrement: vi.fn().mockImplementation(
+          () => new Promise((resolve) => setTimeout(() => resolve({
+            allowed: true,
+            requestsRemaining: 999,
+            eventsRemaining: 99999,
+            resetAt: Date.now() + 60000,
+          }), 5000))
+        ),
+      })
+      const namespace = createMockNamespace(rateLimiter)
+      const env = createMockEnv(namespace)
+      const request = createRequest({ cfConnectingIp: '1.2.3.4' })
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      // Call with a 100ms timeout
+      const resultPromise = checkRateLimit(request, env, 100, 100)
+      vi.advanceTimersByTime(100)
+      const result = await resultPromise
+
+      expect(result).toBeNull()
+      consoleSpy.mockRestore()
+    })
+
+    it('uses custom timeout when provided', async () => {
+      const rateLimiter = createMockRateLimiter({
+        checkAndIncrement: vi.fn().mockImplementation(
+          () => new Promise((resolve) => setTimeout(() => resolve({
+            allowed: true,
+            requestsRemaining: 999,
+            eventsRemaining: 99999,
+            resetAt: Date.now() + 60000,
+          }), 200))
+        ),
+      })
+      const namespace = createMockNamespace(rateLimiter)
+      const env = createMockEnv(namespace)
+      const request = createRequest({ cfConnectingIp: '1.2.3.4' })
+
+      // Call with a 500ms timeout - should succeed
+      const resultPromise = checkRateLimit(request, env, 100, 500)
+      vi.advanceTimersByTime(200)
+      const result = await resultPromise
+
+      expect(result).toBeNull() // null means request allowed
+    })
+  })
+
+  describe('circuit breaker protection', () => {
+    beforeEach(() => {
+      getRateLimiterCircuitBreaker().reset()
+    })
+
+    afterEach(() => {
+      getRateLimiterCircuitBreaker().reset()
+    })
+
+    it('allows request when circuit breaker is open', async () => {
+      // Trip the circuit breaker
+      getRateLimiterCircuitBreaker().trip(new Error('test'))
+
+      const rateLimiter = createMockRateLimiter()
+      const namespace = createMockNamespace(rateLimiter)
+      const env = createMockEnv(namespace)
+      const request = createRequest({ cfConnectingIp: '1.2.3.4' })
+      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const result = await checkRateLimit(request, env, 100)
+
+      expect(result).toBeNull()
+      expect(rateLimiter.checkAndIncrement).not.toHaveBeenCalled()
+      consoleSpy.mockRestore()
+    })
+
+    it('opens circuit after repeated failures', async () => {
+      const rateLimiter = createMockRateLimiter({
+        checkAndIncrement: vi.fn().mockRejectedValue(new Error('DO error')),
+      })
+      const namespace = createMockNamespace(rateLimiter)
+      const env = createMockEnv(namespace)
+      const request = createRequest({ cfConnectingIp: '1.2.3.4' })
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      // Call 5 times to trip the circuit breaker (default threshold)
+      for (let i = 0; i < 5; i++) {
+        await checkRateLimit(request, env, 100)
+      }
+
+      expect(getRateLimiterCircuitBreaker().getState()).toBe('open')
       consoleSpy.mockRestore()
     })
   })

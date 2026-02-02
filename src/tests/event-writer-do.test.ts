@@ -213,8 +213,15 @@ interface BufferedEvent extends EventRecord {
   _eventId: string
 }
 
+interface DedupMarker {
+  eventIds: string[]
+  createdAt: number
+}
+
 const BUFFER_KEY = '_eventWriter:buffer'
 const FLUSHED_KEY = '_eventWriter:flushed'
+const DEDUP_MARKERS_PREFIX = '_eventWriter:dedup:'
+const DEFAULT_DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
 
 const DEFAULT_CONFIG = {
   countThreshold: 100,
@@ -222,6 +229,7 @@ const DEFAULT_CONFIG = {
   maxBufferSize: 10_000,
   maxPendingWrites: 100,
   flushIntervalMs: 5_000,
+  dedupTtlMs: DEFAULT_DEDUP_TTL_MS,
 }
 
 /**
@@ -262,9 +270,20 @@ class SimulatedEventWriterDO {
 
   private async restoreBuffer(): Promise<void> {
     try {
+      // Load all dedup markers (with TTL support)
+      await this.loadDedupMarkers()
+
+      // Handle legacy format (FLUSHED_KEY stores string[])
       const flushedIds = await this.ctx.storage.get<string[]>(FLUSHED_KEY)
       if (flushedIds && flushedIds.length > 0) {
-        this.flushedEventIds = new Set(flushedIds)
+        // Add legacy markers to in-memory set
+        for (const id of flushedIds) {
+          this.flushedEventIds.add(id)
+        }
+        // Migrate legacy markers to new TTL format
+        await this.storeDedupMarkers(flushedIds)
+        // Delete legacy key
+        await this.ctx.storage.delete(FLUSHED_KEY)
       }
 
       const stored = await this.ctx.storage.get<BufferedEvent[]>(BUFFER_KEY)
@@ -276,16 +295,69 @@ class SimulatedEventWriterDO {
 
         if (stored.length !== unflushedEvents.length) {
           await this.persistBuffer()
-          this.flushedEventIds.clear()
-          await this.ctx.storage.delete(FLUSHED_KEY)
         }
-      } else if (this.flushedEventIds.size > 0) {
-        this.flushedEventIds.clear()
-        await this.ctx.storage.delete(FLUSHED_KEY)
       }
     } catch (error) {
       // Silently handle restore errors in tests
     }
+  }
+
+  private async loadDedupMarkers(): Promise<void> {
+    const now = Date.now()
+    const allMarkers = await this.ctx.storage.list() as Map<string, unknown>
+    const expiredKeys: string[] = []
+
+    for (const [key, value] of allMarkers) {
+      if (!key.startsWith(DEDUP_MARKERS_PREFIX)) continue
+      const marker = value as DedupMarker
+      const age = now - marker.createdAt
+      if (age > this.config.dedupTtlMs) {
+        expiredKeys.push(key)
+      } else {
+        for (const eventId of marker.eventIds) {
+          this.flushedEventIds.add(eventId)
+        }
+      }
+    }
+
+    if (expiredKeys.length > 0) {
+      await this.ctx.storage.delete(expiredKeys)
+    }
+  }
+
+  private async storeDedupMarkers(eventIds: string[]): Promise<void> {
+    if (eventIds.length === 0) return
+
+    const marker: DedupMarker = {
+      eventIds,
+      createdAt: Date.now(),
+    }
+    const key = `${DEDUP_MARKERS_PREFIX}${marker.createdAt}`
+    await this.ctx.storage.put(key, marker)
+  }
+
+  private async cleanupExpiredDedupMarkers(): Promise<number> {
+    const now = Date.now()
+    const allMarkers = await this.ctx.storage.list() as Map<string, unknown>
+    const expiredKeys: string[] = []
+
+    for (const [key, value] of allMarkers) {
+      if (!key.startsWith(DEDUP_MARKERS_PREFIX)) continue
+      const marker = value as DedupMarker
+      const age = now - marker.createdAt
+      if (age > this.config.dedupTtlMs) {
+        expiredKeys.push(key)
+        for (const eventId of marker.eventIds) {
+          this.flushedEventIds.delete(eventId)
+        }
+      }
+    }
+
+    if (expiredKeys.length > 0) {
+      await this.ctx.storage.delete(expiredKeys)
+    }
+
+    return expiredKeys.length
   }
 
   private async persistBuffer(): Promise<void> {
@@ -395,9 +467,14 @@ class SimulatedEventWriterDO {
 
   async alarm(): Promise<void> {
     this.flushScheduled = false
+
+    // Flush any buffered events
     if (this.buffer.length > 0) {
       await this.flush()
     }
+
+    // Clean up expired dedup markers to prevent unbounded storage growth
+    await this.cleanupExpiredDedupMarkers()
   }
 
   async forceFlush(): Promise<WriteResult | null> {
@@ -411,6 +488,7 @@ class SimulatedEventWriterDO {
     lastFlushTime: string
     timeSinceFlush: number
     flushScheduled: boolean
+    dedupMarkerCount: number
   }> {
     return {
       shard: this.shardId,
@@ -419,6 +497,7 @@ class SimulatedEventWriterDO {
       lastFlushTime: new Date(this.lastFlushTime).toISOString(),
       timeSinceFlush: Date.now() - this.lastFlushTime,
       flushScheduled: this.flushScheduled,
+      dedupMarkerCount: this.flushedEventIds.size,
     }
   }
 
@@ -451,10 +530,13 @@ class SimulatedEventWriterDO {
         results.push(result)
       }
 
-      // Atomic flush pattern
-      await this.ctx.storage.put(FLUSHED_KEY, eventIds)
+      // Store dedup markers with TTL BEFORE deleting buffer
+      await this.storeDedupMarkers(eventIds)
+      // Also add to in-memory set for immediate dedup
+      for (const id of eventIds) {
+        this.flushedEventIds.add(id)
+      }
       await this.ctx.storage.delete(BUFFER_KEY)
-      await this.ctx.storage.delete(FLUSHED_KEY)
 
       return results[0] ?? null
     } catch (error) {
@@ -462,6 +544,11 @@ class SimulatedEventWriterDO {
       this.buffer.unshift(...events)
       throw error
     }
+  }
+
+  // Expose cleanup method for testing
+  async triggerCleanup(): Promise<number> {
+    return this.cleanupExpiredDedupMarkers()
   }
 
   // Test helpers
@@ -783,16 +870,21 @@ describe('EventWriterDO', () => {
       expect(events[0]).not.toHaveProperty('_eventId')
     })
 
-    it('should implement atomic flush pattern', async () => {
+    it('should implement atomic flush pattern with TTL-based dedup markers', async () => {
       const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
 
       await writer.ingest([{ type: 'test.event', ts: new Date().toISOString() }])
       await writer.forceFlush()
 
-      // Should mark events as flushed, then delete buffer, then delete flushed markers
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(FLUSHED_KEY, expect.any(Array))
+      // Should store dedup markers with TTL (using timestamp prefix), then delete buffer
+      // Note: We no longer delete the dedup markers immediately - they have TTL-based cleanup
+      const putCalls = mockCtx.storage.put.mock.calls
+      const dedupCall = putCalls.find((call: unknown[]) => (call[0] as string).startsWith(DEDUP_MARKERS_PREFIX))
+      expect(dedupCall).toBeDefined()
+      expect(dedupCall![1]).toHaveProperty('eventIds')
+      expect(dedupCall![1]).toHaveProperty('createdAt')
+
       expect(mockCtx.storage.delete).toHaveBeenCalledWith(BUFFER_KEY)
-      expect(mockCtx.storage.delete).toHaveBeenCalledWith(FLUSHED_KEY)
     })
 
     it('should return null for empty buffer', async () => {
@@ -1053,6 +1145,259 @@ describe('EventWriterDO', () => {
       await vi.runAllTimersAsync()
 
       expect(writer.getBuffer()).toHaveLength(0)
+    })
+  })
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Dedup Marker TTL Cleanup Tests
+  // ──────────────────────────────────────────────────────────────────────────
+
+  describe('dedup marker TTL cleanup', () => {
+    it('should store dedup markers with timestamp after flush', async () => {
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+
+      await writer.ingest([{ type: 'test.event', ts: new Date().toISOString() }])
+      await writer.forceFlush()
+
+      // Check that dedup markers were stored with timestamp prefix
+      const storedKeys = Array.from(mockCtx.storage._storage.keys())
+      const dedupKeys = storedKeys.filter(k => k.startsWith(DEDUP_MARKERS_PREFIX))
+      expect(dedupKeys.length).toBe(1)
+
+      // Verify marker structure
+      const marker = mockCtx.storage._storage.get(dedupKeys[0]) as DedupMarker
+      expect(marker.eventIds).toHaveLength(1)
+      expect(marker.createdAt).toBeLessThanOrEqual(Date.now())
+    })
+
+    it('should track dedup marker count in stats', async () => {
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+
+      await writer.ingest([
+        { type: 'event1', ts: new Date().toISOString() },
+        { type: 'event2', ts: new Date().toISOString() },
+      ])
+      await writer.forceFlush()
+
+      const stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(2)
+    })
+
+    it('should clean up expired dedup markers during alarm', async () => {
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+      // Set very short TTL for testing
+      writer.setConfig({ dedupTtlMs: 1000 }) // 1 second
+
+      await writer.ingest([{ type: 'test.event', ts: new Date().toISOString() }])
+      await writer.forceFlush()
+
+      // Verify marker exists
+      let stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(1)
+
+      // Advance time past TTL
+      vi.advanceTimersByTime(2000)
+
+      // Trigger alarm (which calls cleanup)
+      await writer.alarm()
+
+      // Markers should be cleaned up
+      stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(0)
+    })
+
+    it('should not clean up non-expired dedup markers', async () => {
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+      writer.setConfig({ dedupTtlMs: 60_000 }) // 1 minute
+
+      await writer.ingest([{ type: 'test.event', ts: new Date().toISOString() }])
+      await writer.forceFlush()
+
+      // Verify marker exists
+      let stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(1)
+
+      // Advance time but not past TTL
+      vi.advanceTimersByTime(30_000) // 30 seconds
+
+      // Trigger cleanup
+      await writer.triggerCleanup()
+
+      // Markers should still exist
+      stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(1)
+    })
+
+    it('should handle multiple dedup marker batches with different ages', async () => {
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+      writer.setConfig({ dedupTtlMs: 5000, countThreshold: 1 })
+
+      // First batch at t=0
+      await writer.ingest([{ type: 'event1', ts: new Date().toISOString() }])
+
+      // Advance time
+      vi.advanceTimersByTime(3000)
+
+      // Second batch at t=3000
+      await writer.ingest([{ type: 'event2', ts: new Date().toISOString() }])
+
+      let stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(2)
+
+      // Advance time past TTL for first batch (t=6000)
+      vi.advanceTimersByTime(3000)
+
+      // Trigger cleanup - first batch should be expired, second should remain
+      await writer.triggerCleanup()
+
+      stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(1)
+    })
+
+    it('should migrate legacy FLUSHED_KEY format to new TTL format', async () => {
+      // Pre-populate with legacy format
+      mockCtx.storage._storage.set(FLUSHED_KEY, ['legacy-event-1', 'legacy-event-2'])
+      mockCtx.storage._storage.set(BUFFER_KEY, [
+        { type: 'event', ts: new Date().toISOString(), _eventId: 'legacy-event-1' },
+        { type: 'event2', ts: new Date().toISOString(), _eventId: 'new-event' },
+      ])
+
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+      await vi.runAllTimersAsync()
+
+      // Legacy FLUSHED_KEY should be deleted
+      expect(mockCtx.storage._storage.has(FLUSHED_KEY)).toBe(false)
+
+      // Legacy markers should be migrated to new format
+      const dedupKeys = Array.from(mockCtx.storage._storage.keys()).filter(k => k.startsWith(DEDUP_MARKERS_PREFIX))
+      expect(dedupKeys.length).toBe(1)
+
+      // Buffer should have filtered the duplicate
+      expect(writer.getBuffer().length).toBe(1)
+      expect(writer.getBuffer()[0]._eventId).toBe('new-event')
+    })
+
+    it('should load dedup markers on restore and filter duplicates', async () => {
+      const now = Date.now()
+
+      // Pre-populate with new TTL format marker
+      const marker: DedupMarker = {
+        eventIds: ['existing-event-1', 'existing-event-2'],
+        createdAt: now - 1000, // 1 second ago
+      }
+      mockCtx.storage._storage.set(`${DEDUP_MARKERS_PREFIX}${now - 1000}`, marker)
+
+      // Pre-populate buffer with mix of new and duplicate events
+      mockCtx.storage._storage.set(BUFFER_KEY, [
+        { type: 'event1', ts: new Date().toISOString(), _eventId: 'existing-event-1' },
+        { type: 'event2', ts: new Date().toISOString(), _eventId: 'new-event' },
+      ])
+
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+      await vi.runAllTimersAsync()
+
+      // Buffer should only have the new event
+      expect(writer.getBuffer().length).toBe(1)
+      expect(writer.getBuffer()[0]._eventId).toBe('new-event')
+
+      // Stats should show loaded dedup markers
+      const stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(2)
+    })
+
+    it('should filter out expired markers on load', async () => {
+      const now = Date.now()
+
+      // Pre-populate with expired marker (older than default 24 hours)
+      const expiredMarker: DedupMarker = {
+        eventIds: ['expired-event'],
+        createdAt: now - 25 * 60 * 60 * 1000, // 25 hours ago
+      }
+      mockCtx.storage._storage.set(`${DEDUP_MARKERS_PREFIX}${now - 25 * 60 * 60 * 1000}`, expiredMarker)
+
+      // Pre-populate with fresh marker
+      const freshMarker: DedupMarker = {
+        eventIds: ['fresh-event'],
+        createdAt: now - 1000, // 1 second ago
+      }
+      mockCtx.storage._storage.set(`${DEDUP_MARKERS_PREFIX}${now - 1000}`, freshMarker)
+
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+      await vi.runAllTimersAsync()
+
+      // Only fresh marker should be loaded
+      const stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(1)
+
+      // Expired marker should be deleted from storage
+      const storedKeys = Array.from(mockCtx.storage._storage.keys())
+      const dedupKeys = storedKeys.filter(k => k.startsWith(DEDUP_MARKERS_PREFIX))
+      expect(dedupKeys.length).toBe(1)
+    })
+
+    it('should use configurable TTL', async () => {
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+
+      // Set custom TTL to 500ms
+      writer.setConfig({ dedupTtlMs: 500 })
+
+      await writer.ingest([{ type: 'test.event', ts: new Date().toISOString() }])
+      await writer.forceFlush()
+
+      let stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(1)
+
+      // Advance time just past custom TTL
+      vi.advanceTimersByTime(600)
+
+      // Cleanup should remove the marker
+      await writer.triggerCleanup()
+
+      stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(0)
+    })
+
+    it('should remove event IDs from in-memory set when markers expire', async () => {
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+      writer.setConfig({ dedupTtlMs: 1000 })
+
+      await writer.ingest([{ type: 'test.event', ts: new Date().toISOString() }])
+      await writer.forceFlush()
+
+      // Get the flushed event IDs (stored in stats)
+      let stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(1)
+
+      // Advance time past TTL and cleanup
+      vi.advanceTimersByTime(2000)
+      await writer.triggerCleanup()
+
+      stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(0)
+    })
+
+    it('should default to 24 hour TTL', async () => {
+      const writer = new SimulatedEventWriterDO(mockCtx, mockEnv, mockWriteEvents)
+
+      await writer.ingest([{ type: 'test.event', ts: new Date().toISOString() }])
+      await writer.forceFlush()
+
+      let stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(1)
+
+      // Advance time to just under 24 hours
+      vi.advanceTimersByTime(23 * 60 * 60 * 1000)
+
+      await writer.triggerCleanup()
+      stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(1) // Should still exist
+
+      // Advance past 24 hours
+      vi.advanceTimersByTime(2 * 60 * 60 * 1000) // +2 more hours
+
+      await writer.triggerCleanup()
+      stats = await writer.stats()
+      expect(stats.dedupMarkerCount).toBe(0) // Should be cleaned up
     })
   })
 })

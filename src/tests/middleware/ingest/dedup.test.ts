@@ -2,7 +2,7 @@
  * Ingest Deduplication Middleware Tests
  *
  * Unit tests for src/middleware/ingest/dedup.ts
- * Tests deduplication via R2 markers and namespace isolation
+ * Tests atomic deduplication via R2 conditional put and namespace isolation
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -75,7 +75,7 @@ describe('dedupMiddleware', () => {
       const result = await dedupMiddleware(context)
 
       expect(result.continue).toBe(true)
-      expect(context.env.EVENTS_BUCKET.head).not.toHaveBeenCalled()
+      expect(context.env.EVENTS_BUCKET.put).not.toHaveBeenCalled()
     })
 
     it('continues when batchId is empty string', async () => {
@@ -90,7 +90,7 @@ describe('dedupMiddleware', () => {
   describe('new batch (not duplicated)', () => {
     it('continues when batch has not been seen before', async () => {
       const mockBucket = createMockBucket({
-        head: vi.fn().mockResolvedValue(null), // Not found
+        put: vi.fn().mockResolvedValue({ key: 'created' }), // Successfully created (marker didn't exist)
       })
       const context = createMockContext({
         batchId: 'new-batch-123',
@@ -101,10 +101,13 @@ describe('dedupMiddleware', () => {
 
       expect(result.continue).toBe(true)
       expect(context.deduplicated).toBeFalsy()
+      expect(context.dedupMarkerWritten).toBe(true)
     })
 
-    it('checks correct namespace-isolated dedup key', async () => {
-      const mockBucket = createMockBucket()
+    it('writes to correct namespace-isolated dedup key', async () => {
+      const mockBucket = createMockBucket({
+        put: vi.fn().mockResolvedValue({ key: 'created' }),
+      })
       const context = createMockContext({
         batchId: 'batch-abc',
         tenant: { namespace: 'acme', isAdmin: false, keyId: 'key' },
@@ -113,11 +116,19 @@ describe('dedupMiddleware', () => {
 
       await dedupMiddleware(context)
 
-      expect(mockBucket.head).toHaveBeenCalledWith('ns/acme/dedup/batch-abc')
+      expect(mockBucket.put).toHaveBeenCalledWith(
+        'ns/acme/dedup/batch-abc',
+        expect.any(String),
+        expect.objectContaining({
+          onlyIf: { uploadedBefore: expect.any(Date) },
+        })
+      )
     })
 
     it('uses legacy path for admin with default namespace', async () => {
-      const mockBucket = createMockBucket()
+      const mockBucket = createMockBucket({
+        put: vi.fn().mockResolvedValue({ key: 'created' }),
+      })
       const context = createMockContext({
         batchId: 'batch-xyz',
         tenant: { namespace: 'default', isAdmin: true, keyId: 'key' },
@@ -126,14 +137,35 @@ describe('dedupMiddleware', () => {
 
       await dedupMiddleware(context)
 
-      expect(mockBucket.head).toHaveBeenCalledWith('dedup/batch-xyz')
+      expect(mockBucket.put).toHaveBeenCalledWith(
+        'dedup/batch-xyz',
+        expect.any(String),
+        expect.any(Object)
+      )
     })
   })
 
   describe('duplicate batch', () => {
-    it('returns success response for duplicate batch', async () => {
+    it('returns success response for duplicate batch (put returns null)', async () => {
       const mockBucket = createMockBucket({
-        head: vi.fn().mockResolvedValue({ key: 'exists' }), // Found
+        put: vi.fn().mockResolvedValue(null), // null means marker already exists
+      })
+      const context = createMockContext({
+        batchId: 'duplicate-batch',
+        batch: { events: [{ type: 'e', ts: '2024-01-01T00:00:00Z' }] },
+        tenant: { namespace: 'acme', isAdmin: false, keyId: 'key' },
+        env: { EVENTS_BUCKET: mockBucket } as any,
+      })
+
+      const result = await dedupMiddleware(context)
+
+      expect(result.continue).toBe(false)
+      expect(result.response?.status).toBe(200)
+    })
+
+    it('returns success response for duplicate batch (412 error)', async () => {
+      const mockBucket = createMockBucket({
+        put: vi.fn().mockRejectedValue(new Error('412 Precondition Failed')),
       })
       const context = createMockContext({
         batchId: 'duplicate-batch',
@@ -150,7 +182,7 @@ describe('dedupMiddleware', () => {
 
     it('includes deduplicated flag in response', async () => {
       const mockBucket = createMockBucket({
-        head: vi.fn().mockResolvedValue({ key: 'exists' }),
+        put: vi.fn().mockResolvedValue(null), // null means marker already exists
       })
       const context = createMockContext({
         batchId: 'dup-batch',
@@ -170,7 +202,7 @@ describe('dedupMiddleware', () => {
 
     it('sets deduplicated flag on context', async () => {
       const mockBucket = createMockBucket({
-        head: vi.fn().mockResolvedValue({ key: 'exists' }),
+        put: vi.fn().mockResolvedValue(null), // null means marker already exists
       })
       const context = createMockContext({
         batchId: 'dup-batch',
@@ -184,7 +216,7 @@ describe('dedupMiddleware', () => {
 
     it('includes CORS headers in response', async () => {
       const mockBucket = createMockBucket({
-        head: vi.fn().mockResolvedValue({ key: 'exists' }),
+        put: vi.fn().mockResolvedValue(null), // null means marker already exists
       })
       const context = createMockContext({
         batchId: 'dup-batch',
@@ -201,7 +233,9 @@ describe('dedupMiddleware', () => {
     it('allows batchId with path-like characters since R2 handles path safety', async () => {
       // R2 bucket keys can contain path-like characters safely
       // The middleware doesn't validate path traversal since R2 doesn't use filesystem paths
-      const mockBucket = createMockBucket()
+      const mockBucket = createMockBucket({
+        put: vi.fn().mockResolvedValue({ key: 'created' }),
+      })
       const context = createMockContext({
         batchId: '../../../etc/passwd',
         env: { EVENTS_BUCKET: mockBucket } as any,
@@ -211,6 +245,18 @@ describe('dedupMiddleware', () => {
 
       // Should continue since R2 treats this as a regular key string
       expect(result.continue).toBe(true)
+    })
+
+    it('rethrows non-412 errors', async () => {
+      const mockBucket = createMockBucket({
+        put: vi.fn().mockRejectedValue(new Error('Network error')),
+      })
+      const context = createMockContext({
+        batchId: 'batch-123',
+        env: { EVENTS_BUCKET: mockBucket } as any,
+      })
+
+      await expect(dedupMiddleware(context)).rejects.toThrow('Network error')
     })
   })
 })
@@ -247,7 +293,28 @@ describe('writeDedupMarker', () => {
   })
 
   describe('with batchId', () => {
-    it('writes dedup marker to R2', async () => {
+    it('does nothing when dedupMarkerWritten is true (already written atomically)', async () => {
+      const mockBucket = createMockBucket()
+      const context = createMockContext({
+        batchId: 'batch-123',
+        dedupMarkerWritten: true,
+        tenant: { namespace: 'acme', isAdmin: false, keyId: 'key' },
+        batch: {
+          events: [
+            { type: 'e1', ts: '2024-01-01T00:00:00Z' },
+            { type: 'e2', ts: '2024-01-01T00:00:01Z' },
+          ],
+        },
+        env: { EVENTS_BUCKET: mockBucket } as any,
+      })
+
+      await writeDedupMarker(context)
+
+      // Should not write since marker was already written atomically
+      expect(mockBucket.put).not.toHaveBeenCalled()
+    })
+
+    it('does nothing even without dedupMarkerWritten flag (safety net only)', async () => {
       const mockBucket = createMockBucket()
       const context = createMockContext({
         batchId: 'batch-123',
@@ -263,77 +330,8 @@ describe('writeDedupMarker', () => {
 
       await writeDedupMarker(context)
 
-      expect(mockBucket.put).toHaveBeenCalledTimes(1)
-      expect(mockBucket.put).toHaveBeenCalledWith(
-        'ns/acme/dedup/batch-123',
-        expect.any(String),
-        expect.objectContaining({
-          httpMetadata: { contentType: 'application/json' },
-        })
-      )
-    })
-
-    it('includes correct metadata in marker', async () => {
-      const mockBucket = createMockBucket()
-      const context = createMockContext({
-        batchId: 'batch-xyz',
-        tenant: { namespace: 'team', isAdmin: false, keyId: 'key' },
-        batch: { events: [{ type: 'e', ts: '2024-01-01T00:00:00Z' }] },
-        env: { EVENTS_BUCKET: mockBucket } as any,
-      })
-
-      await writeDedupMarker(context)
-
-      const putCall = mockBucket.put.mock.calls[0]
-      const body = JSON.parse(putCall[1])
-
-      expect(body.batchId).toBe('batch-xyz')
-      expect(body.namespace).toBe('team')
-      expect(body.eventCount).toBe(1)
-      expect(body.ingestedAt).toBeDefined()
-    })
-
-    it('includes custom metadata on R2 object', async () => {
-      const mockBucket = createMockBucket()
-      const context = createMockContext({
-        batchId: 'batch-abc',
-        tenant: { namespace: 'ns', isAdmin: false, keyId: 'key' },
-        batch: {
-          events: [
-            { type: 'e1', ts: '2024-01-01T00:00:00Z' },
-            { type: 'e2', ts: '2024-01-01T00:00:01Z' },
-            { type: 'e3', ts: '2024-01-01T00:00:02Z' },
-          ],
-        },
-        env: { EVENTS_BUCKET: mockBucket } as any,
-      })
-
-      await writeDedupMarker(context)
-
-      const putCall = mockBucket.put.mock.calls[0]
-      const options = putCall[2]
-
-      expect(options.customMetadata.batchId).toBe('batch-abc')
-      expect(options.customMetadata.namespace).toBe('ns')
-      expect(options.customMetadata.eventCount).toBe('3')
-    })
-
-    it('uses legacy path for admin with default namespace', async () => {
-      const mockBucket = createMockBucket()
-      const context = createMockContext({
-        batchId: 'batch-admin',
-        tenant: { namespace: 'default', isAdmin: true, keyId: 'key' },
-        batch: { events: [{ type: 'e', ts: '2024-01-01T00:00:00Z' }] },
-        env: { EVENTS_BUCKET: mockBucket } as any,
-      })
-
-      await writeDedupMarker(context)
-
-      expect(mockBucket.put).toHaveBeenCalledWith(
-        'dedup/batch-admin',
-        expect.any(String),
-        expect.any(Object)
-      )
+      // With atomic dedup, writeDedupMarker is now a no-op safety net
+      expect(mockBucket.put).not.toHaveBeenCalled()
     })
   })
 })
@@ -343,8 +341,10 @@ describe('writeDedupMarker', () => {
 // ============================================================================
 
 describe('dedup integration', () => {
-  it('dedup check and marker write use same key', async () => {
-    const mockBucket = createMockBucket()
+  it('atomic dedup writes marker on first call', async () => {
+    const mockBucket = createMockBucket({
+      put: vi.fn().mockResolvedValue({ key: 'created' }),
+    })
     const context = createMockContext({
       batchId: 'consistent-batch',
       tenant: { namespace: 'myteam', isAdmin: false, keyId: 'key' },
@@ -352,21 +352,25 @@ describe('dedup integration', () => {
       env: { EVENTS_BUCKET: mockBucket } as any,
     })
 
-    // First, check dedup (batch not found)
+    // dedupMiddleware atomically writes the marker
     await dedupMiddleware(context)
-    const checkKey = mockBucket.head.mock.calls[0][0]
+    const putKey = mockBucket.put.mock.calls[0][0]
 
-    // Then, write marker
+    expect(putKey).toBe('ns/myteam/dedup/consistent-batch')
+    expect(context.dedupMarkerWritten).toBe(true)
+
+    // writeDedupMarker is now a no-op since marker was already written
     await writeDedupMarker(context)
-    const writeKey = mockBucket.put.mock.calls[0][0]
-
-    expect(checkKey).toBe(writeKey)
-    expect(checkKey).toBe('ns/myteam/dedup/consistent-batch')
+    expect(mockBucket.put).toHaveBeenCalledTimes(1) // Still only 1 call
   })
 
   it('different namespaces have different dedup keys', async () => {
-    const mockBucket1 = createMockBucket()
-    const mockBucket2 = createMockBucket()
+    const mockBucket1 = createMockBucket({
+      put: vi.fn().mockResolvedValue({ key: 'created' }),
+    })
+    const mockBucket2 = createMockBucket({
+      put: vi.fn().mockResolvedValue({ key: 'created' }),
+    })
 
     const context1 = createMockContext({
       batchId: 'same-batch',
@@ -383,8 +387,8 @@ describe('dedup integration', () => {
     await dedupMiddleware(context1)
     await dedupMiddleware(context2)
 
-    const key1 = mockBucket1.head.mock.calls[0][0]
-    const key2 = mockBucket2.head.mock.calls[0][0]
+    const key1 = mockBucket1.put.mock.calls[0][0]
+    const key2 = mockBucket2.put.mock.calls[0][0]
 
     expect(key1).toBe('ns/team-a/dedup/same-batch')
     expect(key2).toBe('ns/team-b/dedup/same-batch')
