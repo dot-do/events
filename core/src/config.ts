@@ -27,6 +27,9 @@ export const DEFAULT_MAX_CONSECUTIVE_FAILURES = 10
 /** Default circuit breaker reset time (ms) - 5 minutes */
 export const DEFAULT_CIRCUIT_BREAKER_RESET_MS = 300000
 
+/** Maximum circuit breaker reset time (ms) - 1 hour */
+export const MAX_CIRCUIT_BREAKER_RESET_MS = 3600000
+
 /** Default fetch timeout (ms) for event delivery - 30 seconds */
 export const DEFAULT_FETCH_TIMEOUT_MS = 30000
 
@@ -138,6 +141,7 @@ export const coreConfig = {
     defaultMaxRetryQueueSize: DEFAULT_MAX_RETRY_QUEUE_SIZE,
     defaultMaxConsecutiveFailures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
     defaultCircuitBreakerResetMs: DEFAULT_CIRCUIT_BREAKER_RESET_MS,
+    maxCircuitBreakerResetMs: MAX_CIRCUIT_BREAKER_RESET_MS,
     defaultFetchTimeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
   },
   retry: {
