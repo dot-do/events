@@ -30,6 +30,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "pnpm build"
   },
@@ -63,6 +64,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250121.0",
     "@types/picomatch": "^4.0.2",
+    "@vitest/coverage-v8": "^2.1.8",
     "tsup": "^8.0.0",
     "typescript": "^5.7.3",
     "vitest": "^2.1.8"

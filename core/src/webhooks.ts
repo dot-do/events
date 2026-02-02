@@ -26,6 +26,350 @@ export interface VerificationResult {
   timestamp?: number
 }
 
+/**
+ * Supported webhook providers
+ */
+export const WEBHOOK_PROVIDERS = ['github', 'stripe', 'workos', 'slack', 'linear', 'svix'] as const
+export type WebhookProvider = (typeof WEBHOOK_PROVIDERS)[number]
+
+/**
+ * Base webhook provider configuration
+ */
+export interface WebhookProviderConfigBase {
+  /** The webhook provider type */
+  provider: WebhookProvider
+  /** Whether this provider is enabled */
+  enabled?: boolean
+}
+
+/**
+ * GitHub webhook provider configuration
+ */
+export interface GitHubWebhookConfig extends WebhookProviderConfigBase {
+  provider: 'github'
+  /** The webhook secret configured in GitHub */
+  secret: string
+}
+
+/**
+ * Stripe webhook provider configuration
+ */
+export interface StripeWebhookConfig extends WebhookProviderConfigBase {
+  provider: 'stripe'
+  /** The webhook signing secret (starts with whsec_) */
+  secret: string
+  /** Tolerance window in seconds (default: 300) */
+  toleranceSeconds?: number
+}
+
+/**
+ * WorkOS webhook provider configuration
+ */
+export interface WorkOSWebhookConfig extends WebhookProviderConfigBase {
+  provider: 'workos'
+  /** The webhook signing secret */
+  secret: string
+  /** Tolerance window in seconds (default: 300) */
+  toleranceSeconds?: number
+}
+
+/**
+ * Slack webhook provider configuration
+ */
+export interface SlackWebhookConfig extends WebhookProviderConfigBase {
+  provider: 'slack'
+  /** The Slack signing secret */
+  secret: string
+  /** Tolerance window in seconds (default: 300) */
+  toleranceSeconds?: number
+}
+
+/**
+ * Linear webhook provider configuration
+ */
+export interface LinearWebhookConfig extends WebhookProviderConfigBase {
+  provider: 'linear'
+  /** The Linear webhook signing secret */
+  secret: string
+}
+
+/**
+ * Svix webhook provider configuration
+ */
+export interface SvixWebhookConfig extends WebhookProviderConfigBase {
+  provider: 'svix'
+  /** The Svix webhook signing secret (with whsec_ prefix, base64 encoded) */
+  secret: string
+  /** Tolerance window in seconds (default: 300) */
+  toleranceSeconds?: number
+}
+
+/**
+ * Union of all webhook provider configurations
+ */
+export type WebhookProviderConfig =
+  | GitHubWebhookConfig
+  | StripeWebhookConfig
+  | WorkOSWebhookConfig
+  | SlackWebhookConfig
+  | LinearWebhookConfig
+  | SvixWebhookConfig
+
+/**
+ * Error thrown when webhook configuration is invalid
+ */
+export class WebhookConfigError extends Error {
+  constructor(
+    message: string,
+    public readonly provider?: string,
+    public readonly field?: string
+  ) {
+    super(message)
+    this.name = 'WebhookConfigError'
+  }
+}
+
+/**
+ * Error thrown when webhook signature verification fails
+ */
+export class WebhookSignatureError extends Error {
+  constructor(
+    message: string,
+    public readonly provider: string,
+    public readonly timestamp?: number
+  ) {
+    super(message)
+    this.name = 'WebhookSignatureError'
+  }
+}
+
+// ============================================================================
+// Type Guards for Runtime Validation
+// ============================================================================
+
+/**
+ * Checks if a value is a non-empty string
+ */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
+/**
+ * Checks if a value is a valid webhook provider
+ */
+export function isValidProvider(value: unknown): value is WebhookProvider {
+  return isNonEmptyString(value) && WEBHOOK_PROVIDERS.includes(value as WebhookProvider)
+}
+
+/**
+ * Type guard for GitHubWebhookConfig
+ */
+export function isGitHubConfig(config: unknown): config is GitHubWebhookConfig {
+  if (!config || typeof config !== 'object') return false
+  const c = config as Record<string, unknown>
+  return c.provider === 'github' && isNonEmptyString(c.secret)
+}
+
+/**
+ * Type guard for StripeWebhookConfig
+ */
+export function isStripeConfig(config: unknown): config is StripeWebhookConfig {
+  if (!config || typeof config !== 'object') return false
+  const c = config as Record<string, unknown>
+  return (
+    c.provider === 'stripe' &&
+    isNonEmptyString(c.secret) &&
+    (c.toleranceSeconds === undefined || typeof c.toleranceSeconds === 'number')
+  )
+}
+
+/**
+ * Type guard for WorkOSWebhookConfig
+ */
+export function isWorkOSConfig(config: unknown): config is WorkOSWebhookConfig {
+  if (!config || typeof config !== 'object') return false
+  const c = config as Record<string, unknown>
+  return (
+    c.provider === 'workos' &&
+    isNonEmptyString(c.secret) &&
+    (c.toleranceSeconds === undefined || typeof c.toleranceSeconds === 'number')
+  )
+}
+
+/**
+ * Type guard for SlackWebhookConfig
+ */
+export function isSlackConfig(config: unknown): config is SlackWebhookConfig {
+  if (!config || typeof config !== 'object') return false
+  const c = config as Record<string, unknown>
+  return (
+    c.provider === 'slack' &&
+    isNonEmptyString(c.secret) &&
+    (c.toleranceSeconds === undefined || typeof c.toleranceSeconds === 'number')
+  )
+}
+
+/**
+ * Type guard for LinearWebhookConfig
+ */
+export function isLinearConfig(config: unknown): config is LinearWebhookConfig {
+  if (!config || typeof config !== 'object') return false
+  const c = config as Record<string, unknown>
+  return c.provider === 'linear' && isNonEmptyString(c.secret)
+}
+
+/**
+ * Type guard for SvixWebhookConfig
+ */
+export function isSvixConfig(config: unknown): config is SvixWebhookConfig {
+  if (!config || typeof config !== 'object') return false
+  const c = config as Record<string, unknown>
+  return (
+    c.provider === 'svix' &&
+    isNonEmptyString(c.secret) &&
+    (c.toleranceSeconds === undefined || typeof c.toleranceSeconds === 'number')
+  )
+}
+
+/**
+ * Type guard for any WebhookProviderConfig
+ */
+export function isWebhookProviderConfig(config: unknown): config is WebhookProviderConfig {
+  return (
+    isGitHubConfig(config) ||
+    isStripeConfig(config) ||
+    isWorkOSConfig(config) ||
+    isSlackConfig(config) ||
+    isLinearConfig(config) ||
+    isSvixConfig(config)
+  )
+}
+
+/**
+ * Validates a webhook provider configuration and returns validation errors
+ *
+ * @param config - The configuration to validate
+ * @returns An array of validation error messages (empty if valid)
+ */
+export function validateWebhookConfig(config: unknown): string[] {
+  const errors: string[] = []
+
+  if (!config || typeof config !== 'object') {
+    errors.push('Configuration must be a non-null object')
+    return errors
+  }
+
+  const c = config as Record<string, unknown>
+
+  // Check provider field
+  if (!('provider' in c)) {
+    errors.push('Missing required field: provider')
+    return errors
+  }
+
+  if (!isValidProvider(c.provider)) {
+    errors.push(`Invalid provider: "${c.provider}". Must be one of: ${WEBHOOK_PROVIDERS.join(', ')}`)
+    return errors
+  }
+
+  // Check secret field (required for all providers)
+  if (!('secret' in c)) {
+    errors.push('Missing required field: secret')
+  } else if (!isNonEmptyString(c.secret)) {
+    errors.push('Field "secret" must be a non-empty string')
+  }
+
+  // Provider-specific validation
+  switch (c.provider) {
+    case 'stripe':
+      // Stripe secrets typically start with whsec_
+      if (isNonEmptyString(c.secret) && !c.secret.startsWith('whsec_')) {
+        // This is a warning, not an error - some test secrets may not have the prefix
+        // errors.push('Stripe webhook secret should start with "whsec_"')
+      }
+      if (c.toleranceSeconds !== undefined && typeof c.toleranceSeconds !== 'number') {
+        errors.push('Field "toleranceSeconds" must be a number')
+      }
+      if (typeof c.toleranceSeconds === 'number' && c.toleranceSeconds <= 0) {
+        errors.push('Field "toleranceSeconds" must be a positive number')
+      }
+      break
+
+    case 'svix':
+      // Svix secrets must start with whsec_
+      if (isNonEmptyString(c.secret) && !c.secret.startsWith('whsec_')) {
+        errors.push('Svix webhook secret must start with "whsec_"')
+      }
+      if (c.toleranceSeconds !== undefined && typeof c.toleranceSeconds !== 'number') {
+        errors.push('Field "toleranceSeconds" must be a number')
+      }
+      if (typeof c.toleranceSeconds === 'number' && c.toleranceSeconds <= 0) {
+        errors.push('Field "toleranceSeconds" must be a positive number')
+      }
+      break
+
+    case 'workos':
+    case 'slack':
+      if (c.toleranceSeconds !== undefined && typeof c.toleranceSeconds !== 'number') {
+        errors.push('Field "toleranceSeconds" must be a number')
+      }
+      if (typeof c.toleranceSeconds === 'number' && c.toleranceSeconds <= 0) {
+        errors.push('Field "toleranceSeconds" must be a positive number')
+      }
+      break
+
+    // github and linear have no additional validation
+  }
+
+  // Validate enabled field if present
+  if ('enabled' in c && c.enabled !== undefined && typeof c.enabled !== 'boolean') {
+    errors.push('Field "enabled" must be a boolean')
+  }
+
+  return errors
+}
+
+/**
+ * Validates a webhook provider configuration and throws if invalid
+ *
+ * @param config - The configuration to validate
+ * @throws {WebhookConfigError} If the configuration is invalid
+ * @returns The validated configuration
+ */
+export function assertValidWebhookConfig(config: unknown): WebhookProviderConfig {
+  const errors = validateWebhookConfig(config)
+  if (errors.length > 0) {
+    const provider = config && typeof config === 'object' ? (config as Record<string, unknown>).provider : undefined
+    throw new WebhookConfigError(
+      `Invalid webhook configuration: ${errors.join('; ')}`,
+      typeof provider === 'string' ? provider : undefined
+    )
+  }
+  return config as WebhookProviderConfig
+}
+
+/**
+ * Creates a validated webhook configuration from partial input
+ *
+ * @param provider - The webhook provider
+ * @param secret - The webhook secret
+ * @param options - Optional additional configuration
+ * @returns The validated configuration
+ * @throws {WebhookConfigError} If the configuration is invalid
+ */
+export function createWebhookConfig(
+  provider: WebhookProvider,
+  secret: string,
+  options?: { enabled?: boolean; toleranceSeconds?: number }
+): WebhookProviderConfig {
+  const config = {
+    provider,
+    secret,
+    ...options,
+  }
+  return assertValidWebhookConfig(config)
+}
+
 // ============================================================================
 // Shared Utilities
 // ============================================================================

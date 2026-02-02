@@ -17,6 +17,7 @@
 
 import { parquetReadObjects, parquetMetadata } from 'hyparquet'
 import { createAsyncBuffer } from './async-buffer.js'
+import { validateNamespaceOrCollection, buildSafeR2Path } from './r2-path.js'
 
 // ============================================================================
 // Types
@@ -145,30 +146,42 @@ function getSnapshotType(filename: string): 'daily' | 'monthly' | null {
 
 /**
  * Gets the prefix path for snapshots
+ * @throws InvalidR2PathError if ns or collection contain invalid characters
  */
 function getSnapshotsPrefix(ns: string, collection: string): string {
-  return `${ns}/${collection}/snapshots/`
+  const safeNs = validateNamespaceOrCollection(ns, 'namespace')
+  const safeCollection = validateNamespaceOrCollection(collection, 'collection')
+  return buildSafeR2Path(safeNs, safeCollection, 'snapshots') + '/'
 }
 
 /**
  * Gets the path for the snapshot manifest
+ * @throws InvalidR2PathError if ns or collection contain invalid characters
  */
 function getManifestPath(ns: string, collection: string): string {
-  return `${ns}/${collection}/snapshots/manifest.json`
+  const safeNs = validateNamespaceOrCollection(ns, 'namespace')
+  const safeCollection = validateNamespaceOrCollection(collection, 'collection')
+  return buildSafeR2Path(safeNs, safeCollection, 'snapshots', 'manifest.json')
 }
 
 /**
  * Gets the path for data.parquet
+ * @throws InvalidR2PathError if ns or collection contain invalid characters
  */
 function getDataPath(ns: string, collection: string): string {
-  return `${ns}/${collection}/data.parquet`
+  const safeNs = validateNamespaceOrCollection(ns, 'namespace')
+  const safeCollection = validateNamespaceOrCollection(collection, 'collection')
+  return buildSafeR2Path(safeNs, safeCollection, 'data.parquet')
 }
 
 /**
  * Gets the prefix path for deltas
+ * @throws InvalidR2PathError if ns or collection contain invalid characters
  */
 function getDeltasPrefix(ns: string, collection: string): string {
-  return `${ns}/${collection}/deltas/`
+  const safeNs = validateNamespaceOrCollection(ns, 'namespace')
+  const safeCollection = validateNamespaceOrCollection(collection, 'collection')
+  return buildSafeR2Path(safeNs, safeCollection, 'deltas') + '/'
 }
 
 /**

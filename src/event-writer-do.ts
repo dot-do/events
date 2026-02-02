@@ -15,6 +15,7 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import { writeEvents, ulid, type EventRecord, type WriteResult } from './event-writer'
+import { recordWriterDOMetric, recordR2WriteMetric, MetricTimer } from './metrics'
 
 /**
  * Internal event with unique ID for deduplication
@@ -28,7 +29,7 @@ const FLUSHED_KEY = '_eventWriter:flushed'
 
 import type { Env as FullEnv } from './env'
 
-export type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER'>
+export type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'ANALYTICS'>
 
 // ============================================================================
 // Configuration
@@ -117,6 +118,12 @@ export class EventWriterDO extends DurableObject<Env> {
         if (unflushedEvents.length > 0) {
           this.buffer = unflushedEvents
           console.log(`[EventWriterDO:${this.shardId}] Restored ${unflushedEvents.length} events from storage`)
+
+          // Record restore metric
+          recordWriterDOMetric(this.env.ANALYTICS, 'restore', 'success', {
+            events: unflushedEvents.length,
+            shard: this.shardId,
+          })
         }
 
         // Clean up: if we filtered events, update persisted buffer and clear flushed markers
@@ -158,9 +165,15 @@ export class EventWriterDO extends DurableObject<Env> {
    * Returns tryNextShard if this shard is overloaded
    */
   async ingest(events: EventRecord[], source?: string): Promise<IngestResult> {
+    const timer = new MetricTimer()
+
     // Backpressure check
     if (this.pendingWrites >= this.config.maxPendingWrites) {
       console.log(`[EventWriterDO:${this.shardId}] Backpressure triggered: ${this.pendingWrites} pending writes`)
+      recordWriterDOMetric(this.env.ANALYTICS, 'backpressure', 'backpressure', {
+        events: events.length,
+        shard: this.shardId,
+      }, timer.elapsed())
       return {
         ok: false,
         buffered: this.buffer.length,
@@ -171,7 +184,18 @@ export class EventWriterDO extends DurableObject<Env> {
 
     this.pendingWrites++
     try {
-      return await this.doIngest(events, source)
+      const result = await this.doIngest(events, source)
+      recordWriterDOMetric(this.env.ANALYTICS, 'ingest', 'success', {
+        events: events.length,
+        shard: this.shardId,
+      }, timer.elapsed())
+      return result
+    } catch (err) {
+      recordWriterDOMetric(this.env.ANALYTICS, 'ingest', 'error', {
+        events: events.length,
+        shard: this.shardId,
+      }, timer.elapsed())
+      throw err
     } finally {
       this.pendingWrites--
     }
@@ -268,6 +292,7 @@ export class EventWriterDO extends DurableObject<Env> {
       return null
     }
 
+    const timer = new MetricTimer()
     const events = this.buffer
     this.buffer = []
     this.lastFlushTime = Date.now()
@@ -291,12 +316,25 @@ export class EventWriterDO extends DurableObject<Env> {
     console.log(`[EventWriterDO:${this.shardId}] Flushing ${events.length} events across ${eventsBySource.size} source(s)`)
 
     const results: WriteResult[] = []
+    let totalBytes = 0
     try {
       // Write each source group to its own prefix
       for (const [source, sourceEvents] of eventsBySource) {
+        const writeTimer = new MetricTimer()
         const result = await writeEvents(this.env.EVENTS_BUCKET, source, sourceEvents)
         console.log(`[EventWriterDO:${this.shardId}] Flushed: ${result.key}`)
         results.push(result)
+        totalBytes += result.bytes
+
+        // Record R2 write metric for each source
+        recordR2WriteMetric(
+          this.env.ANALYTICS,
+          'success',
+          sourceEvents.length,
+          result.bytes,
+          writeTimer.elapsed(),
+          source
+        )
       }
 
       // ATOMIC FLUSH PATTERN:
@@ -311,12 +349,29 @@ export class EventWriterDO extends DurableObject<Env> {
       // Step 3: Clear flushed markers (safe to fail - will be cleaned on next restore)
       await this.ctx.storage.delete(FLUSHED_KEY)
 
+      // Record successful flush metric
+      recordWriterDOMetric(this.env.ANALYTICS, 'flush', 'success', {
+        events: events.length,
+        bytes: totalBytes,
+        shard: this.shardId,
+      }, timer.elapsed())
+
       // Return the first result (or combine stats if needed)
       return results[0] ?? null
     } catch (error) {
       // On error, put events back in buffer (storage still has them persisted)
       console.error(`[EventWriterDO:${this.shardId}] Flush failed:`, error)
       this.buffer.unshift(...events)
+
+      // Record failed flush metric
+      recordWriterDOMetric(this.env.ANALYTICS, 'flush', 'error', {
+        events: events.length,
+        shard: this.shardId,
+      }, timer.elapsed())
+
+      // Record R2 write failure
+      recordR2WriteMetric(this.env.ANALYTICS, 'error', events.length, 0, timer.elapsed())
+
       throw error
     }
   }

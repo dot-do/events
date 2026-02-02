@@ -1,9 +1,13 @@
 /**
  * Query builder route handler - POST /query
+ *
+ * Supports multi-tenant isolation via namespace parameter.
+ * When a namespace is provided, queries are automatically scoped to that namespace's data.
  */
 
 import type { Env } from '../env'
 import { authCorsHeaders } from '../utils'
+import type { TenantContext } from '../middleware/tenant'
 
 // ============================================================================
 // Query Builder
@@ -17,6 +21,8 @@ interface QueryRequest {
   collection?: string
   colo?: string
   limit?: number
+  /** Namespace to query (for multi-tenant isolation) */
+  namespace?: string
 }
 
 const MAX_QUERY_LIMIT = 10000
@@ -72,6 +78,7 @@ function validateQueryRequest(query: unknown): query is QueryRequest {
   if (q.doClass !== undefined && (typeof q.doClass !== 'string' || q.doClass.length > MAX_STRING_PARAM_LENGTH)) return false
   if (q.collection !== undefined && (typeof q.collection !== 'string' || q.collection.length > MAX_STRING_PARAM_LENGTH)) return false
   if (q.colo !== undefined && (typeof q.colo !== 'string' || q.colo.length > MAX_STRING_PARAM_LENGTH)) return false
+  if (q.namespace !== undefined && (typeof q.namespace !== 'string' || q.namespace.length > MAX_STRING_PARAM_LENGTH)) return false
 
   // Validate eventTypes if present
   if (q.eventTypes !== undefined) {
@@ -90,7 +97,14 @@ function validateQueryRequest(query: unknown): query is QueryRequest {
   return true
 }
 
-export async function handleQuery(request: Request, env: Env): Promise<Response> {
+/**
+ * Handle query requests with optional tenant context for namespace isolation
+ *
+ * @param request - The HTTP request
+ * @param env - Environment bindings
+ * @param tenant - Optional tenant context (if provided, queries are scoped to this tenant's namespace)
+ */
+export async function handleQuery(request: Request, env: Env, tenant?: TenantContext): Promise<Response> {
   let queryBody: unknown
   try {
     queryBody = await request.json()
@@ -107,8 +121,29 @@ export async function handleQuery(request: Request, env: Env): Promise<Response>
 
   const query = queryBody as QueryRequest
 
+  // Determine namespace for query isolation
+  // Priority: 1) Request body namespace, 2) Tenant context namespace, 3) No isolation (admin only)
+  let namespace: string | undefined
+  if (query.namespace) {
+    // Explicit namespace in request - validate access
+    if (tenant && !tenant.isAdmin && tenant.namespace !== query.namespace) {
+      return Response.json(
+        { error: 'Access denied: cannot query namespace you do not have access to' },
+        { status: 403, headers: authCorsHeaders(request, env) }
+      )
+    }
+    namespace = query.namespace
+  } else if (tenant && !tenant.isAdmin) {
+    // Non-admin tenant must be scoped to their namespace
+    namespace = tenant.namespace
+  }
+  // Admin without explicit namespace can query all data
+
   const conditions: string[] = []
-  let pathPattern = 'events/'
+
+  // Build namespace-isolated path pattern
+  // Events are stored under: ns/<namespace>/events/... for tenant isolation
+  let pathPattern = namespace ? `ns/${escapeSql(namespace)}/events/` : 'events/'
 
   // Optimize path based on date range
   // Path structure: events/YYYY/MM/DD/HH/uuid.parquet (4 directory levels after events/)
@@ -165,6 +200,12 @@ export async function handleQuery(request: Request, env: Env): Promise<Response>
     conditions.push(`ts <= '${escapeSql(query.dateRange.end)}'`)
   }
 
+  // Add namespace isolation condition to payload._namespace field
+  // This is a defense-in-depth measure - path isolation is the primary mechanism
+  if (namespace) {
+    conditions.push(`payload._namespace = '${escapeSql(namespace)}'`)
+  }
+
   // Validate pathPattern to prevent SQL injection
   // Even though pathPattern is built from Date methods, validate as defense-in-depth
   if (!validatePathPattern(pathPattern)) {
@@ -198,5 +239,9 @@ FROM read_json_auto('${jsonlPattern}',
     sql += `\nLIMIT ${query.limit}`
   }
 
-  return Response.json({ sql }, { headers: authCorsHeaders(request, env) })
+  return Response.json({
+    sql,
+    namespace: namespace || null,
+    isolated: !!namespace,
+  }, { headers: authCorsHeaders(request, env) })
 }

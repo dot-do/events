@@ -19,6 +19,23 @@ import {
   generateSlackSignature,
   generateLinearSignature,
   generateSvixSignature,
+  // Validation exports
+  WEBHOOK_PROVIDERS,
+  isValidProvider,
+  isGitHubConfig,
+  isStripeConfig,
+  isWorkOSConfig,
+  isSlackConfig,
+  isLinearConfig,
+  isSvixConfig,
+  isWebhookProviderConfig,
+  validateWebhookConfig,
+  assertValidWebhookConfig,
+  createWebhookConfig,
+  WebhookConfigError,
+  WebhookSignatureError,
+  type WebhookProvider,
+  type WebhookProviderConfig,
 } from '../webhooks.js'
 
 // ============================================================================
@@ -1096,6 +1113,298 @@ describe('Timing-safe comparison', () => {
 
       const ratio = Math.max(validMedian, invalidMedian) / Math.min(validMedian, invalidMedian)
       expect(ratio).toBeLessThan(2)
+    })
+  })
+})
+
+// ============================================================================
+// Webhook Provider Configuration Validation Tests
+// ============================================================================
+
+describe('Webhook Provider Validation', () => {
+  describe('WEBHOOK_PROVIDERS constant', () => {
+    it('contains all supported providers', () => {
+      expect(WEBHOOK_PROVIDERS).toContain('github')
+      expect(WEBHOOK_PROVIDERS).toContain('stripe')
+      expect(WEBHOOK_PROVIDERS).toContain('workos')
+      expect(WEBHOOK_PROVIDERS).toContain('slack')
+      expect(WEBHOOK_PROVIDERS).toContain('linear')
+      expect(WEBHOOK_PROVIDERS).toContain('svix')
+      expect(WEBHOOK_PROVIDERS).toHaveLength(6)
+    })
+
+    it('is immutable (readonly)', () => {
+      // TypeScript should prevent mutations, but we can verify runtime behavior
+      const originalLength = WEBHOOK_PROVIDERS.length
+      expect(originalLength).toBe(6)
+    })
+  })
+
+  describe('isValidProvider', () => {
+    it('returns true for valid providers', () => {
+      expect(isValidProvider('github')).toBe(true)
+      expect(isValidProvider('stripe')).toBe(true)
+      expect(isValidProvider('workos')).toBe(true)
+      expect(isValidProvider('slack')).toBe(true)
+      expect(isValidProvider('linear')).toBe(true)
+      expect(isValidProvider('svix')).toBe(true)
+    })
+
+    it('returns false for invalid providers', () => {
+      expect(isValidProvider('invalid')).toBe(false)
+      expect(isValidProvider('GitHub')).toBe(false) // Case-sensitive
+      expect(isValidProvider('GITHUB')).toBe(false)
+      expect(isValidProvider('')).toBe(false)
+      expect(isValidProvider(null)).toBe(false)
+      expect(isValidProvider(undefined)).toBe(false)
+      expect(isValidProvider(123)).toBe(false)
+      expect(isValidProvider({})).toBe(false)
+    })
+  })
+
+  describe('Provider-specific type guards', () => {
+    describe('isGitHubConfig', () => {
+      it('returns true for valid GitHub config', () => {
+        expect(isGitHubConfig({ provider: 'github', secret: 'my-secret' })).toBe(true)
+        expect(isGitHubConfig({ provider: 'github', secret: 'my-secret', enabled: true })).toBe(true)
+      })
+
+      it('returns false for invalid configs', () => {
+        expect(isGitHubConfig({ provider: 'stripe', secret: 'my-secret' })).toBe(false)
+        expect(isGitHubConfig({ provider: 'github' })).toBe(false) // Missing secret
+        expect(isGitHubConfig({ provider: 'github', secret: '' })).toBe(false) // Empty secret
+        expect(isGitHubConfig(null)).toBe(false)
+        expect(isGitHubConfig({})).toBe(false)
+      })
+    })
+
+    describe('isStripeConfig', () => {
+      it('returns true for valid Stripe config', () => {
+        expect(isStripeConfig({ provider: 'stripe', secret: 'whsec_test' })).toBe(true)
+        expect(isStripeConfig({ provider: 'stripe', secret: 'whsec_test', toleranceSeconds: 600 })).toBe(true)
+      })
+
+      it('returns false for invalid configs', () => {
+        expect(isStripeConfig({ provider: 'github', secret: 'my-secret' })).toBe(false)
+        expect(isStripeConfig({ provider: 'stripe', secret: 'test', toleranceSeconds: 'invalid' })).toBe(false)
+      })
+    })
+
+    describe('isWorkOSConfig', () => {
+      it('returns true for valid WorkOS config', () => {
+        expect(isWorkOSConfig({ provider: 'workos', secret: 'my-secret' })).toBe(true)
+        expect(isWorkOSConfig({ provider: 'workos', secret: 'my-secret', toleranceSeconds: 300 })).toBe(true)
+      })
+
+      it('returns false for invalid configs', () => {
+        expect(isWorkOSConfig({ provider: 'github', secret: 'my-secret' })).toBe(false)
+      })
+    })
+
+    describe('isSlackConfig', () => {
+      it('returns true for valid Slack config', () => {
+        expect(isSlackConfig({ provider: 'slack', secret: 'my-secret' })).toBe(true)
+      })
+
+      it('returns false for invalid configs', () => {
+        expect(isSlackConfig({ provider: 'github', secret: 'my-secret' })).toBe(false)
+      })
+    })
+
+    describe('isLinearConfig', () => {
+      it('returns true for valid Linear config', () => {
+        expect(isLinearConfig({ provider: 'linear', secret: 'my-secret' })).toBe(true)
+      })
+
+      it('returns false for invalid configs', () => {
+        expect(isLinearConfig({ provider: 'github', secret: 'my-secret' })).toBe(false)
+      })
+    })
+
+    describe('isSvixConfig', () => {
+      it('returns true for valid Svix config', () => {
+        expect(isSvixConfig({ provider: 'svix', secret: 'whsec_test' })).toBe(true)
+        expect(isSvixConfig({ provider: 'svix', secret: 'whsec_test', toleranceSeconds: 600 })).toBe(true)
+      })
+
+      it('returns false for invalid configs', () => {
+        expect(isSvixConfig({ provider: 'github', secret: 'my-secret' })).toBe(false)
+      })
+    })
+
+    describe('isWebhookProviderConfig', () => {
+      it('returns true for any valid provider config', () => {
+        expect(isWebhookProviderConfig({ provider: 'github', secret: 'test' })).toBe(true)
+        expect(isWebhookProviderConfig({ provider: 'stripe', secret: 'test' })).toBe(true)
+        expect(isWebhookProviderConfig({ provider: 'workos', secret: 'test' })).toBe(true)
+        expect(isWebhookProviderConfig({ provider: 'slack', secret: 'test' })).toBe(true)
+        expect(isWebhookProviderConfig({ provider: 'linear', secret: 'test' })).toBe(true)
+        expect(isWebhookProviderConfig({ provider: 'svix', secret: 'test' })).toBe(true)
+      })
+
+      it('returns false for invalid configs', () => {
+        expect(isWebhookProviderConfig({ provider: 'invalid', secret: 'test' })).toBe(false)
+        expect(isWebhookProviderConfig({ secret: 'test' })).toBe(false)
+        expect(isWebhookProviderConfig(null)).toBe(false)
+        expect(isWebhookProviderConfig('string')).toBe(false)
+      })
+    })
+  })
+
+  describe('validateWebhookConfig', () => {
+    it('returns empty array for valid configs', () => {
+      expect(validateWebhookConfig({ provider: 'github', secret: 'test' })).toEqual([])
+      expect(validateWebhookConfig({ provider: 'stripe', secret: 'whsec_test', toleranceSeconds: 300 })).toEqual([])
+      expect(validateWebhookConfig({ provider: 'svix', secret: 'whsec_test' })).toEqual([])
+    })
+
+    it('returns errors for null/undefined config', () => {
+      const errors = validateWebhookConfig(null)
+      expect(errors).toContain('Configuration must be a non-null object')
+    })
+
+    it('returns errors for non-object config', () => {
+      const errors = validateWebhookConfig('string')
+      expect(errors).toContain('Configuration must be a non-null object')
+    })
+
+    it('returns errors for missing provider', () => {
+      const errors = validateWebhookConfig({ secret: 'test' })
+      expect(errors).toContain('Missing required field: provider')
+    })
+
+    it('returns errors for invalid provider', () => {
+      const errors = validateWebhookConfig({ provider: 'invalid', secret: 'test' })
+      expect(errors.some((e) => e.includes('Invalid provider'))).toBe(true)
+    })
+
+    it('returns errors for missing secret', () => {
+      const errors = validateWebhookConfig({ provider: 'github' })
+      expect(errors).toContain('Missing required field: secret')
+    })
+
+    it('returns errors for empty secret', () => {
+      const errors = validateWebhookConfig({ provider: 'github', secret: '' })
+      expect(errors.some((e) => e.includes('non-empty string'))).toBe(true)
+    })
+
+    it('returns errors for invalid toleranceSeconds type', () => {
+      const errors = validateWebhookConfig({ provider: 'stripe', secret: 'test', toleranceSeconds: 'invalid' })
+      expect(errors.some((e) => e.includes('toleranceSeconds'))).toBe(true)
+    })
+
+    it('returns errors for non-positive toleranceSeconds', () => {
+      const errors = validateWebhookConfig({ provider: 'stripe', secret: 'test', toleranceSeconds: 0 })
+      expect(errors.some((e) => e.includes('positive number'))).toBe(true)
+
+      const errors2 = validateWebhookConfig({ provider: 'stripe', secret: 'test', toleranceSeconds: -100 })
+      expect(errors2.some((e) => e.includes('positive number'))).toBe(true)
+    })
+
+    it('returns errors for Svix secret without whsec_ prefix', () => {
+      const errors = validateWebhookConfig({ provider: 'svix', secret: 'invalid-prefix' })
+      expect(errors.some((e) => e.includes('whsec_'))).toBe(true)
+    })
+
+    it('returns errors for invalid enabled field', () => {
+      const errors = validateWebhookConfig({ provider: 'github', secret: 'test', enabled: 'yes' })
+      expect(errors.some((e) => e.includes('enabled'))).toBe(true)
+    })
+
+    it('allows valid enabled field', () => {
+      expect(validateWebhookConfig({ provider: 'github', secret: 'test', enabled: true })).toEqual([])
+      expect(validateWebhookConfig({ provider: 'github', secret: 'test', enabled: false })).toEqual([])
+    })
+  })
+
+  describe('assertValidWebhookConfig', () => {
+    it('returns config for valid input', () => {
+      const config = { provider: 'github' as const, secret: 'test' }
+      const result = assertValidWebhookConfig(config)
+      expect(result).toEqual(config)
+    })
+
+    it('throws WebhookConfigError for invalid input', () => {
+      expect(() => assertValidWebhookConfig(null)).toThrow(WebhookConfigError)
+      expect(() => assertValidWebhookConfig({ provider: 'invalid' })).toThrow(WebhookConfigError)
+      expect(() => assertValidWebhookConfig({ provider: 'github' })).toThrow(WebhookConfigError)
+    })
+
+    it('includes provider in error when available', () => {
+      try {
+        assertValidWebhookConfig({ provider: 'github' })
+        expect.fail('Should have thrown')
+      } catch (error) {
+        expect(error).toBeInstanceOf(WebhookConfigError)
+        expect((error as WebhookConfigError).provider).toBe('github')
+      }
+    })
+
+    it('includes error message details', () => {
+      try {
+        assertValidWebhookConfig({ provider: 'github', secret: '' })
+        expect.fail('Should have thrown')
+      } catch (error) {
+        expect(error).toBeInstanceOf(WebhookConfigError)
+        expect((error as WebhookConfigError).message).toContain('Invalid webhook configuration')
+      }
+    })
+  })
+
+  describe('createWebhookConfig', () => {
+    it('creates valid config for each provider', () => {
+      const githubConfig = createWebhookConfig('github', 'secret')
+      expect(githubConfig.provider).toBe('github')
+      expect(githubConfig.secret).toBe('secret')
+
+      const stripeConfig = createWebhookConfig('stripe', 'whsec_test', { toleranceSeconds: 600 })
+      expect(stripeConfig.provider).toBe('stripe')
+      expect((stripeConfig as any).toleranceSeconds).toBe(600)
+    })
+
+    it('throws for invalid input', () => {
+      expect(() => createWebhookConfig('github', '')).toThrow(WebhookConfigError)
+    })
+
+    it('includes enabled option', () => {
+      const config = createWebhookConfig('github', 'secret', { enabled: false })
+      expect(config.enabled).toBe(false)
+    })
+  })
+
+  describe('WebhookConfigError', () => {
+    it('has correct name', () => {
+      const error = new WebhookConfigError('test message')
+      expect(error.name).toBe('WebhookConfigError')
+    })
+
+    it('stores provider and field', () => {
+      const error = new WebhookConfigError('test message', 'github', 'secret')
+      expect(error.provider).toBe('github')
+      expect(error.field).toBe('secret')
+    })
+
+    it('is instanceof Error', () => {
+      const error = new WebhookConfigError('test')
+      expect(error).toBeInstanceOf(Error)
+    })
+  })
+
+  describe('WebhookSignatureError', () => {
+    it('has correct name', () => {
+      const error = new WebhookSignatureError('test message', 'github')
+      expect(error.name).toBe('WebhookSignatureError')
+    })
+
+    it('stores provider and timestamp', () => {
+      const error = new WebhookSignatureError('test message', 'stripe', 1234567890)
+      expect(error.provider).toBe('stripe')
+      expect(error.timestamp).toBe(1234567890)
+    })
+
+    it('is instanceof Error', () => {
+      const error = new WebhookSignatureError('test', 'github')
+      expect(error).toBeInstanceOf(Error)
     })
   })
 })

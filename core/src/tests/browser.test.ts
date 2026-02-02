@@ -768,4 +768,393 @@ describe('Browser SDK', () => {
       })
     })
   })
+
+  describe('retry logic', () => {
+    it('should retry failed requests with exponential backoff', async () => {
+      // Fail twice, then succeed
+      mockFetch
+        .mockRejectedValueOnce(new Error('Network error'))
+        .mockRejectedValueOnce(new Error('Network error'))
+        .mockResolvedValueOnce(new Response('OK', { status: 200 }))
+
+      const { EventsSDK } = await import('../browser.js')
+      const onSuccess = vi.fn()
+      const sdk = new EventsSDK({
+        maxRetries: 3,
+        retryDelay: 100,
+        onSuccess
+      })
+
+      sdk.track('retry_event')
+      await sdk.flush()
+
+      // First attempt failed, event should be queued for retry
+      expect(sdk.pendingRetryCount).toBe(1)
+
+      // Advance past first retry delay (100ms * 2^0 = 100ms)
+      await vi.advanceTimersByTimeAsync(100)
+
+      // Second attempt failed, still queued
+      expect(sdk.pendingRetryCount).toBe(1)
+
+      // Advance past second retry delay (100ms * 2^1 = 200ms)
+      await vi.advanceTimersByTimeAsync(200)
+
+      // Third attempt should succeed
+      expect(onSuccess).toHaveBeenCalledWith(expect.arrayContaining([
+        expect.objectContaining({ event: 'retry_event' })
+      ]))
+      expect(sdk.pendingRetryCount).toBe(0)
+    })
+
+    it('should call onError after max retries exceeded', async () => {
+      mockFetch.mockRejectedValue(new Error('Network error'))
+
+      const { EventsSDK } = await import('../browser.js')
+      const onError = vi.fn()
+      const sdk = new EventsSDK({
+        maxRetries: 2,
+        retryDelay: 100,
+        onError
+      })
+
+      sdk.track('failing_event')
+      await sdk.flush()
+
+      // First attempt failed
+      expect(sdk.pendingRetryCount).toBe(1)
+
+      // Advance past first retry (100ms)
+      await vi.advanceTimersByTimeAsync(100)
+      expect(sdk.pendingRetryCount).toBe(1)
+
+      // Advance past second retry (200ms)
+      await vi.advanceTimersByTimeAsync(200)
+
+      // Max retries exceeded, onError should be called
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('Failed to send events after 2 attempts')
+        }),
+        expect.arrayContaining([
+          expect.objectContaining({ event: 'failing_event' })
+        ])
+      )
+      expect(sdk.pendingRetryCount).toBe(0)
+    })
+
+    it('should retry on HTTP error status codes', async () => {
+      mockFetch
+        .mockResolvedValueOnce(new Response('Server Error', { status: 500, statusText: 'Internal Server Error' }))
+        .mockResolvedValueOnce(new Response('OK', { status: 200 }))
+
+      const { EventsSDK } = await import('../browser.js')
+      const onSuccess = vi.fn()
+      const sdk = new EventsSDK({
+        maxRetries: 3,
+        retryDelay: 100,
+        onSuccess
+      })
+
+      sdk.track('http_error_event')
+      await sdk.flush()
+
+      expect(sdk.pendingRetryCount).toBe(1)
+
+      await vi.advanceTimersByTimeAsync(100)
+
+      expect(onSuccess).toHaveBeenCalled()
+      expect(sdk.pendingRetryCount).toBe(0)
+    })
+
+    it('should call onSuccess callback when events are sent successfully', async () => {
+      const { EventsSDK } = await import('../browser.js')
+      const onSuccess = vi.fn()
+      const sdk = new EventsSDK({ onSuccess })
+
+      sdk.track('success_event', { foo: 'bar' })
+      await sdk.flush()
+
+      expect(onSuccess).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'track',
+            event: 'success_event',
+            properties: { foo: 'bar' }
+          })
+        ])
+      )
+    })
+
+    it('should respect maxRetryQueueSize limit', async () => {
+      mockFetch.mockRejectedValue(new Error('Network error'))
+
+      const { EventsSDK } = await import('../browser.js')
+      const onError = vi.fn()
+      const sdk = new EventsSDK({
+        maxRetries: 10,
+        retryDelay: 1000,
+        maxRetryQueueSize: 5,
+        onError,
+        batchSize: 100 // High batch size so we can queue many events
+      })
+
+      // Queue 10 events first
+      for (let i = 0; i < 10; i++) {
+        sdk.track(`event_${i}`)
+      }
+      await sdk.flush()
+
+      // Only 5 events should be in retry queue (newest ones kept)
+      expect(sdk.pendingRetryCount).toBe(5)
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('dropping 5 oldest events')
+        }),
+        expect.any(Array)
+      )
+    })
+
+    it('should drop events when retry queue is full', async () => {
+      mockFetch.mockRejectedValue(new Error('Network error'))
+
+      const { EventsSDK } = await import('../browser.js')
+      const onError = vi.fn()
+      const sdk = new EventsSDK({
+        maxRetries: 10,
+        retryDelay: 10000, // Long delay so retries don't process
+        maxRetryQueueSize: 3,
+        onError,
+        batchSize: 100
+      })
+
+      // First batch of 3 events
+      for (let i = 0; i < 3; i++) {
+        sdk.track(`batch1_event_${i}`)
+      }
+      await sdk.flush()
+      expect(sdk.pendingRetryCount).toBe(3)
+
+      // Second batch - queue is full
+      for (let i = 0; i < 2; i++) {
+        sdk.track(`batch2_event_${i}`)
+      }
+      await sdk.flush()
+
+      // Should have called onError for dropped events
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('Retry queue full')
+        }),
+        expect.any(Array)
+      )
+      // Queue should still be at max
+      expect(sdk.pendingRetryCount).toBe(3)
+    })
+
+    it('should expose queuedCount getter', async () => {
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK({ batchSize: 100 })
+
+      expect(sdk.queuedCount).toBe(0)
+
+      sdk.track('event1')
+      sdk.track('event2')
+      expect(sdk.queuedCount).toBe(2)
+
+      await sdk.flush()
+      expect(sdk.queuedCount).toBe(0)
+    })
+
+    it('should expose pendingRetryCount getter', async () => {
+      mockFetch.mockRejectedValue(new Error('Network error'))
+
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK({ maxRetries: 3, retryDelay: 1000 })
+
+      expect(sdk.pendingRetryCount).toBe(0)
+
+      sdk.track('event1')
+      await sdk.flush()
+
+      expect(sdk.pendingRetryCount).toBe(1)
+    })
+  })
+
+  describe('event persistence', () => {
+    it('should persist events to localStorage when sendBeacon fails', async () => {
+      mockNavigator.sendBeacon = vi.fn(() => false) // sendBeacon returns false on failure
+
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK()
+
+      sdk.track('beacon_fail_event')
+      await sdk.flush(1) // Use beacon mode
+
+      expect(mockLocalStorage.setItem).toHaveBeenCalledWith(
+        'events_failed',
+        expect.stringContaining('beacon_fail_event')
+      )
+    })
+
+    it('should recover persisted events on init', async () => {
+      const failedEvents = JSON.stringify([
+        { type: 'track', event: 'recovered_event', ts: '2024-01-01T00:00:00Z', anonymousId: 'a', sessionId: 's', url: '', path: '', referrer: '', ua: '' }
+      ])
+      mockLocalStorage.setItem('events_failed', failedEvents)
+      ;(mockLocalStorage.getItem as ReturnType<typeof vi.fn>).mockImplementation(
+        (key: string) => key === 'events_failed' ? failedEvents : null
+      )
+
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK()
+
+      const recovered = sdk.recoverPersistedEvents()
+      expect(recovered).toHaveLength(1)
+      expect(recovered[0].event).toBe('recovered_event')
+
+      // Verify localStorage was cleared
+      expect(mockLocalStorage.removeItem).toHaveBeenCalledWith('events_failed')
+
+      // Events should be in queue for sending
+      expect(sdk.queuedCount).toBe(1)
+    })
+
+    it('should automatically recover events when using init()', async () => {
+      const failedEvents = JSON.stringify([
+        { type: 'track', event: 'auto_recovered', ts: '2024-01-01T00:00:00Z', anonymousId: 'a', sessionId: 's', url: '', path: '', referrer: '', ua: '' }
+      ])
+      ;(mockLocalStorage.getItem as ReturnType<typeof vi.fn>).mockImplementation(
+        (key: string) => key === 'events_failed' ? failedEvents : null
+      )
+
+      const { init } = await import('../browser.js')
+      const sdk = init()
+
+      // Events should be recovered and in queue
+      expect(sdk.queuedCount).toBe(1)
+    })
+
+    it('should limit persisted events to maxRetryQueueSize', async () => {
+      mockNavigator.sendBeacon = vi.fn(() => false)
+
+      // Pre-populate with existing failed events
+      const existingFailed = JSON.stringify(
+        Array(80).fill(null).map((_, i) => ({
+          type: 'track', event: `existing_${i}`, ts: '2024-01-01T00:00:00Z',
+          anonymousId: 'a', sessionId: 's', url: '', path: '', referrer: '', ua: ''
+        }))
+      )
+
+      // Create a storage mock that tracks what's been set
+      const storedValues = new Map<string, string>()
+      storedValues.set('events_failed', existingFailed)
+      const getItemMock = vi.fn((key: string) => storedValues.get(key) ?? null)
+      const setItemMock = vi.fn((key: string, value: string) => storedValues.set(key, value))
+      vi.stubGlobal('localStorage', {
+        getItem: getItemMock,
+        setItem: setItemMock,
+        removeItem: vi.fn((key: string) => storedValues.delete(key)),
+        clear: vi.fn(),
+        key: vi.fn(),
+        length: 0,
+      })
+      vi.resetModules()
+      vi.stubGlobal('fetch', mockFetch)
+      vi.stubGlobal('sessionStorage', mockSessionStorage)
+      vi.stubGlobal('document', mockDocument)
+      vi.stubGlobal('navigator', mockNavigator)
+      vi.stubGlobal('location', mockLocation)
+      vi.stubGlobal('addEventListener', addEventListenerSpy)
+      vi.stubGlobal('window', {})
+
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK({ maxRetryQueueSize: 100, batchSize: 150 })
+
+      // Add 50 more events
+      for (let i = 0; i < 50; i++) {
+        sdk.track(`new_event_${i}`)
+      }
+      await sdk.flush(1)
+
+      // Should have called setItem with limited events (newest 100)
+      const failedCall = setItemMock.mock.calls.find((call: string[]) => call[0] === 'events_failed')
+      expect(failedCall).toBeDefined()
+      const storedEvents = JSON.parse(failedCall[1])
+      expect(storedEvents.length).toBeLessThanOrEqual(100)
+      // Should have 80 existing + 50 new = 130, but limited to 100 (newest)
+      expect(storedEvents.length).toBe(100)
+    })
+
+    it('should handle localStorage errors gracefully during persist', async () => {
+      mockNavigator.sendBeacon = vi.fn(() => false)
+      ;(mockLocalStorage.setItem as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        throw new Error('QuotaExceeded')
+      })
+
+      const { EventsSDK } = await import('../browser.js')
+      const onError = vi.fn()
+      const sdk = new EventsSDK({ onError })
+
+      sdk.track('persist_fail_event')
+
+      // Should not throw
+      await expect(sdk.flush(1)).resolves.not.toThrow()
+
+      // onError should be called
+      expect(onError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining('Failed to persist events')
+        }),
+        expect.any(Array)
+      )
+    })
+
+    it('should handle invalid JSON in localStorage gracefully', async () => {
+      ;(mockLocalStorage.getItem as ReturnType<typeof vi.fn>).mockImplementation(
+        (key: string) => key === 'events_failed' ? 'not valid json' : null
+      )
+
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK()
+
+      // Should not throw
+      const recovered = sdk.recoverPersistedEvents()
+      expect(recovered).toEqual([])
+    })
+  })
+
+  describe('getInstance()', () => {
+    it('should return null before initialization', async () => {
+      const { getInstance } = await import('../browser.js')
+      expect(getInstance()).toBeNull()
+    })
+
+    it('should return SDK instance after init', async () => {
+      const { init, getInstance } = await import('../browser.js')
+      const sdk = init()
+      expect(getInstance()).toBe(sdk)
+    })
+  })
+
+  describe('destroy with retry cleanup', () => {
+    it('should clear retry timer on destroy', async () => {
+      mockFetch.mockRejectedValue(new Error('Network error'))
+
+      const { EventsSDK } = await import('../browser.js')
+      const sdk = new EventsSDK({ maxRetries: 3, retryDelay: 1000 })
+
+      sdk.track('event1')
+      await sdk.flush()
+
+      // There should be a pending retry
+      expect(sdk.pendingRetryCount).toBe(1)
+
+      // Destroy should clean up
+      sdk.destroy()
+
+      // Advancing time should not cause errors
+      await vi.advanceTimersByTimeAsync(5000)
+    })
+  })
 })

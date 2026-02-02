@@ -15,6 +15,7 @@
 import { readParquetRecords, writeCompactedParquet } from './compaction.js'
 import { readDeltaFile } from './cdc-delta.js'
 import type { DeltaRecord } from './cdc-delta.js'
+import { validateNamespaceOrCollection, buildSafeR2Path } from './r2-path.js'
 
 // ============================================================================
 // Types
@@ -142,12 +143,16 @@ export async function compactCollection(
   collection: string,
   options: CompactionOptions = {}
 ): Promise<CompactionResult> {
+  // Validate namespace and collection to prevent path traversal
+  const safeNs = validateNamespaceOrCollection(ns, 'namespace')
+  const safeCollection = validateNamespaceOrCollection(collection, 'collection')
+
   // Path matches cdc-processor.ts: {ns}/{collection}/deltas/{seq}_{timestamp}.parquet
-  const basePath = `${ns}/${collection}`
-  const deltasPath = `${basePath}/deltas/`
-  const dataPath = `${basePath}/data.parquet`
-  const manifestPath = `${basePath}/manifest.json`
-  const processedPath = `${basePath}/processed/`
+  const basePath = buildSafeR2Path(safeNs, safeCollection)
+  const deltasPath = buildSafeR2Path(safeNs, safeCollection, 'deltas') + '/'
+  const dataPath = buildSafeR2Path(safeNs, safeCollection, 'data.parquet')
+  const manifestPath = buildSafeR2Path(safeNs, safeCollection, 'manifest.json')
+  const processedPath = buildSafeR2Path(safeNs, safeCollection, 'processed') + '/'
 
   const errors: string[] = []
   const processedFiles: string[] = []

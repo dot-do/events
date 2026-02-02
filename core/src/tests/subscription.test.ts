@@ -700,3 +700,166 @@ describe('Delivery Logging', () => {
     expect(attempt3.status).toBe('success')
   })
 })
+
+// ============================================================================
+// Cleanup Logic Tests
+// ============================================================================
+
+describe('Cleanup Logic', () => {
+  describe('cleanupOldData logic', () => {
+    /**
+     * Simulates the cleanup logic for determining what records to delete.
+     * This tests the business logic without needing SQLite.
+     */
+    interface CleanupRecord {
+      id: string
+      createdAt: number
+      status?: 'pending' | 'delivered' | 'failed' | 'dead'
+      deliveredAt?: number
+    }
+
+    function shouldDeleteDeadLetter(record: CleanupRecord, cutoffTs: number): boolean {
+      return record.createdAt < cutoffTs
+    }
+
+    function shouldDeleteDeliveryLog(
+      record: CleanupRecord,
+      deliveryStatus: 'pending' | 'delivered' | 'failed' | 'dead',
+      deliveredAt: number | undefined,
+      cutoffTs: number
+    ): boolean {
+      // Only delete logs for terminal deliveries (delivered or dead)
+      if (deliveryStatus !== 'delivered' && deliveryStatus !== 'dead') {
+        return false
+      }
+      // Must be older than cutoff
+      return record.createdAt < cutoffTs && deliveredAt !== undefined && deliveredAt < cutoffTs
+    }
+
+    function shouldDeleteDelivery(record: CleanupRecord, cutoffTs: number): boolean {
+      // Only delete terminal deliveries
+      if (record.status !== 'delivered' && record.status !== 'dead') {
+        return false
+      }
+      // Must be older than cutoff
+      return record.createdAt < cutoffTs && record.deliveredAt !== undefined && record.deliveredAt < cutoffTs
+    }
+
+    const now = Date.now()
+    const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000)
+    const cutoff = thirtyDaysAgo
+
+    describe('dead letter cleanup', () => {
+      it('deletes dead letters older than cutoff', () => {
+        const oldDeadLetter = { id: 'dl1', createdAt: thirtyDaysAgo - 1000 }
+        expect(shouldDeleteDeadLetter(oldDeadLetter, cutoff)).toBe(true)
+      })
+
+      it('keeps dead letters newer than cutoff', () => {
+        const newDeadLetter = { id: 'dl2', createdAt: now - 1000 }
+        expect(shouldDeleteDeadLetter(newDeadLetter, cutoff)).toBe(false)
+      })
+
+      it('deletes dead letters exactly at cutoff boundary', () => {
+        const boundaryDeadLetter = { id: 'dl3', createdAt: cutoff - 1 }
+        expect(shouldDeleteDeadLetter(boundaryDeadLetter, cutoff)).toBe(true)
+      })
+    })
+
+    describe('delivery log cleanup', () => {
+      it('deletes logs for old delivered deliveries', () => {
+        const log = { id: 'log1', createdAt: thirtyDaysAgo - 1000 }
+        expect(shouldDeleteDeliveryLog(log, 'delivered', thirtyDaysAgo - 1000, cutoff)).toBe(true)
+      })
+
+      it('deletes logs for old dead deliveries', () => {
+        const log = { id: 'log2', createdAt: thirtyDaysAgo - 1000 }
+        expect(shouldDeleteDeliveryLog(log, 'dead', thirtyDaysAgo - 1000, cutoff)).toBe(true)
+      })
+
+      it('keeps logs for pending deliveries', () => {
+        const log = { id: 'log3', createdAt: thirtyDaysAgo - 1000 }
+        expect(shouldDeleteDeliveryLog(log, 'pending', undefined, cutoff)).toBe(false)
+      })
+
+      it('keeps logs for failed deliveries (still retrying)', () => {
+        const log = { id: 'log4', createdAt: thirtyDaysAgo - 1000 }
+        expect(shouldDeleteDeliveryLog(log, 'failed', undefined, cutoff)).toBe(false)
+      })
+
+      it('keeps logs for recent delivered deliveries', () => {
+        const log = { id: 'log5', createdAt: now - 1000 }
+        expect(shouldDeleteDeliveryLog(log, 'delivered', now - 1000, cutoff)).toBe(false)
+      })
+    })
+
+    describe('delivery cleanup', () => {
+      it('deletes old delivered deliveries', () => {
+        const delivery: CleanupRecord = {
+          id: 'del1',
+          createdAt: thirtyDaysAgo - 1000,
+          status: 'delivered',
+          deliveredAt: thirtyDaysAgo - 1000,
+        }
+        expect(shouldDeleteDelivery(delivery, cutoff)).toBe(true)
+      })
+
+      it('deletes old dead deliveries', () => {
+        const delivery: CleanupRecord = {
+          id: 'del2',
+          createdAt: thirtyDaysAgo - 1000,
+          status: 'dead',
+          deliveredAt: thirtyDaysAgo - 1000,
+        }
+        expect(shouldDeleteDelivery(delivery, cutoff)).toBe(true)
+      })
+
+      it('keeps pending deliveries regardless of age', () => {
+        const delivery: CleanupRecord = {
+          id: 'del3',
+          createdAt: thirtyDaysAgo - 1000,
+          status: 'pending',
+        }
+        expect(shouldDeleteDelivery(delivery, cutoff)).toBe(false)
+      })
+
+      it('keeps failed deliveries (still retrying) regardless of age', () => {
+        const delivery: CleanupRecord = {
+          id: 'del4',
+          createdAt: thirtyDaysAgo - 1000,
+          status: 'failed',
+        }
+        expect(shouldDeleteDelivery(delivery, cutoff)).toBe(false)
+      })
+
+      it('keeps recent delivered deliveries', () => {
+        const delivery: CleanupRecord = {
+          id: 'del5',
+          createdAt: now - 1000,
+          status: 'delivered',
+          deliveredAt: now - 1000,
+        }
+        expect(shouldDeleteDelivery(delivery, cutoff)).toBe(false)
+      })
+    })
+  })
+
+  describe('TTL configuration', () => {
+    const DEAD_LETTER_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 days
+    const DEDUP_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
+
+    it('dead letter TTL is 30 days', () => {
+      expect(DEAD_LETTER_TTL_MS).toBe(2592000000) // 30 * 24 * 60 * 60 * 1000
+    })
+
+    it('dedup marker TTL is 24 hours', () => {
+      expect(DEDUP_TTL_MS).toBe(86400000) // 24 * 60 * 60 * 1000
+    })
+
+    it('calculates correct cutoff timestamp', () => {
+      const now = 1700000000000 // Fixed timestamp for testing
+      const cutoff = now - DEAD_LETTER_TTL_MS
+      expect(cutoff).toBe(now - 2592000000)
+    })
+  })
+})

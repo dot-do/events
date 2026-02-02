@@ -2,6 +2,8 @@
  * Snapshot/Backup utilities for Collections
  */
 
+import { sanitizeR2Path, buildSafeR2Path, sanitizePathSegment, InvalidR2PathError } from './r2-path.js'
+
 export interface SnapshotOptions {
   /** R2 bucket for snapshots */
   bucket: R2Bucket
@@ -42,7 +44,11 @@ export async function createSnapshot(
   const prefix = options.prefix ?? 'snapshots'
   const timestamp = new Date().toISOString()
   const safeTimestamp = timestamp.replace(/[:.]/g, '-')
-  const key = `${prefix}/${doId}/${safeTimestamp}.json`
+
+  // Sanitize the doId and prefix to prevent path traversal attacks
+  const safePrefix = sanitizeR2Path(prefix)
+  const safeDoId = sanitizePathSegment(doId)
+  const key = buildSafeR2Path(safePrefix, safeDoId, `${safeTimestamp}.json`)
 
   // Get all collections
   const collectionsResult = sql.exec<{ collection: string }>(
@@ -109,7 +115,9 @@ export async function restoreSnapshot(
   bucket: R2Bucket,
   snapshotKey: string
 ): Promise<{ collections: string[]; totalDocs: number }> {
-  const object = await bucket.get(snapshotKey)
+  // Sanitize the snapshotKey to prevent path traversal attacks
+  const safeSnapshotKey = sanitizeR2Path(snapshotKey)
+  const object = await bucket.get(safeSnapshotKey)
   if (!object) {
     throw new Error(`Snapshot not found: ${snapshotKey}`)
   }
@@ -153,8 +161,11 @@ export async function listSnapshots(
   options?: { prefix?: string; limit?: number }
 ): Promise<R2Objects> {
   const prefix = options?.prefix ?? 'snapshots'
+  // Sanitize inputs to prevent path traversal attacks
+  const safePrefix = sanitizeR2Path(prefix)
+  const safeDoId = sanitizePathSegment(doId)
   return bucket.list({
-    prefix: `${prefix}/${doId}/`,
+    prefix: buildSafeR2Path(safePrefix, safeDoId) + '/',
     limit: options?.limit ?? 100,
   })
 }
@@ -166,5 +177,7 @@ export async function deleteSnapshot(
   bucket: R2Bucket,
   snapshotKey: string
 ): Promise<void> {
-  await bucket.delete(snapshotKey)
+  // Sanitize the snapshotKey to prevent path traversal attacks
+  const safeSnapshotKey = sanitizeR2Path(snapshotKey)
+  await bucket.delete(safeSnapshotKey)
 }

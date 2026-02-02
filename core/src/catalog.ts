@@ -554,21 +554,40 @@ export class CatalogDO extends DurableObject<Env> {
     const files = await this.listFiles(namespace, tableName, options.snapshotId)
     if (files.length === 0) return ''
 
-    const paths = files.map((f) => `'${f.path}'`).join(', ')
+    // Escape file paths to prevent SQL injection
+    // Escape single quotes by doubling them (standard SQL escaping)
+    const escapePath = (path: string): string => {
+      // Validate path only contains safe characters for file paths
+      // Allow: alphanumeric, forward/back slash, dash, underscore, period, colon (for drive letters)
+      const SAFE_PATH_RE = /^[A-Za-z0-9/_\-.:]+$/
+      if (!SAFE_PATH_RE.test(path)) {
+        throw new Error(`Invalid file path: ${path}`)
+      }
+      // Even with validation, escape single quotes as a defense-in-depth measure
+      return path.replace(/'/g, "''")
+    }
+
+    const paths = files.map((f) => `'${escapePath(f.path)}'`).join(', ')
     const format = files[0]!.format
+
+    const columns = options.columns?.join(', ') || '*'
 
     let sql: string
     if (format === 'parquet') {
-      sql = `SELECT ${options.columns?.join(', ') || '*'} FROM read_parquet([${paths}])`
+      sql = `SELECT ${columns} FROM read_parquet([${paths}])`
     } else {
-      sql = `SELECT ${options.columns?.join(', ') || '*'} FROM read_json_auto([${paths}])`
+      sql = `SELECT ${columns} FROM read_json_auto([${paths}])`
     }
 
     if (options.where) {
       sql += ` WHERE ${options.where}`
     }
 
-    if (options.limit) {
+    if (options.limit !== undefined) {
+      // Validate limit is a safe integer
+      if (!Number.isInteger(options.limit) || options.limit < 0) {
+        throw new Error(`Invalid limit: ${options.limit}`)
+      }
       sql += ` LIMIT ${options.limit}`
     }
 

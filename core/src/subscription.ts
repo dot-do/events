@@ -1154,6 +1154,67 @@ export class SubscriptionDO extends DurableObject<Env> {
       Date.now()
     )
   }
+
+  // ---------------------------------------------------------------------------
+  // Cleanup Methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Clean up old data to prevent unbounded growth
+   *
+   * Deletes:
+   * - Dead letters older than cutoffTs
+   * - Delivery logs for completed/dead deliveries older than cutoffTs
+   * - Completed/dead deliveries older than cutoffTs
+   *
+   * @param cutoffTs - Timestamp (milliseconds) - delete records older than this
+   * @returns Counts of deleted records
+   */
+  async cleanupOldData(cutoffTs: number): Promise<{
+    deadLettersDeleted: number
+    deliveryLogsDeleted: number
+    deliveriesDeleted: number
+  }> {
+    // 1. Delete old dead letters
+    const deadLettersResult = this.sql.exec(
+      `DELETE FROM dead_letters WHERE created_at < ?`,
+      cutoffTs
+    )
+    const deadLettersDeleted = deadLettersResult.rowsWritten
+
+    // 2. Delete old delivery logs for completed or dead deliveries
+    // Keep logs for pending/failed deliveries to aid debugging
+    const logsResult = this.sql.exec(
+      `DELETE FROM delivery_log
+       WHERE created_at < ?
+       AND delivery_id IN (
+         SELECT id FROM deliveries
+         WHERE status IN ('delivered', 'dead')
+         AND (delivered_at IS NOT NULL AND delivered_at < ?)
+       )`,
+      cutoffTs,
+      cutoffTs
+    )
+    const deliveryLogsDeleted = logsResult.rowsWritten
+
+    // 3. Delete old completed/dead deliveries
+    // Only delete deliveries that are in terminal states
+    const deliveriesResult = this.sql.exec(
+      `DELETE FROM deliveries
+       WHERE status IN ('delivered', 'dead')
+       AND created_at < ?
+       AND (delivered_at IS NOT NULL AND delivered_at < ?)`,
+      cutoffTs,
+      cutoffTs
+    )
+    const deliveriesDeleted = deliveriesResult.rowsWritten
+
+    return {
+      deadLettersDeleted,
+      deliveryLogsDeleted,
+      deliveriesDeleted,
+    }
+  }
 }
 
 // Export type for wrangler config

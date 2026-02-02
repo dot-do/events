@@ -15,11 +15,15 @@
  *
  * Subscriptions are sharded by top-level event type prefix (e.g., "collection",
  * "webhook", "rpc") to distribute load across multiple SubscriptionDO instances.
+ *
+ * Multi-tenant isolation is supported via namespace-prefixed shard keys.
+ * Each tenant's subscriptions are isolated in their own DO instances.
  */
 
 import type { SubscriptionDO } from '../core/src/subscription'
 import { corsHeaders as baseCorsHeaders } from './utils'
 import type { Env } from './env'
+import type { TenantContext } from './middleware/tenant'
 
 type SubscriptionEnv = Pick<Env, 'SUBSCRIPTIONS'>
 
@@ -120,31 +124,65 @@ export function getSubscriptionShard(pattern: string): string {
 }
 
 /**
- * Get a SubscriptionDO stub for the given shard key.
+ * Get namespace-prefixed shard key for multi-tenant isolation.
+ * Non-admin tenants have their shards prefixed with their namespace.
+ *
+ * @param baseShard - The base shard key (e.g., "collection")
+ * @param tenant - Optional tenant context for namespace isolation
+ * @returns Namespace-prefixed shard key (e.g., "acme:collection") or base shard for admins
  */
-function getSubscriptionStub(env: SubscriptionEnv, shard: string = 'default'): DurableObjectStub<SubscriptionDO> {
-  const id = env.SUBSCRIPTIONS.idFromName(shard)
+function getNamespacedShard(baseShard: string, tenant?: TenantContext): string {
+  if (!tenant || tenant.isAdmin) {
+    return baseShard
+  }
+  return `${tenant.namespace}:${baseShard}`
+}
+
+/**
+ * Get a SubscriptionDO stub for the given shard key.
+ * Supports namespace isolation via tenant context.
+ */
+function getSubscriptionStub(
+  env: SubscriptionEnv,
+  shard: string = 'default',
+  tenant?: TenantContext
+): DurableObjectStub<SubscriptionDO> {
+  const namespacedShard = getNamespacedShard(shard, tenant)
+  const id = env.SUBSCRIPTIONS.idFromName(namespacedShard)
   return env.SUBSCRIPTIONS.get(id)
 }
 
 /**
  * Get stubs for all known shards (used for list-all and cross-shard queries).
+ * When tenant is provided, returns namespace-isolated shards.
  */
-function getAllSubscriptionStubs(env: SubscriptionEnv): { shard: string; stub: DurableObjectStub<SubscriptionDO> }[] {
-  return KNOWN_SUBSCRIPTION_SHARDS.map(shard => ({
-    shard,
-    stub: getSubscriptionStub(env, shard),
-  }))
+function getAllSubscriptionStubs(
+  env: SubscriptionEnv,
+  tenant?: TenantContext
+): { shard: string; stub: DurableObjectStub<SubscriptionDO> }[] {
+  return KNOWN_SUBSCRIPTION_SHARDS.map(baseShard => {
+    const shard = getNamespacedShard(baseShard, tenant)
+    return {
+      shard,
+      stub: getSubscriptionStub(env, baseShard, tenant),
+    }
+  })
 }
 
 /**
  * Handle subscription-related routes
  * Returns null if the route is not handled
+ *
+ * @param request - The HTTP request
+ * @param env - Environment bindings
+ * @param url - Parsed URL
+ * @param tenant - Optional tenant context for namespace isolation
  */
 export async function handleSubscriptionRoutes(
   request: Request,
   env: SubscriptionEnv,
-  url: URL
+  url: URL,
+  tenant?: TenantContext
 ): Promise<Response | null> {
   // Only handle /subscriptions routes
   if (!url.pathname.startsWith('/subscriptions')) {
@@ -213,9 +251,10 @@ export async function handleSubscriptionRoutes(
         )
       }
 
-      // Route to the correct shard based on pattern prefix
-      const shard = getSubscriptionShard(pattern)
-      const stub = getSubscriptionStub(env, shard)
+      // Route to the correct shard based on pattern prefix (with namespace isolation)
+      const baseShard = getSubscriptionShard(pattern)
+      const stub = getSubscriptionStub(env, baseShard, tenant)
+      const namespacedShard = getNamespacedShard(baseShard, tenant)
       const result = await stub.subscribe({
         workerId,
         workerBinding: workerBinding as string | undefined,
@@ -224,7 +263,11 @@ export async function handleSubscriptionRoutes(
         maxRetries: maxRetries as number | undefined,
         timeoutMs: timeoutMs as number | undefined,
       })
-      return Response.json({ ...result, shard }, {
+      return Response.json({
+        ...result,
+        shard: namespacedShard,
+        namespace: tenant?.namespace || null,
+      }, {
         status: result.ok ? 200 : 400,
         headers: corsHeaders(),
       })
@@ -251,14 +294,15 @@ export async function handleSubscriptionRoutes(
       }
 
       // If shard is provided, use it directly; otherwise query all shards
+      // Note: The shard should already be namespace-prefixed if provided by the client
       if (requestedShard && typeof requestedShard === 'string') {
-        const stub = getSubscriptionStub(env, requestedShard)
+        const stub = getSubscriptionStub(env, requestedShard, tenant)
         const result = await stub.unsubscribe(subscriptionId)
         return Response.json(result, { headers: corsHeaders() })
       }
 
-      // Try all shards to find the subscription
-      for (const { stub } of getAllSubscriptionStubs(env)) {
+      // Try all shards to find the subscription (within tenant's namespace)
+      for (const { stub } of getAllSubscriptionStubs(env, tenant)) {
         const sub = await stub.getSubscription(subscriptionId)
         if (sub) {
           const result = await stub.unsubscribe(subscriptionId)
@@ -290,12 +334,12 @@ export async function handleSubscriptionRoutes(
       }
 
       if (requestedShard && typeof requestedShard === 'string') {
-        const stub = getSubscriptionStub(env, requestedShard)
+        const stub = getSubscriptionStub(env, requestedShard, tenant)
         const result = await stub.reactivate(subscriptionId)
         return Response.json(result, { headers: corsHeaders() })
       }
 
-      for (const { stub } of getAllSubscriptionStubs(env)) {
+      for (const { stub } of getAllSubscriptionStubs(env, tenant)) {
         const sub = await stub.getSubscription(subscriptionId)
         if (sub) {
           const result = await stub.reactivate(subscriptionId)
@@ -323,15 +367,19 @@ export async function handleSubscriptionRoutes(
         offset: offset ? parseInt(offset, 10) : undefined,
       }
 
-      // If a specific shard is requested, only query that one
+      // If a specific shard is requested, only query that one (with namespace isolation)
       if (shard) {
-        const stub = getSubscriptionStub(env, shard)
+        const stub = getSubscriptionStub(env, shard, tenant)
         const result = await stub.listSubscriptions(filterOpts)
-        return Response.json({ subscriptions: result, shard }, { headers: corsHeaders() })
+        return Response.json({
+          subscriptions: result,
+          shard: getNamespacedShard(shard, tenant),
+          namespace: tenant?.namespace || null,
+        }, { headers: corsHeaders() })
       }
 
-      // Query all shards in parallel and merge results
-      const allStubs = getAllSubscriptionStubs(env)
+      // Query all shards in parallel and merge results (within tenant's namespace)
+      const allStubs = getAllSubscriptionStubs(env, tenant)
       const results = await Promise.all(
         allStubs.map(async ({ shard: shardName, stub }) => {
           const subs = await stub.listSubscriptions(filterOpts)
@@ -347,7 +395,10 @@ export async function handleSubscriptionRoutes(
       const globalLimit = limit ? parseInt(limit, 10) : allSubscriptions.length
       allSubscriptions = allSubscriptions.slice(globalOffset, globalOffset + globalLimit)
 
-      return Response.json({ subscriptions: allSubscriptions }, { headers: corsHeaders() })
+      return Response.json({
+        subscriptions: allSubscriptions,
+        namespace: tenant?.namespace || null,
+      }, { headers: corsHeaders() })
     }
 
     // GET /subscriptions/match?eventType=xxx - route to correct shard + default
@@ -362,23 +413,27 @@ export async function handleSubscriptionRoutes(
       }
 
       // Route to the shard for this event type, plus the default shard for catch-all patterns
-      const shard = getSubscriptionShard(eventType)
-      const shards = shard === 'default' ? ['default'] : [shard, 'default']
-      const uniqueShards = [...new Set(shards)]
+      // Uses namespace isolation via tenant context
+      const baseShard = getSubscriptionShard(eventType)
+      const baseShards = baseShard === 'default' ? ['default'] : [baseShard, 'default']
+      const uniqueShards = [...new Set(baseShards)]
 
       const results = await Promise.all(
-        uniqueShards.map(s => getSubscriptionStub(env, s).findMatchingSubscriptions(eventType))
+        uniqueShards.map(s => getSubscriptionStub(env, s, tenant).findMatchingSubscriptions(eventType))
       )
 
-      return Response.json({ subscriptions: results.flat() }, { headers: corsHeaders() })
+      return Response.json({
+        subscriptions: results.flat(),
+        namespace: tenant?.namespace || null,
+      }, { headers: corsHeaders() })
     }
 
-    // GET /subscriptions/status/:id - try all shards
+    // GET /subscriptions/status/:id - try all shards (within tenant's namespace)
     const statusMatch = path.match(/^\/status\/([A-Z0-9]+)$/)
     if (statusMatch && request.method === 'GET') {
       const subscriptionId = statusMatch[1]!
 
-      for (const { stub } of getAllSubscriptionStubs(env)) {
+      for (const { stub } of getAllSubscriptionStubs(env, tenant)) {
         const result = await stub.getSubscriptionStatus(subscriptionId)
         if (result.subscription) {
           return Response.json(result, { headers: corsHeaders() })
@@ -391,12 +446,12 @@ export async function handleSubscriptionRoutes(
       )
     }
 
-    // GET /subscriptions/deliveries/:id/logs - try all shards
+    // GET /subscriptions/deliveries/:id/logs - try all shards (within tenant's namespace)
     const logsMatch = path.match(/^\/deliveries\/([A-Z0-9]+)\/logs$/)
     if (logsMatch && request.method === 'GET') {
       const deliveryId = logsMatch[1]!
 
-      for (const { stub } of getAllSubscriptionStubs(env)) {
+      for (const { stub } of getAllSubscriptionStubs(env, tenant)) {
         const result = await stub.getDeliveryLogs(deliveryId)
         if (result.length > 0) {
           return Response.json({ logs: result }, { headers: corsHeaders() })
@@ -406,13 +461,13 @@ export async function handleSubscriptionRoutes(
       return Response.json({ logs: [] }, { headers: corsHeaders() })
     }
 
-    // GET /subscriptions/:id/dead-letters - try all shards
+    // GET /subscriptions/:id/dead-letters - try all shards (within tenant's namespace)
     const deadLettersMatch = path.match(/^\/([A-Z0-9]+)\/dead-letters$/)
     if (deadLettersMatch && request.method === 'GET') {
       const subscriptionId = deadLettersMatch[1]!
       const limit = url.searchParams.get('limit')
 
-      for (const { stub } of getAllSubscriptionStubs(env)) {
+      for (const { stub } of getAllSubscriptionStubs(env, tenant)) {
         const sub = await stub.getSubscription(subscriptionId)
         if (sub) {
           const result = await stub.getDeadLetters(subscriptionId, limit ? parseInt(limit, 10) : undefined)
@@ -423,12 +478,12 @@ export async function handleSubscriptionRoutes(
       return Response.json({ deadLetters: [] }, { headers: corsHeaders() })
     }
 
-    // POST /subscriptions/:id/dead-letters/:deadLetterId/retry - try all shards
+    // POST /subscriptions/:id/dead-letters/:deadLetterId/retry - try all shards (within tenant's namespace)
     const retryMatch = path.match(/^\/([A-Z0-9]+)\/dead-letters\/([A-Z0-9]+)\/retry$/)
     if (retryMatch && request.method === 'POST') {
       const deadLetterId = retryMatch[2]!
 
-      for (const { stub } of getAllSubscriptionStubs(env)) {
+      for (const { stub } of getAllSubscriptionStubs(env, tenant)) {
         const result = await stub.retryDeadLetter(deadLetterId)
         if (result.ok) {
           return Response.json(result, { status: 200, headers: corsHeaders() })
@@ -438,12 +493,12 @@ export async function handleSubscriptionRoutes(
       return Response.json({ ok: false }, { status: 404, headers: corsHeaders() })
     }
 
-    // GET /subscriptions/:id - try all shards
+    // GET /subscriptions/:id - try all shards (within tenant's namespace)
     const getMatch = path.match(/^\/([A-Z0-9]+)$/)
     if (getMatch && request.method === 'GET') {
       const subscriptionId = getMatch[1]!
 
-      for (const { stub } of getAllSubscriptionStubs(env)) {
+      for (const { stub } of getAllSubscriptionStubs(env, tenant)) {
         const result = await stub.getSubscription(subscriptionId)
         if (result) {
           return Response.json({ subscription: result }, { headers: corsHeaders() })
@@ -456,7 +511,7 @@ export async function handleSubscriptionRoutes(
       )
     }
 
-    // PUT /subscriptions/:id - try all shards
+    // PUT /subscriptions/:id - try all shards (within tenant's namespace)
     const updateMatch = path.match(/^\/([A-Z0-9]+)$/)
     if (updateMatch && request.method === 'PUT') {
       const subscriptionId = updateMatch[1]!
@@ -480,7 +535,7 @@ export async function handleSubscriptionRoutes(
         return Response.json({ ok: false, error: 'Invalid field: rpcMethod must be a string' }, { status: 400, headers: corsHeaders() })
       }
 
-      for (const { stub } of getAllSubscriptionStubs(env)) {
+      for (const { stub } of getAllSubscriptionStubs(env, tenant)) {
         const sub = await stub.getSubscription(subscriptionId)
         if (sub) {
           const result = await stub.updateSubscription(subscriptionId, {
@@ -495,12 +550,12 @@ export async function handleSubscriptionRoutes(
       return Response.json({ ok: false, error: 'Subscription not found' }, { status: 404, headers: corsHeaders() })
     }
 
-    // DELETE /subscriptions/:id - try all shards
+    // DELETE /subscriptions/:id - try all shards (within tenant's namespace)
     const deleteMatch = path.match(/^\/([A-Z0-9]+)$/)
     if (deleteMatch && request.method === 'DELETE') {
       const subscriptionId = deleteMatch[1]!
 
-      for (const { stub } of getAllSubscriptionStubs(env)) {
+      for (const { stub } of getAllSubscriptionStubs(env, tenant)) {
         const sub = await stub.getSubscription(subscriptionId)
         if (sub) {
           const result = await stub.deleteSubscription(subscriptionId)

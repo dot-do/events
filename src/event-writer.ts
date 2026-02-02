@@ -12,6 +12,7 @@
 
 import { parquetWriteBuffer } from '@dotdo/hyparquet-writer'
 import { ulid } from '../core/src/ulid'
+import { sanitizeR2Path, buildSafeR2Path, sanitizePathSegment, InvalidR2PathError } from './utils'
 
 export { ulid }
 
@@ -62,6 +63,9 @@ export async function writeEvents(
   if (events.length === 0) {
     throw new Error('No events to write')
   }
+
+  // Sanitize prefix to prevent path traversal attacks
+  const safePrefix = sanitizeR2Path(prefix)
 
   const startCpu = performance.now()
 
@@ -124,7 +128,7 @@ export async function writeEvents(
     String(now.getUTCHours()).padStart(2, '0'),
   ].join('/')
 
-  const key = `${prefix}/${datePath}/${ulid()}.parquet`
+  const key = `${safePrefix}/${datePath}/${ulid()}.parquet`
 
   // Get timestamp range from events
   const timestamps = events.map(e => new Date(e.ts).getTime())

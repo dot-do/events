@@ -130,6 +130,17 @@ export type {
 } from './subscription.js'
 export { SubscriptionDO } from './subscription.js'
 
+// === Schema Registry: Event Validation ===
+
+export type {
+  JsonSchema,
+  SchemaRegistration,
+  ValidationResult,
+  ValidationError,
+  NamespaceConfig,
+} from './schema-registry.js'
+export { SchemaRegistryDO, validateAgainstSchema } from './schema-registry.js'
+
 // Pattern matching for subscriptions
 export {
   matchPattern,
@@ -165,6 +176,16 @@ export { createSnapshot, restoreSnapshot, listSnapshots, deleteSnapshot } from '
 export { ulid } from './ulid.js'
 export { createAsyncBuffer } from './async-buffer.js'
 
+// === R2 Path Sanitization ===
+
+export {
+  InvalidR2PathError,
+  sanitizePathSegment,
+  sanitizeR2Path,
+  buildSafeR2Path,
+  validateNamespaceOrCollection,
+} from './r2-path.js'
+
 // === SQL Row Mapper ===
 
 export type { SqlRow } from './sql-mapper.js'
@@ -179,6 +200,20 @@ export {
   getJson,
   getOptionalJson,
 } from './sql-mapper.js'
+
+// === Dedup Cache ===
+// Optimized deduplication for queue processing using bloom filters and R2 batch operations
+
+export type { DedupCheckResult } from './dedup-cache.js'
+export {
+  BloomFilter,
+  LRUCache,
+  DedupCache,
+  batchCheckDuplicates,
+  batchWriteDedupMarkers,
+  getCdcDedupCache,
+  getSubDedupCache,
+} from './dedup-cache.js'
 
 // === Browser SDK ===
 // Note: For browser usage, import from '@dotdo/events/browser' for the standalone bundle

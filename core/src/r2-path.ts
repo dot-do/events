@@ -1,10 +1,9 @@
 /**
- * Shared utilities for the events.do worker
+ * R2 Path Sanitization Utilities
+ *
+ * Provides functions to prevent path traversal attacks when constructing
+ * R2 object keys from user input or external data.
  */
-
-// ============================================================================
-// R2 Path Sanitization - Prevents Path Traversal Attacks
-// ============================================================================
 
 /**
  * Error thrown when an R2 path contains invalid or dangerous characters
@@ -156,62 +155,43 @@ export function buildSafeR2Path(prefix: string, ...segments: string[]): string {
   return sanitizeR2Path(fullPath)
 }
 
-// ============================================================================
-// CORS Utilities
-// ============================================================================
-
 /**
- * CORS headers for public endpoints (webhooks, health, ingest)
+ * Validates namespace and collection names for R2 path usage.
+ * These are commonly used as path prefixes in CDC and compaction operations.
+ *
+ * Allowed characters: alphanumeric, hyphen, underscore
+ * Must start with alphanumeric character
+ * Length: 1-64 characters
+ *
+ * @param name - The namespace or collection name to validate
+ * @param type - Label for error messages ('namespace' or 'collection')
+ * @returns The validated name
+ * @throws InvalidR2PathError if name is invalid
  */
-export function corsHeaders(): HeadersInit {
-  return {
-    'Access-Control-Allow-Origin': '*',
-  }
-}
-
-/** Default allowed origins pattern for authenticated endpoints (*.do domains) */
-const DEFAULT_ALLOWED_ORIGIN_PATTERN = /^https?:\/\/([a-z0-9-]+\.)*do$/
-
-/**
- * Check if an origin is allowed for authenticated endpoints.
- * Reads ALLOWED_ORIGINS env var (comma-separated) or defaults to *.do domains.
- */
-export function getAllowedOrigin(requestOrigin: string | null, env?: { ALLOWED_ORIGINS?: string }): string | null {
-  if (!requestOrigin) return null
-
-  // Check explicit allowed origins from env
-  if (env?.ALLOWED_ORIGINS) {
-    const allowed = env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-    if (allowed.includes(requestOrigin)) return requestOrigin
-    // Also support wildcard patterns like *.do
-    for (const pattern of allowed) {
-      if (pattern.startsWith('*.')) {
-        const suffix = pattern.slice(1) // e.g. ".do"
-        try {
-          const originHost = new URL(requestOrigin).hostname
-          if (originHost.endsWith(suffix) || originHost === suffix.slice(1)) return requestOrigin
-        } catch {
-          // Invalid origin URL
-        }
-      }
-    }
-    return null
+export function validateNamespaceOrCollection(name: string, type: 'namespace' | 'collection' = 'namespace'): string {
+  if (!name || name.length === 0) {
+    throw new InvalidR2PathError(`${type} cannot be empty`, name)
   }
 
-  // Default: allow *.do domains
-  if (DEFAULT_ALLOWED_ORIGIN_PATTERN.test(requestOrigin)) return requestOrigin
-  return null
-}
-
-/**
- * CORS headers for authenticated endpoints - restrict to known .do origins.
- * Returns the request's Origin if it matches allowed origins, otherwise 'null'.
- */
-export function authCorsHeaders(request: Request, env?: { ALLOWED_ORIGINS?: string }): HeadersInit {
-  const requestOrigin = request.headers.get('Origin')
-  const origin = getAllowedOrigin(requestOrigin, env) ?? 'null'
-  return {
-    'Access-Control-Allow-Origin': origin,
-    'Vary': 'Origin',
+  if (name.length > 64) {
+    throw new InvalidR2PathError(`${type} exceeds maximum length of 64 characters`, name)
   }
+
+  // Must start with alphanumeric
+  if (!/^[a-zA-Z0-9]/.test(name)) {
+    throw new InvalidR2PathError(`${type} must start with an alphanumeric character`, name)
+  }
+
+  // Only allow alphanumeric, hyphen, underscore
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(name)) {
+    throw new InvalidR2PathError(`${type} can only contain alphanumeric characters, hyphens, and underscores`, name)
+  }
+
+  // Reject reserved names
+  const reserved = ['.', '..', 'CON', 'PRN', 'AUX', 'NUL']
+  if (reserved.includes(name.toUpperCase())) {
+    throw new InvalidR2PathError(`${type} cannot be a reserved name`, name)
+  }
+
+  return name
 }
