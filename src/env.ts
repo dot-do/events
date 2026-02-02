@@ -13,6 +13,7 @@ import type { SchemaRegistryDO } from '../core/src/schema-registry'
 import type { EventWriterDO } from './event-writer-do'
 import type { ShardCoordinatorDO } from './shard-coordinator-do'
 import type { SubscriptionShardCoordinatorDO } from './subscription-shard-coordinator-do'
+import type { CDCShardCoordinatorDO } from './cdc-shard-coordinator-do'
 import type { RateLimiterDO } from './middleware/rate-limiter-do'
 import type { WebhookEnv } from './webhook-handler'
 import type { EventBatch } from '@dotdo/events'
@@ -34,6 +35,8 @@ export interface Env extends WebhookEnv {
   SHARD_COORDINATOR?: DurableObjectNamespace<ShardCoordinatorDO>
   /** Shard coordinator for SubscriptionDO dynamic sharding (optional - falls back to static shards if not bound) */
   SUBSCRIPTION_SHARD_COORDINATOR?: DurableObjectNamespace<SubscriptionShardCoordinatorDO>
+  /** Shard coordinator for CDCProcessorDO dynamic sharding (optional - falls back to hash-based routing if not bound) */
+  CDC_SHARD_COORDINATOR?: DurableObjectNamespace<CDCShardCoordinatorDO>
   RATE_LIMITER: DurableObjectNamespace<RateLimiterDO>
   /** Schema registry for event validation (optional - validation disabled if not bound) */
   SCHEMA_REGISTRY?: DurableObjectNamespace<SchemaRegistryDO>
