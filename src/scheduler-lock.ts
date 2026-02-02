@@ -8,6 +8,10 @@
  * - Automatic cleanup of expired locks
  */
 
+import { logger, logError } from './logger'
+
+const log = logger.child({ component: 'SchedulerLock' })
+
 export interface SchedulerLockOptions {
   /** Lock timeout in milliseconds (default: 10 minutes) */
   timeoutMs?: number
@@ -62,7 +66,7 @@ export async function acquireSchedulerLock(
       },
     })
 
-    console.log(`[SCHEDULER-LOCK] Lock acquired by ${hostname} at ${lockInfo.timestamp}, expires at ${new Date(expiresAt).toISOString()}`)
+    log.info('Lock acquired', { hostname, expiresAt: new Date(expiresAt).toISOString() })
     return lockInfo
   } catch (err) {
     // Put failed - lock object exists, check if it's expired
@@ -70,7 +74,7 @@ export async function acquireSchedulerLock(
 
     if (!existing) {
       // Lock was just deleted, retry acquisition
-      console.log('[SCHEDULER-LOCK] Lock disappeared, retrying acquisition...')
+      log.info('Lock disappeared, retrying acquisition')
       return acquireSchedulerLock(bucket, options)
     }
 
@@ -79,24 +83,24 @@ export async function acquireSchedulerLock(
 
       // If lock is still valid, another worker owns it
       if (existingLock.expiresAt > now) {
-        console.log(
-          `[SCHEDULER-LOCK] Lock held by ${existingLock.hostname} (acquired at ${existingLock.timestamp}), ` +
-          `expires in ${Math.round((existingLock.expiresAt - now) / 1000)}s`
-        )
+        log.info('Lock held by another worker', {
+          holder: existingLock.hostname,
+          expiresInSeconds: Math.round((existingLock.expiresAt - now) / 1000)
+        })
         return null
       }
 
       // Lock is expired (>10 min old), delete and retry
-      console.log(
-        `[SCHEDULER-LOCK] Found expired lock from ${existingLock.hostname} ` +
-        `(expired ${Math.round((now - existingLock.expiresAt) / 1000)}s ago), deleting and retrying...`
-      )
+      log.info('Found expired lock, deleting and retrying', {
+        holder: existingLock.hostname,
+        expiredSecondsAgo: Math.round((now - existingLock.expiresAt) / 1000)
+      })
 
       await bucket.delete(LOCK_KEY)
       return acquireSchedulerLock(bucket, options)
     } catch (parseErr) {
       // Invalid lock data, delete and retry
-      console.warn('[SCHEDULER-LOCK] Invalid lock data, deleting and retrying...')
+      log.warn('Invalid lock data, deleting and retrying')
       await bucket.delete(LOCK_KEY)
       return acquireSchedulerLock(bucket, options)
     }
@@ -118,24 +122,22 @@ export async function releaseSchedulerLock(
     const existing = await bucket.get(LOCK_KEY)
 
     if (!existing) {
-      console.warn('[SCHEDULER-LOCK] Lock already released')
+      log.warn('Lock already released')
       return true
     }
 
     const existingLock: LockInfo = await existing.json()
 
     if (existingLock.hostname !== lock.hostname || existingLock.acquiredAt !== lock.acquiredAt) {
-      console.warn(
-        `[SCHEDULER-LOCK] Lock owned by different worker: ${existingLock.hostname} (expected ${lock.hostname})`
-      )
+      log.warn('Lock owned by different worker', { holder: existingLock.hostname, expected: lock.hostname })
       return false
     }
 
     await bucket.delete(LOCK_KEY)
-    console.log(`[SCHEDULER-LOCK] Lock released by ${lock.hostname}`)
+    log.info('Lock released', { hostname: lock.hostname })
     return true
   } catch (err) {
-    console.error('[SCHEDULER-LOCK] Failed to release lock:', err)
+    logError(log, 'Failed to release lock', err)
     return false
   }
 }

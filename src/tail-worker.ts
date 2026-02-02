@@ -16,6 +16,9 @@
 import { ingestWithOverflow } from './event-writer-do'
 import type { EventRecord } from './event-writer'
 import type { Env as FullEnv } from './env'
+import { logger, sanitize } from './logger'
+
+const log = logger.child({ component: 'tail' })
 
 type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'TAIL_AUTH_SECRET'>
 
@@ -105,7 +108,7 @@ export default {
   },
 
   async tail(events: TraceItem[], env: Env): Promise<void> {
-    console.log(`[tail] tail() called with ${events.length} events`)
+    log.info('tail() called', { eventCount: events.length })
 
     if (events.length === 0) return
 
@@ -168,9 +171,11 @@ export default {
       let safePayload: unknown
       try {
         // JSON round-trip to strip non-serializable values
-        safePayload = JSON.parse(JSON.stringify(trace))
+        // Then sanitize to remove any sensitive data from logs/traces
+        const serialized = JSON.parse(JSON.stringify(trace))
+        safePayload = sanitize.payload(serialized)
       } catch (e) {
-        console.log(`[tail] Serialization error: ${e}`)
+        log.warn('Serialization error', { error: sanitize.errorMessage(String(e)) })
         safePayload = { event: { type: eventType }, scriptName: trace.scriptName }
       }
 
@@ -195,12 +200,12 @@ export default {
     // Send directly to EventWriterDO - no module-level buffering.
     // The DO handles batching and persistence with alarm-based retries.
     if (records.length > 0) {
-      console.log(`[tail] Sending ${records.length} events to EventWriterDO via RPC`)
+      log.info('Sending events to EventWriterDO', { count: records.length })
       const result = await ingestWithOverflow(env, records, 'tail')
       if (!result.ok) {
-        console.error(`[tail] Failed to ingest, shard ${result.shard}`)
+        log.error('Failed to ingest', { shard: result.shard })
       } else {
-        console.log(`[tail] Ingested to shard ${result.shard}, buffered: ${result.buffered}`)
+        log.info('Ingested successfully', { shard: result.shard, buffered: result.buffered })
       }
     }
   },

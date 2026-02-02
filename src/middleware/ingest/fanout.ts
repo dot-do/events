@@ -15,6 +15,8 @@ import { getNamespacedShardKey } from '../tenant'
 import type { TenantContext } from '../tenant'
 import type { Env } from '../../env'
 import type { IngestContext } from './types'
+import { logger, logError } from '../../logger'
+import { getSubscriptionRoutingShard } from '../../subscription-shard-coordinator-do'
 
 // ============================================================================
 // Fanout Mode Determination
@@ -44,7 +46,7 @@ export async function sendToQueue(
   }
 
   await env.EVENTS_QUEUE.send(batch)
-  console.log(`[ingest] Sent ${batch.events.length} events to queue for CDC/subscription fanout`)
+  logger.info('Sent events to queue for CDC/subscription fanout', { component: 'ingest', eventCount: batch.events.length })
 }
 
 // ============================================================================
@@ -87,10 +89,10 @@ export async function processCDCEvents(
       const processor = env.CDC_PROCESSOR.get(processorId)
       await processor.process(groupEvents)
       recordCDCMetric(env.ANALYTICS, 'success', groupEvents.length, key)
-      console.log(`[ingest] DIRECT CDC processed ${groupEvents.length} events for ${key}`)
+      logger.info('DIRECT CDC processed events', { component: 'fanout', eventCount: groupEvents.length, cdcKey: key })
     } catch (err) {
       recordCDCMetric(env.ANALYTICS, 'error', groupEvents.length, key)
-      console.error(`[ingest] CDC processor error for ${key}:`, err)
+      logError(logger, 'CDC processor error', err, { component: 'fanout', cdcKey: key, eventCount: groupEvents.length })
     }
   })
 
@@ -102,7 +104,8 @@ export async function processCDCEvents(
 // ============================================================================
 
 /**
- * Fan out events to subscription matching and delivery
+ * Fan out events to subscription matching and delivery.
+ * Uses dynamic sharding when SUBSCRIPTION_SHARD_COORDINATOR is available.
  */
 export async function processSubscriptionFanout(
   events: DurableEvent[],
@@ -113,33 +116,39 @@ export async function processSubscriptionFanout(
     return
   }
 
-  // Group events by shard key (first segment before '.', or 'default')
-  const eventsByShard = new Map<string, DurableEvent[]>()
+  const namespace = tenant.isAdmin ? undefined : tenant.namespace
+
+  // Group events by base prefix (first segment before '.', or 'default')
+  const eventsByPrefix = new Map<string, DurableEvent[]>()
 
   for (const event of events) {
     const dotIndex = event.type.indexOf('.')
-    const baseShardKey = dotIndex > 0 ? event.type.slice(0, dotIndex) : 'default'
-    // Namespace-isolated subscription shard key
-    const shardKey = getNamespacedShardKey(tenant, baseShardKey)
-    const existing = eventsByShard.get(shardKey) ?? []
+    const basePrefix = dotIndex > 0 ? event.type.slice(0, dotIndex) : 'default'
+    const existing = eventsByPrefix.get(basePrefix) ?? []
     existing.push(event)
-    eventsByShard.set(shardKey, existing)
+    eventsByPrefix.set(basePrefix, existing)
   }
 
-  // Fan out each group to its corresponding shard
-  const shardPromises = Array.from(eventsByShard.entries()).map(
-    async ([shardKey, shardEvents]) => {
+  // Fan out each group using dynamic shard routing
+  const prefixPromises = Array.from(eventsByPrefix.entries()).map(
+    async ([basePrefix, prefixEvents]) => {
       let successCount = 0
       let errorCount = 0
 
       try {
-        const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
-        const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
-
-        const fanoutPromises = shardEvents.map(async (event) => {
-          // Use existing event id for idempotency if available
+        // Process events with dynamic shard routing
+        // Each event may be routed to a different sub-shard based on load
+        const fanoutPromises = prefixEvents.map(async (event) => {
           const eventId = (event as { id?: string }).id || ulid()
+
           try {
+            // Get the routing shard (uses coordinator if available, or falls back to legacy)
+            // Use event ID for consistent hashing so retries go to the same shard
+            const shardKey = await getSubscriptionRoutingShard(env, basePrefix, namespace, eventId)
+
+            const subId = env.SUBSCRIPTIONS.idFromName(shardKey)
+            const subscriptionDO = env.SUBSCRIPTIONS.get(subId)
+
             await subscriptionDO.fanout({
               id: eventId,
               type: event.type,
@@ -149,29 +158,41 @@ export async function processSubscriptionFanout(
             successCount++
           } catch (err) {
             errorCount++
-            console.error(
-              `[ingest] Subscription fanout error for event ${eventId} type ${event.type}:`,
-              err
-            )
+            logError(logger, 'Subscription fanout error', err, {
+              component: 'fanout',
+              eventId,
+              eventType: event.type,
+              basePrefix,
+            })
           }
         })
 
         await Promise.all(fanoutPromises)
-        recordSubscriptionMetric(env.ANALYTICS, 'success', successCount, shardKey)
+        recordSubscriptionMetric(env.ANALYTICS, 'success', successCount, basePrefix)
         if (errorCount > 0) {
-          recordSubscriptionMetric(env.ANALYTICS, 'error', errorCount, shardKey, 'fanout_error')
+          recordSubscriptionMetric(env.ANALYTICS, 'error', errorCount, basePrefix, 'fanout_error')
         }
-        console.log(
-          `[ingest] DIRECT subscription fanout: ${shardEvents.length} events to shard ${shardKey}`
-        )
+        logger.info('DIRECT subscription fanout completed', {
+          component: 'fanout',
+          eventCount: prefixEvents.length,
+          basePrefix,
+          namespace: tenant.namespace,
+          successCount,
+          errorCount,
+          dynamicSharding: !!env.SUBSCRIPTION_SHARD_COORDINATOR,
+        })
       } catch (err) {
-        recordSubscriptionMetric(env.ANALYTICS, 'error', shardEvents.length, shardKey, 'shard_error')
-        console.error(`[ingest] Subscription shard error for shard ${shardKey}:`, err)
+        recordSubscriptionMetric(env.ANALYTICS, 'error', prefixEvents.length, basePrefix, 'prefix_error')
+        logError(logger, 'Subscription prefix error', err, {
+          component: 'fanout',
+          basePrefix,
+          eventCount: prefixEvents.length,
+        })
       }
     }
   )
 
-  await Promise.all(shardPromises)
+  await Promise.all(prefixPromises)
 }
 
 // ============================================================================
@@ -185,7 +206,7 @@ export async function processSubscriptionFanout(
 export async function executeDirectFanout(context: IngestContext): Promise<void> {
   const { batch, tenant, env } = context
 
-  console.log(`[ingest] Starting DIRECT fanout for ${batch!.events.length} events`)
+  logger.info('Starting DIRECT fanout', { component: 'fanout', eventCount: batch!.events.length })
 
   try {
     await Promise.all([
@@ -193,7 +214,10 @@ export async function executeDirectFanout(context: IngestContext): Promise<void>
       processSubscriptionFanout(batch!.events, tenant, env),
     ])
   } catch (err) {
-    console.error('[ingest] CDC/subscription pipeline error:', err)
+    logError(logger, 'CDC/subscription pipeline error', err, {
+      component: 'fanout',
+      eventCount: batch!.events.length,
+    })
   }
 }
 

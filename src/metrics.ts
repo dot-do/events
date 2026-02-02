@@ -44,9 +44,9 @@ export interface MetricDimensions {
   /** Status (success, error, rate_limited, etc.) */
   status: 'success' | 'error' | 'rate_limited' | 'validation_error' | 'backpressure'
   /** Optional error type for failures */
-  errorType?: string
+  errorType?: string | undefined
   /** Optional additional context (e.g., shard ID, provider) */
-  context?: string
+  context?: string | undefined
 }
 
 /**
@@ -56,11 +56,11 @@ export interface MetricValues {
   /** Number of items processed (events, batches, etc.) */
   count: number
   /** Operation latency in milliseconds */
-  latencyMs?: number
+  latencyMs?: number | undefined
   /** Size in bytes (for R2 writes) */
-  bytes?: number
+  bytes?: number | undefined
   /** Error count (for partial failures) */
-  errors?: number
+  errors?: number | undefined
 }
 
 /**
@@ -95,9 +95,9 @@ export function writeMetric(
       // Index: primary index for fast filtering (namespace + operation)
       indexes: [`${dimensions.namespace}:${dimensions.operation}`],
     })
-  } catch (err) {
+  } catch {
     // Don't let metrics failures affect the main code path
-    console.warn('[metrics] Failed to write data point:', err)
+    // Intentionally suppressed - metrics logging shouldn't cause noise
   }
 }
 

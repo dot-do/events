@@ -5,6 +5,9 @@
 import type { Env, AuthRequest } from '../env'
 import { corsHeaders, authCorsHeaders } from '../utils'
 import { optionalAuth } from 'oauth.do/itty'
+import { logger, sanitize } from '../logger'
+
+const log = logger.child({ component: 'auth' })
 
 // ============================================================================
 // Open Redirect Prevention
@@ -163,7 +166,11 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
   const error = url.searchParams.get('error')
   const debug = url.searchParams.get('debug') === 'true'
 
-  console.log('[callback] Received callback', { code: code?.slice(0, 8) + '...', returnTo, error })
+  log.info('Received callback', {
+    codePrefix: code ? sanitize.id(code, 8) : null,
+    returnTo: sanitize.url(returnTo),
+    hasError: !!error
+  })
 
   if (error) {
     return Response.json({ error, error_description: url.searchParams.get('error_description') }, { status: 400, headers: corsHeaders() })
@@ -174,18 +181,18 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
   }
 
   // Exchange code for token via oauth.do service binding
-  console.log('[callback] Exchanging code with oauth.do')
+  log.info('Exchanging code with oauth.do')
   const response = await env.OAUTH.fetch(new Request('https://oauth.do/exchange', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code }),
   }))
 
-  console.log('[callback] Exchange response status:', response.status)
+  log.info('Exchange response received', { status: response.status })
 
   if (!response.ok) {
     const err = await response.json() as { error: string; error_description?: string }
-    console.error('[callback] oauth.do/exchange error:', err)
+    log.error('oauth.do/exchange error', { errorCode: err.error })
     return Response.json(err, { status: response.status, headers: corsHeaders() })
   }
 
@@ -197,25 +204,24 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
     error_description?: string
   }
 
-  console.log('[callback] Exchange data:', { hasAccessToken: !!data.access_token, hasToken: !!data.token, error: data.error })
+  log.info('Exchange completed', { hasAccessToken: !!data.access_token, hasToken: !!data.token, hasError: !!data.error })
 
   if (data.error) {
-    console.error('[callback] oauth.do/exchange error:', data.error, data.error_description)
+    log.error('oauth.do/exchange returned error', { errorCode: data.error })
     return Response.json({ error: data.error, error_description: data.error_description }, { status: 400, headers: corsHeaders() })
   }
 
   // oauth.do returns 'token', standard OAuth returns 'access_token' - accept both
   const accessToken = data.access_token || data.token
   if (!accessToken) {
-    console.error('[callback] No access_token from oauth.do/exchange')
+    log.error('No access_token from oauth.do/exchange')
     return Response.json({ error: 'invalid_response', error_description: 'No access token received' }, { status: 500, headers: corsHeaders() })
   }
 
   // Set auth cookie and redirect
   const maxAge = 3600 * 24 * 7 // 7 days
   const cookie = `auth=${accessToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`
-  console.log('[callback] Setting cookie and redirecting to:', returnTo)
-  console.log('[callback] Token length:', accessToken.length)
+  log.info('Setting cookie and redirecting', { redirectTo: sanitize.url(returnTo) })
 
   // Validate redirect URI to prevent open redirects
   const redirectTo = validateRedirectUri(returnTo, url.origin, '/events')

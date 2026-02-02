@@ -29,6 +29,12 @@ import {
   WebhookConfigError,
   WebhookSignatureError,
 } from '../core/src/webhooks'
+import { PayloadTooLargeError } from '../core/src/errors'
+import { MAX_WEBHOOK_BODY_SIZE } from './middleware/ingest/types'
+import { readBodyWithLimit } from './middleware/ingest/validate'
+import { logger, sanitize } from './logger'
+
+const log = logger.child({ component: 'webhook' })
 
 // ============================================================================
 // Types
@@ -65,6 +71,7 @@ export type WebhookErrorCode =
   | 'MISSING_HEADERS'
   | 'TIMESTAMP_EXPIRED'
   | 'CONFIG_ERROR'
+  | 'PAYLOAD_TOO_LARGE'
   | 'UNKNOWN_ERROR'
 
 /**
@@ -81,7 +88,7 @@ export interface NormalizedWebhookEvent {
   webhook: {
     provider: string
     eventType: string // Original event type from provider
-    deliveryId?: string
+    deliveryId?: string | undefined
     verified: boolean
   }
   /** Original webhook body */
@@ -136,7 +143,7 @@ function createProviderConfigFromEnv(env: WebhookEnv, provider: WebhookProvider)
   // Validate the configuration
   const errors = validateWebhookConfig(baseConfig)
   if (errors.length > 0) {
-    console.error(`[webhook] Invalid configuration for ${provider}: ${errors.join('; ')}`)
+    log.error('Invalid webhook configuration', { provider, errorCount: errors.length })
     return null
   }
 
@@ -352,7 +359,7 @@ export async function handleWebhook(
 ): Promise<Response> {
   // Validate provider using type guard
   if (!isValidProvider(providerParam)) {
-    console.warn(`[webhook] Unsupported provider: ${providerParam}`)
+    log.warn('Unsupported provider', { provider: providerParam })
     return createErrorResponse(
       `Unsupported provider: "${providerParam}"`,
       'UNSUPPORTED_PROVIDER',
@@ -368,7 +375,7 @@ export async function handleWebhook(
 
   // Reject requests if webhook is not properly configured
   if (!config) {
-    console.error(`[webhook] Provider ${provider} not configured or invalid - rejecting request`)
+    log.error('Provider not configured or invalid', { provider })
     return createErrorResponse(
       'Webhook not configured for this provider',
       'SECRET_NOT_CONFIGURED',
@@ -376,12 +383,37 @@ export async function handleWebhook(
     )
   }
 
+  // Check Content-Length header first (fast rejection)
+  const contentLength = request.headers.get('content-length')
+  if (contentLength) {
+    const length = parseInt(contentLength, 10)
+    if (!isNaN(length) && length > MAX_WEBHOOK_BODY_SIZE) {
+      log.warn('Webhook payload too large', { provider, contentLength: length, maxSize: MAX_WEBHOOK_BODY_SIZE })
+      return createErrorResponse(
+        `Request body too large: ${length} bytes exceeds ${MAX_WEBHOOK_BODY_SIZE} byte limit`,
+        'PAYLOAD_TOO_LARGE',
+        413,
+        { maxSize: MAX_WEBHOOK_BODY_SIZE, contentLength: length }
+      )
+    }
+  }
+
   // CRITICAL: Get raw body FIRST (before any parsing)
+  // Use streaming read with size limit to protect against missing Content-Length
   let rawBody: string
   try {
-    rawBody = await request.text()
+    rawBody = await readBodyWithLimit(request, MAX_WEBHOOK_BODY_SIZE)
   } catch (error) {
-    console.error(`[webhook] Failed to read request body: ${error}`)
+    if (error instanceof PayloadTooLargeError) {
+      log.warn('Webhook payload too large during read', { provider })
+      return createErrorResponse(
+        error.message,
+        'PAYLOAD_TOO_LARGE',
+        413,
+        { maxSize: MAX_WEBHOOK_BODY_SIZE }
+      )
+    }
+    log.error('Failed to read request body', { provider, error: sanitize.errorMessage(String(error)) })
     return createErrorResponse(
       'Failed to read request body',
       'UNKNOWN_ERROR',
@@ -392,7 +424,7 @@ export async function handleWebhook(
   // Verify signature - always required when secret is configured
   const verification = await verifySignature(provider, config.secret, rawBody, request.headers)
   if (!verification.valid) {
-    console.warn(`[webhook] Signature verification failed for ${provider}: ${verification.error}`)
+    log.warn('Signature verification failed', { provider, errorType: verification.error?.split(':')[0] })
     return createErrorResponse(
       'Signature verification failed',
       getErrorCodeFromVerification(verification.error ?? 'Invalid signature'),
@@ -407,7 +439,7 @@ export async function handleWebhook(
     payload = JSON.parse(rawBody)
   } catch (error) {
     const parseError = error instanceof Error ? error.message : 'Unknown parse error'
-    console.warn(`[webhook] Invalid JSON body from ${provider}: ${parseError}`)
+    log.warn('Invalid JSON body', { provider })
     return createErrorResponse(
       'Invalid JSON body',
       'INVALID_JSON',
@@ -418,7 +450,7 @@ export async function handleWebhook(
 
   // Validate that payload is an object (most webhooks send objects)
   if (payload === null || typeof payload !== 'object') {
-    console.warn(`[webhook] Payload from ${provider} is not an object`)
+    log.warn('Payload is not an object', { provider })
     return createErrorResponse(
       'Webhook payload must be a JSON object',
       'INVALID_JSON',
@@ -444,8 +476,8 @@ export async function handleWebhook(
     payload,
   }
 
-  // Log successful webhook receipt
-  console.log(`[webhook] Received ${provider}.${eventType}${deliveryId ? ` (${deliveryId})` : ''}`)
+  // Log successful webhook receipt (deliveryId is safe - it's a public identifier from the provider)
+  log.info('Webhook received', { provider, eventType, deliveryId: deliveryId ? sanitize.id(deliveryId) : undefined })
 
   // Return the normalized event
   // The caller can decide what to do with it (store in R2, forward to queue, etc.)
@@ -492,11 +524,33 @@ export async function processWebhookWithConfig(
     }
   }
 
-  // Get raw body
+  // Check Content-Length header first (fast rejection)
+  const contentLength = request.headers.get('content-length')
+  if (contentLength) {
+    const length = parseInt(contentLength, 10)
+    if (!isNaN(length) && length > MAX_WEBHOOK_BODY_SIZE) {
+      return {
+        success: false,
+        verified: false,
+        error: `Request body too large: ${length} bytes exceeds ${MAX_WEBHOOK_BODY_SIZE} byte limit`,
+        errorCode: 'PAYLOAD_TOO_LARGE',
+      }
+    }
+  }
+
+  // Get raw body with size limit
   let rawBody: string
   try {
-    rawBody = await request.text()
-  } catch {
+    rawBody = await readBodyWithLimit(request, MAX_WEBHOOK_BODY_SIZE)
+  } catch (error) {
+    if (error instanceof PayloadTooLargeError) {
+      return {
+        success: false,
+        verified: false,
+        error: error.message,
+        errorCode: 'PAYLOAD_TOO_LARGE',
+      }
+    }
     return {
       success: false,
       verified: false,

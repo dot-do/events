@@ -18,6 +18,7 @@ import { DurableObject } from 'cloudflare:workers'
 import { writeEvents, ulid, type EventRecord, type WriteResult } from './event-writer'
 import { recordWriterDOMetric, recordR2WriteMetric, MetricTimer } from './metrics'
 import type { ShardCoordinatorDO } from './shard-coordinator-do'
+import { logger, sanitize, logError, type Logger } from './logger'
 
 /**
  * Internal event with unique ID for deduplication
@@ -115,6 +116,7 @@ export class EventWriterDO extends DurableObject<Env> {
 
     this.lastMetricsReport = now
 
+    const log = logger.child({ component: 'EventWriterDO', shard: this.shardId })
     try {
       const coordinatorId = this.env.SHARD_COORDINATOR.idFromName('global')
       const coordinator = this.env.SHARD_COORDINATOR.get(coordinatorId)
@@ -129,7 +131,7 @@ export class EventWriterDO extends DurableObject<Env> {
       })
     } catch (err) {
       // Non-fatal: coordinator unavailable
-      console.warn(`[EventWriterDO:${this.shardId}] Failed to report metrics to coordinator:`, err)
+      log.warn('Failed to report metrics to coordinator', { error: sanitize.errorMessage(String(err)) })
     }
   }
 
@@ -149,7 +151,8 @@ export class EventWriterDO extends DurableObject<Env> {
       const result = await coordinator.reportBackpressure(this.shardId)
       return result.alternativeShard
     } catch (err) {
-      console.warn(`[EventWriterDO:${this.shardId}] Failed to report backpressure:`, err)
+      const log = logger.child({ component: 'EventWriterDO', shard: this.shardId })
+      log.warn('Failed to report backpressure', { error: sanitize.errorMessage(String(err)) })
       return this.shardId + 1
     }
   }
@@ -164,7 +167,7 @@ export class EventWriterDO extends DurableObject<Env> {
       const flushedIds = await this.ctx.storage.get<string[]>(FLUSHED_KEY)
       if (flushedIds && flushedIds.length > 0) {
         this.flushedEventIds = new Set(flushedIds)
-        console.log(`[EventWriterDO:${this.shardId}] Restored ${flushedIds.length} flushed event markers`)
+        logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Restored flushed event markers', { count: flushedIds.length })
       }
 
       // Then restore buffer, filtering out already-flushed events
@@ -175,12 +178,12 @@ export class EventWriterDO extends DurableObject<Env> {
         const duplicateCount = stored.length - unflushedEvents.length
 
         if (duplicateCount > 0) {
-          console.log(`[EventWriterDO:${this.shardId}] Filtered ${duplicateCount} already-flushed events`)
+          logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Filtered already-flushed events', { duplicateCount })
         }
 
         if (unflushedEvents.length > 0) {
           this.buffer = unflushedEvents
-          console.log(`[EventWriterDO:${this.shardId}] Restored ${unflushedEvents.length} events from storage`)
+          logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Restored events from storage', { count: unflushedEvents.length })
 
           // Record restore metric
           recordWriterDOMetric(this.env.ANALYTICS, 'restore', 'success', {
@@ -204,7 +207,8 @@ export class EventWriterDO extends DurableObject<Env> {
         }
       }
     } catch (error) {
-      console.warn(`[EventWriterDO:${this.shardId}] Failed to restore buffer:`, error)
+      const log = logger.child({ component: 'EventWriterDO', shard: this.shardId })
+      logError(log, 'Failed to restore buffer', error)
     }
   }
 
@@ -232,7 +236,7 @@ export class EventWriterDO extends DurableObject<Env> {
 
     // Backpressure check
     if (this.pendingWrites >= this.config.maxPendingWrites) {
-      console.log(`[EventWriterDO:${this.shardId}] Backpressure triggered: ${this.pendingWrites} pending writes`)
+      logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Backpressure triggered', { pendingWrites: this.pendingWrites })
       recordWriterDOMetric(this.env.ANALYTICS, 'backpressure', 'backpressure', {
         events: events.length,
         shard: this.shardId,
@@ -287,7 +291,7 @@ export class EventWriterDO extends DurableObject<Env> {
     // Add to buffer and persist to storage
     this.buffer.push(...bufferedEvents)
     await this.persistBuffer()
-    console.log(`[EventWriterDO:${this.shardId}] Buffered ${events.length} events (total: ${this.buffer.length})`)
+    logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Buffered events', { count: events.length, total: this.buffer.length })
 
     // Check if we should flush immediately
     if (this.shouldFlush()) {
@@ -384,7 +388,7 @@ export class EventWriterDO extends DurableObject<Env> {
       eventsBySource.get(source)!.push(eventRecord)
     }
 
-    console.log(`[EventWriterDO:${this.shardId}] Flushing ${events.length} events across ${eventsBySource.size} source(s)`)
+    logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Flushing events', { count: events.length, sources: eventsBySource.size })
 
     const results: WriteResult[] = []
     let totalBytes = 0
@@ -393,7 +397,7 @@ export class EventWriterDO extends DurableObject<Env> {
       for (const [source, sourceEvents] of eventsBySource) {
         const writeTimer = new MetricTimer()
         const result = await writeEvents(this.env.EVENTS_BUCKET, source, sourceEvents)
-        console.log(`[EventWriterDO:${this.shardId}] Flushed: ${result.key}`)
+        logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Flushed', { key: sanitize.id(result.key, 64) })
         results.push(result)
         totalBytes += result.bytes
 
@@ -412,7 +416,7 @@ export class EventWriterDO extends DurableObject<Env> {
       // Step 1: Mark these events as flushed BEFORE deleting buffer
       // This survives the race condition where R2 write succeeds but buffer delete fails
       await this.ctx.storage.put(FLUSHED_KEY, eventIds)
-      console.log(`[EventWriterDO:${this.shardId}] Marked ${eventIds.length} events as flushed`)
+      logger.child({ component: 'EventWriterDO', shard: this.shardId }).info('Marked events as flushed', { count: eventIds.length })
 
       // Step 2: Delete the buffer (if this fails, flushed markers protect against duplication)
       await this.ctx.storage.delete(BUFFER_KEY)
@@ -431,7 +435,8 @@ export class EventWriterDO extends DurableObject<Env> {
       return results[0] ?? null
     } catch (error) {
       // On error, put events back in buffer (storage still has them persisted)
-      console.error(`[EventWriterDO:${this.shardId}] Flush failed:`, error)
+      const log = logger.child({ component: 'EventWriterDO', shard: this.shardId })
+      logError(log, 'Flush failed - events returned to buffer', error, { eventCount: events.length })
       this.buffer.unshift(...events)
 
       // Record failed flush metric
@@ -481,7 +486,7 @@ export async function getActiveShards(env: Env): Promise<number[]> {
   try {
     return await coordinator.getActiveShards()
   } catch (err) {
-    console.warn('[Router] Failed to get active shards from coordinator:', err)
+    logError(logger.child({ component: 'Router' }), 'Failed to get active shards from coordinator', err)
     return [0]
   }
 }
@@ -497,7 +502,7 @@ export async function getRoutingShard(env: Env, preferredShard?: number): Promis
   try {
     return await coordinator.getRoutingShard(preferredShard)
   } catch (err) {
-    console.warn('[Router] Failed to get routing shard from coordinator:', err)
+    logError(logger.child({ component: 'Router' }), 'Failed to get routing shard from coordinator', err, { preferredShard })
     return preferredShard ?? 0
   }
 }
@@ -527,7 +532,7 @@ export async function ingestWithOverflow(
     }
 
     // Overloaded - try next shard (provided by coordinator via EventWriterDO)
-    console.log(`[Router] Shard ${currentShard} overloaded, trying shard ${result.tryNextShard}`)
+    logger.child({ component: 'Router' }).info('Shard overloaded, trying next', { currentShard, nextShard: result.tryNextShard })
     currentShard = result.tryNextShard
   }
 
@@ -601,7 +606,7 @@ export async function getShardStats(env: Env): Promise<{
   try {
     return await coordinator.getStats()
   } catch (err) {
-    console.warn('[Router] Failed to get shard stats:', err)
+    logError(logger.child({ component: 'Router' }), 'Failed to get shard stats', err)
     return null
   }
 }
@@ -622,7 +627,7 @@ export async function forceScaleShards(env: Env, targetCount: number): Promise<{
   try {
     return await coordinator.forceScale(targetCount)
   } catch (err) {
-    console.warn('[Router] Failed to force scale:', err)
+    logError(logger.child({ component: 'Router' }), 'Failed to force scale', err, { targetCount })
     return null
   }
 }

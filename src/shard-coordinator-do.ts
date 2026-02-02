@@ -16,6 +16,9 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Env as FullEnv } from './env'
 import { recordWriterDOMetric, MetricTimer } from './metrics'
+import { logger, sanitize, logError } from './logger'
+
+const log = logger.child({ component: 'ShardCoordinator' })
 
 export type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'ANALYTICS' | 'SHARD_COORDINATOR'>
 
@@ -134,9 +137,9 @@ export class ShardCoordinatorDO extends DurableObject<Env> {
       }
 
       this.initialized = true
-      console.log(`[ShardCoordinator] Restored state: ${this.activeShards.size} active shards`)
+      log.info('Restored state', { activeShards: this.activeShards.size })
     } catch (error) {
-      console.error('[ShardCoordinator] Failed to restore state:', error)
+      logError(log, 'Failed to restore state', error)
       this.initialized = true
     }
   }
@@ -167,7 +170,7 @@ export class ShardCoordinatorDO extends DurableObject<Env> {
   async updateConfig(updates: Partial<ShardConfig>): Promise<ShardConfig> {
     this.config = { ...this.config, ...updates }
     await this.persist()
-    console.log(`[ShardCoordinator] Config updated:`, this.config)
+    log.info('Config updated', { config: sanitize.payload(this.config) })
     return this.config
   }
 
@@ -461,7 +464,7 @@ export class ShardCoordinatorDO extends DurableObject<Env> {
 
     await this.persist()
 
-    console.log(`[ShardCoordinator] Scaled UP: ${previousCount} -> ${this.activeShards.size} shards (added shard ${nextShard})`)
+    log.info('Scaled UP', { previousCount, newCount: this.activeShards.size, addedShard: nextShard })
 
     recordWriterDOMetric(this.env.ANALYTICS, 'restore', 'success', {
       events: this.activeShards.size,
@@ -515,7 +518,7 @@ export class ShardCoordinatorDO extends DurableObject<Env> {
 
     await this.persist()
 
-    console.log(`[ShardCoordinator] Scaled DOWN: ${previousCount} -> ${this.activeShards.size} shards (removed shard ${lowestShard})`)
+    log.info('Scaled DOWN', { previousCount, newCount: this.activeShards.size, removedShard: lowestShard })
 
     return {
       scaled: true,
@@ -564,7 +567,7 @@ export class ShardCoordinatorDO extends DurableObject<Env> {
     this.lastScaleTime = Date.now()
     await this.persist()
 
-    console.log(`[ShardCoordinator] Force scaled: ${previousCount} -> ${targetCount} shards`)
+    log.info('Force scaled', { previousCount, targetCount })
 
     return {
       scaled: true,
@@ -582,7 +585,7 @@ export class ShardCoordinatorDO extends DurableObject<Env> {
   async alarm(): Promise<void> {
     // Periodic health check and potential scale down
     const stats = await this.getStats()
-    console.log(`[ShardCoordinator] Health check: ${stats.activeShards.length} shards, ${stats.averageUtilization.toFixed(2)} avg utilization`)
+    log.info('Health check', { shards: stats.activeShards.length, avgUtilization: parseFloat(stats.averageUtilization.toFixed(2)) })
 
     // Try to scale if needed
     await this.maybeScale()
@@ -598,7 +601,7 @@ export class ShardCoordinatorDO extends DurableObject<Env> {
     const alarm = await this.ctx.storage.getAlarm()
     if (!alarm) {
       this.ctx.storage.setAlarm(Date.now() + this.config.healthCheckIntervalMs)
-      console.log('[ShardCoordinator] Started health checks')
+      log.info('Started health checks')
     }
   }
 }
