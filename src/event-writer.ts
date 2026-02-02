@@ -10,7 +10,7 @@
  * - VARIANT column for payload (efficient semi-structured storage)
  */
 
-import { parquetWriteBuffer, createVariantColumn } from '@dotdo/hyparquet-writer'
+import { parquetWriteBuffer } from '@dotdo/hyparquet-writer'
 import { ulid } from '../core/src/ulid'
 
 export { ulid }
@@ -65,13 +65,10 @@ export async function writeEvents(
 
   const startCpu = performance.now()
 
-  // Build VARIANT column for payload (binary semi-structured storage)
-  const payloadVariant = createVariantColumn('payload', events.map(e => e.payload ?? null))
-
-  // Explicit schema: typed columns + VARIANT group
-  const numTypedColumns = 12
+  // Explicit schema: typed columns + JSON payload
+  const numTypedColumns = 13
   const schema = [
-    { name: 'root', num_children: numTypedColumns + 1 }, // +1 for payload VARIANT group
+    { name: 'root', num_children: numTypedColumns },
     // Primary index columns
     { name: 'ts', type: 'INT64' as const, converted_type: 'TIMESTAMP_MILLIS' as const, repetition_type: 'REQUIRED' as const },
     { name: 'type', type: 'BYTE_ARRAY' as const, converted_type: 'UTF8' as const, repetition_type: 'REQUIRED' as const },
@@ -87,8 +84,8 @@ export async function writeEvents(
     { name: 'url', type: 'BYTE_ARRAY' as const, converted_type: 'UTF8' as const, repetition_type: 'OPTIONAL' as const },
     { name: 'status_code', type: 'INT32' as const, repetition_type: 'OPTIONAL' as const },
     { name: 'duration_ms', type: 'DOUBLE' as const, repetition_type: 'OPTIONAL' as const },
-    // VARIANT group for payload
-    ...payloadVariant.schema,
+    // Payload as JSON string (can be upgraded to VARIANT when supported)
+    { name: 'payload', type: 'BYTE_ARRAY' as const, converted_type: 'UTF8' as const, repetition_type: 'OPTIONAL' as const },
   ]
 
   // Column data (no type - schema is explicit)
@@ -105,7 +102,7 @@ export async function writeEvents(
     { name: 'url', data: events.map(e => e.url ?? null) },
     { name: 'status_code', data: events.map(e => e.statusCode ?? null) },
     { name: 'duration_ms', data: events.map(e => e.durationMs ?? null) },
-    { name: 'payload', data: payloadVariant.data },
+    { name: 'payload', data: events.map(e => e.payload ? JSON.stringify(e.payload) : null) },
   ]
 
   // Write Parquet with SNAPPY compression

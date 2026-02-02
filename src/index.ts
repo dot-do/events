@@ -42,6 +42,7 @@ import { handleWebhooks } from './routes/webhooks'
 import { handleEventsQuery, handleRecent } from './routes/events'
 import { handleQuery } from './routes/query'
 import { handleCatalog } from './routes/catalog'
+import { handleDashboard } from './routes/dashboard'
 
 // Re-export DOs for wrangler
 export { CatalogDO, SubscriptionDO, CDCProcessorDO, EventWriterDO, RateLimiterDO }
@@ -82,7 +83,7 @@ export default {
     // ================================================================
     // Protected routes - require admin auth
     // ================================================================
-    const protectedRoutes = ['/query', '/recent', '/events', '/pipeline', '/catalog', '/subscriptions', '/benchmark']
+    const protectedRoutes = ['/query', '/recent', '/events', '/pipeline', '/catalog', '/subscriptions', '/benchmark', '/dashboard']
     if (protectedRoutes.some(r => url.pathname === r || url.pathname.startsWith(r + '/'))) {
       // Authenticate using AUTH RPC binding directly
       const auth = request.headers.get('Authorization')
@@ -166,6 +167,14 @@ export default {
         const cpuTime = performance.now() - startTime
         console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /benchmark (${user})`)
         return response
+      }
+
+      // Admin dashboard
+      const dashboardResponse = await handleDashboard(request, env, url)
+      if (dashboardResponse) {
+        const cpuTime = performance.now() - startTime
+        console.log(`[CPU:${cpuTime.toFixed(2)}ms] GET /dashboard (${user})`)
+        return dashboardResponse
       }
     }
 
