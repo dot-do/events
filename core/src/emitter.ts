@@ -2,7 +2,7 @@
  * EventEmitter - Batched event emission for Durable Objects
  */
 
-import type { DurableEvent, EmitInput, EventEmitterOptions, CollectionChangeEvent, EventBatch } from './types.js'
+import type { DurableEvent, EmitInput, EventEmitterOptions, CollectionChangeEvent, EventBatch, EventLogger } from './types.js'
 import { EventBufferFullError, CircuitBreakerOpenError } from './types.js'
 import {
   DEFAULT_EMITTER_ENDPOINT,
@@ -98,11 +98,23 @@ async function fetchWithTimeout(
  * }
  * ```
  */
+/**
+ * Default console-based logger for when no logger is injected.
+ * Outputs structured JSON for consistency.
+ */
+const defaultLogger: EventLogger = {
+  debug: (message, context) => console.debug(JSON.stringify({ timestamp: new Date().toISOString(), level: 'debug', message, context })),
+  info: (message, context) => console.info(JSON.stringify({ timestamp: new Date().toISOString(), level: 'info', message, context })),
+  warn: (message, context) => console.warn(JSON.stringify({ timestamp: new Date().toISOString(), level: 'warn', message, context })),
+  error: (message, context) => console.error(JSON.stringify({ timestamp: new Date().toISOString(), level: 'error', message, context })),
+}
+
 export class EventEmitter {
   private batch: DurableEvent[] = []
   private flushTimeout?: ReturnType<typeof setTimeout>
   private identity: DurableEvent['do']
-  private options: Required<Omit<EventEmitterOptions, 'r2Bucket' | 'apiKey'>> & { r2Bucket?: R2Bucket; apiKey?: string }
+  private options: Required<Omit<EventEmitterOptions, 'r2Bucket' | 'apiKey' | 'logger'>> & { r2Bucket?: R2Bucket; apiKey?: string }
+  private log: EventLogger
   /** Cached circuit breaker state for fast checks */
   private circuitBreakerCache: CircuitBreakerState | null = null
   /** Total events dropped due to buffer overflow */
@@ -113,6 +125,7 @@ export class EventEmitter {
     private env: Record<string, unknown>,
     options: EventEmitterOptions = {}
   ) {
+    this.log = options.logger ?? defaultLogger
     this.options = {
       endpoint: options.endpoint ?? DEFAULT_EMITTER_ENDPOINT,
       batchSize: options.batchSize ?? DEFAULT_BATCH_SIZE,
@@ -138,7 +151,7 @@ export class EventEmitter {
 
     // Restore any pending batch from storage (for hibernation recovery)
     this.restoreBatch().catch((error) => {
-      console.error('[events] Failed to restore batch from storage:', error instanceof Error ? error.message : error)
+      this.log.error('Failed to restore batch from storage', { error: error instanceof Error ? error.message : String(error) })
     })
   }
 
@@ -192,13 +205,13 @@ export class EventEmitter {
     // Auto-flush on batch size
     if (this.batch.length >= this.options.batchSize) {
       this.flush().catch((error) => {
-        console.error('[events] Failed to flush events:', error instanceof Error ? error.message : error)
+        this.log.error('Failed to flush events', { error: error instanceof Error ? error.message : String(error) })
       })
     } else if (!this.flushTimeout) {
       // Schedule flush
       this.flushTimeout = setTimeout(() => {
         this.flush().catch((error) => {
-          console.error('[events] Failed to flush events:', error instanceof Error ? error.message : error)
+          this.log.error('Failed to flush events', { error: error instanceof Error ? error.message : String(error) })
         })
       }, this.options.flushIntervalMs)
     }
@@ -248,7 +261,7 @@ export class EventEmitter {
     // Capture SQLite bookmark for PITR (async, but we emit without waiting)
     // The bookmark is optional - if we can't get it, we still emit the event
     this.getBookmarkAndEmit(type, collection, docId, doc, prev).catch((error) => {
-      console.error('[events] Failed to emit CDC event:', error instanceof Error ? error.message : error)
+      this.log.error('Failed to emit CDC event', { error: error instanceof Error ? error.message : String(error), collection, docId })
     })
   }
 
@@ -268,7 +281,7 @@ export class EventEmitter {
       // This can be used to restore the DO to this exact point in time
       bookmark = await this.ctx.storage.getCurrentBookmark()
     } catch (error) {
-      console.warn('[events] Failed to get SQLite bookmark:', error instanceof Error ? error.message : error)
+      this.log.warn('Failed to get SQLite bookmark', { error: error instanceof Error ? error.message : String(error) })
     }
 
     this.emit({
@@ -365,7 +378,7 @@ export class EventEmitter {
       cbState.openedAt = new Date().toISOString()
       await this.ctx.storage.put(STORAGE_KEY_CIRCUIT_BREAKER, cbState)
       this.circuitBreakerCache = cbState
-      console.warn(`[events] Circuit breaker opened after ${cbState.consecutiveFailures} consecutive failures`)
+      this.log.warn('Circuit breaker opened', { consecutiveFailures: cbState.consecutiveFailures })
     }
 
     // Get existing retry queue
@@ -381,7 +394,7 @@ export class EventEmitter {
       droppedCount = combined.length - maxRetry
       toRetry = combined.slice(-maxRetry)
       this.droppedEventCount += droppedCount
-      console.warn(`[events] Retry buffer full: dropped ${droppedCount} oldest events (total dropped: ${this.droppedEventCount})`)
+      this.log.warn('Retry buffer full', { droppedCount, totalDropped: this.droppedEventCount })
     }
 
     await this.ctx.storage.put(STORAGE_KEY_RETRY, toRetry)
@@ -425,7 +438,7 @@ export class EventEmitter {
       state.openedAt = undefined
       await this.ctx.storage.put(STORAGE_KEY_CIRCUIT_BREAKER, state)
       this.circuitBreakerCache = state
-      console.log('[events] Circuit breaker closed after successful delivery')
+      this.log.info('Circuit breaker closed after successful delivery')
     }
   }
 
@@ -502,7 +515,7 @@ export class EventEmitter {
           cbState.openedAt = new Date().toISOString()
           await this.ctx.storage.put(STORAGE_KEY_CIRCUIT_BREAKER, cbState)
           this.circuitBreakerCache = cbState
-          console.warn(`[events] Circuit breaker opened after ${cbState.consecutiveFailures} consecutive failures during retry`)
+          this.log.warn('Circuit breaker opened during retry', { consecutiveFailures: cbState.consecutiveFailures })
 
           // Schedule alarm far in the future for circuit breaker reset
           await this.ctx.storage.setAlarm(Date.now() + this.options.circuitBreakerResetMs)
@@ -526,7 +539,7 @@ export class EventEmitter {
         cbState.openedAt = new Date().toISOString()
         await this.ctx.storage.put(STORAGE_KEY_CIRCUIT_BREAKER, cbState)
         this.circuitBreakerCache = cbState
-        console.warn(`[events] Circuit breaker opened after ${cbState.consecutiveFailures} consecutive failures during retry`)
+        this.log.warn('Circuit breaker opened during retry', { consecutiveFailures: cbState.consecutiveFailures })
 
         // Schedule alarm far in the future for circuit breaker reset
         await this.ctx.storage.setAlarm(Date.now() + this.options.circuitBreakerResetMs)
@@ -552,7 +565,7 @@ export class EventEmitter {
         await this.ctx.storage.delete(STORAGE_KEY_BATCH)
       }
     } catch (error) {
-      console.warn('[events] Failed to restore batch:', error instanceof Error ? error.message : error)
+      this.log.warn('Failed to restore batch', { error: error instanceof Error ? error.message : String(error) })
     }
   }
 
@@ -677,7 +690,7 @@ export class EventEmitter {
     await this.ctx.storage.put(STORAGE_KEY_CIRCUIT_BREAKER, newState)
     await this.ctx.storage.delete(STORAGE_KEY_RETRY_COUNT)
     this.circuitBreakerCache = newState
-    console.log('[events] Circuit breaker manually reset')
+    this.log.info('Circuit breaker manually reset')
 
     // Trigger retry if there are pending events
     const events = await this.ctx.storage.get<DurableEvent[]>(STORAGE_KEY_RETRY)

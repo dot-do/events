@@ -229,6 +229,38 @@ export interface EventBatch {
   events: DurableEvent[]
 }
 
+// ============================================================================
+// Logger Interface
+// ============================================================================
+
+/**
+ * Logger interface for dependency injection.
+ * This allows the consumer to provide a structured logger while keeping the
+ * core package independent of any specific logging implementation.
+ *
+ * @example
+ * ```typescript
+ * const emitter = new EventEmitter(ctx, env, {
+ *   logger: {
+ *     debug: (msg, ctx) => console.debug(JSON.stringify({ level: 'debug', msg, ...ctx })),
+ *     info: (msg, ctx) => console.info(JSON.stringify({ level: 'info', msg, ...ctx })),
+ *     warn: (msg, ctx) => console.warn(JSON.stringify({ level: 'warn', msg, ...ctx })),
+ *     error: (msg, ctx) => console.error(JSON.stringify({ level: 'error', msg, ...ctx })),
+ *   }
+ * })
+ * ```
+ */
+export interface EventLogger {
+  /** Log debug message (typically filtered in production) */
+  debug(message: string, context?: Record<string, unknown>): void
+  /** Log informational message */
+  info(message: string, context?: Record<string, unknown>): void
+  /** Log warning message */
+  warn(message: string, context?: Record<string, unknown>): void
+  /** Log error message */
+  error(message: string, context?: Record<string, unknown>): void
+}
+
 /** Event emitter configuration */
 export interface EventEmitterOptions {
   /** Endpoint to send events (default: events.do) */
@@ -253,6 +285,8 @@ export interface EventEmitterOptions {
   circuitBreakerResetMs?: number | undefined
   /** Fetch timeout in ms for event delivery (default: 30000 = 30 seconds) */
   fetchTimeoutMs?: number | undefined
+  /** Logger for structured logging (default: console-based logger) */
+  logger?: EventLogger | undefined
 }
 
 /** Error thrown when the retry buffer is full and backpressure is needed */

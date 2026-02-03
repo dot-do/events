@@ -1537,7 +1537,7 @@ export class SubscriptionDO extends DurableObject<Env> {
         }
       } catch (_e) {
         // Likely duplicate - already delivered (UNIQUE constraint on subscription_id, event_id)
-        console.log(`Delivery already exists for subscription ${sub.id}, event ${event.id}`)
+        // No logging needed - this is expected behavior during deduplication
       }
     }
 

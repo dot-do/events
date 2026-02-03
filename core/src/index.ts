@@ -24,6 +24,7 @@ export type {
   EmitInput,
   EventBatch,
   EventEmitterOptions,
+  EventLogger,
   // Branded ID types
   SubscriptionId,
   DeliveryId,
