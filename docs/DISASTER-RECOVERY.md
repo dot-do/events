@@ -44,6 +44,63 @@ This document defines the disaster recovery procedures, recovery objectives, and
 | Data Durability | 99.999999999% (11 9s) | R2 storage durability |
 | Event Delivery | At-least-once | Deduplication at ingest |
 
+### Known Data Loss Windows
+
+#### Bookmark-to-Flush Gap (Events)
+
+**What it is:** There is a 0-5 second window between when an event is accepted via `/ingest` and when it is durably written to R2 storage. During this window, events are held in-memory in EventWriterDO.
+
+**Expected Data Loss Window:**
+- **Normal operation:** 0-5 seconds of events (alarm debounce period)
+- **DO crash/eviction:** Up to 5 seconds of in-flight events
+- **Worker redeployment:** Buffered events are lost (no graceful drain)
+
+**How It Works:**
+1. Events arrive at `/ingest` → immediately buffered in EventWriterDO
+2. EventWriterDO sets an alarm for 5 seconds (or uses existing alarm)
+3. Alarm fires → batch written to R2 as Parquet file
+4. Response already returned to client (201 status)
+
+**Mitigation Strategies:**
+
+| Strategy | Description | Trade-off |
+|----------|-------------|-----------|
+| **Shorter flush interval** | Reduce alarm debounce from 5s to 1s | More R2 writes, higher cost |
+| **Synchronous flush** | Block response until R2 write completes | Higher latency (50-200ms) |
+| **Client retry** | Clients retry on 5xx or timeout | Requires idempotent batchId |
+| **Queue-based ingestion** | Use Cloudflare Queue for persistence | Added complexity, higher latency |
+
+**Alarm Flush Guarantees:**
+- Alarms are guaranteed to fire (Cloudflare manages scheduling)
+- If a DO is evicted before alarm fires, buffered data is lost
+- After alarm fires and R2 write succeeds, data is durable (11 9s)
+- Failed R2 writes are retried via alarm reschedule
+
+**Monitoring:**
+- Alert on EventWriterDO alarm failures
+- Track `r2_write_errors` metrics
+- Monitor DO eviction rates
+
+**When This Matters:**
+- High-value events requiring guaranteed delivery → use synchronous flush
+- Audit/compliance events → use queue-based ingestion
+- Analytics events → default behavior is acceptable
+
+#### Bookmark-to-Flush Gap (CDC)
+
+**What it is:** CDC events are debounced for up to 5 seconds before being flushed to R2 delta files.
+
+**Expected Data Loss Window:**
+- **DO crash:** Up to 5 seconds of CDC changes
+- **DO state is preserved:** SQLite bookmark survives DO hibernation
+
+**Critical Difference from Events:**
+- CDC events include SQLite bookmarks that allow replaying changes from DO storage
+- If CDC flush fails but DO survives, changes can be recovered by re-emitting from the bookmark
+- If DO is destroyed, changes since last flush are lost (but collection state is in DO's SQLite)
+
+**Recovery:** Use PITR to reconstruct state from the last successful CDC delta flush.
+
 ---
 
 ## Backup Systems Inventory

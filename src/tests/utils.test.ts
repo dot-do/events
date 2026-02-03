@@ -5,14 +5,34 @@
  * that prevent path traversal attacks and ensure safe R2 key generation.
  */
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
   InvalidR2PathError,
   sanitizePathSegment,
   sanitizeR2Path,
   buildSafeR2Path,
   getAllowedOrigin,
+  withTimeout,
+  TimeoutError,
+  CircuitBreaker,
+  CircuitBreakerOpenError,
+  protectedCall,
 } from '../utils'
+import { simpleHash } from '../utils/hash'
+import {
+  successResponse,
+  errorResponse,
+  badRequest,
+  unauthorized,
+  forbidden,
+  notFound,
+  methodNotAllowed,
+  rateLimited,
+  internalError,
+  notConfigured,
+  serviceUnavailable,
+  ErrorCodes,
+} from '../utils/response'
 
 // ============================================================================
 // sanitizePathSegment() Tests
@@ -640,6 +660,644 @@ describe('Security Integration Tests', () => {
       expect(
         buildSafeR2Path('events', '2024', '01', 'compacted', 'events-001.parquet')
       ).toBe('events/2024/01/compacted/events-001.parquet')
+    })
+  })
+})
+
+// ============================================================================
+// simpleHash() Tests
+// ============================================================================
+
+describe('simpleHash', () => {
+  describe('basic functionality', () => {
+    it('returns a non-negative integer', () => {
+      const hash = simpleHash('test')
+      expect(hash).toBeGreaterThanOrEqual(0)
+      expect(Number.isInteger(hash)).toBe(true)
+    })
+
+    it('returns consistent values for same input', () => {
+      const input = 'consistent-input-string'
+      expect(simpleHash(input)).toBe(simpleHash(input))
+      expect(simpleHash(input)).toBe(simpleHash(input))
+    })
+
+    it('returns different values for different inputs', () => {
+      const hash1 = simpleHash('input-a')
+      const hash2 = simpleHash('input-b')
+      expect(hash1).not.toBe(hash2)
+    })
+  })
+
+  describe('edge cases', () => {
+    it('handles empty string', () => {
+      const hash = simpleHash('')
+      expect(hash).toBe(0)
+    })
+
+    it('handles single character', () => {
+      const hash = simpleHash('x')
+      expect(hash).toBeGreaterThan(0)
+    })
+
+    it('handles long strings', () => {
+      const longString = 'a'.repeat(10000)
+      const hash = simpleHash(longString)
+      expect(hash).toBeGreaterThanOrEqual(0)
+      expect(Number.isInteger(hash)).toBe(true)
+    })
+
+    it('handles special characters', () => {
+      expect(simpleHash('!@#$%^&*()')).toBeGreaterThanOrEqual(0)
+      expect(simpleHash('emoji: 🎉')).toBeGreaterThanOrEqual(0)
+      expect(simpleHash('newline\nand\ttab')).toBeGreaterThanOrEqual(0)
+    })
+
+    it('handles unicode', () => {
+      expect(simpleHash('日本語')).toBeGreaterThanOrEqual(0)
+      expect(simpleHash('العربية')).toBeGreaterThanOrEqual(0)
+      expect(simpleHash('🔥🔥🔥')).toBeGreaterThanOrEqual(0)
+    })
+  })
+
+  describe('distribution for sharding', () => {
+    it('produces varied values for sequential inputs', () => {
+      const hashes = new Set<number>()
+      for (let i = 0; i < 100; i++) {
+        hashes.add(simpleHash(`key-${i}`))
+      }
+      // Should have good distribution (at least 90% unique values)
+      expect(hashes.size).toBeGreaterThan(90)
+    })
+
+    it('distributes evenly across shard counts', () => {
+      const shardCount = 4
+      const shardCounts = [0, 0, 0, 0]
+      for (let i = 0; i < 1000; i++) {
+        const shard = simpleHash(`event-${i}-${Date.now()}`) % shardCount
+        shardCounts[shard]++
+      }
+      // Each shard should get roughly 25% (±10%)
+      for (const count of shardCounts) {
+        expect(count).toBeGreaterThan(150)
+        expect(count).toBeLessThan(350)
+      }
+    })
+  })
+})
+
+// ============================================================================
+// Response Builders Tests
+// ============================================================================
+
+describe('Response Builders', () => {
+  describe('successResponse', () => {
+    it('returns 200 status by default', async () => {
+      const response = successResponse({ message: 'ok' })
+      expect(response.status).toBe(200)
+    })
+
+    it('returns success envelope with data', async () => {
+      const data = { items: [1, 2, 3], total: 3 }
+      const response = successResponse(data)
+      const body = await response.json()
+      expect(body).toEqual({ success: true, data })
+    })
+
+    it('accepts custom status', async () => {
+      const response = successResponse({ created: true }, { status: 201 })
+      expect(response.status).toBe(201)
+    })
+
+    it('accepts custom headers', async () => {
+      const response = successResponse({ ok: true }, {
+        headers: { 'X-Custom': 'value' }
+      })
+      expect(response.headers.get('X-Custom')).toBe('value')
+    })
+
+    it('sets content-type to application/json', async () => {
+      const response = successResponse({ ok: true })
+      expect(response.headers.get('content-type')).toContain('application/json')
+    })
+  })
+
+  describe('errorResponse', () => {
+    it('returns error envelope with code and message', async () => {
+      const response = errorResponse('TEST_ERROR', 'Something went wrong', 400)
+      const body = await response.json()
+      expect(body).toEqual({
+        success: false,
+        error: { code: 'TEST_ERROR', message: 'Something went wrong' }
+      })
+    })
+
+    it('includes details when provided', async () => {
+      const response = errorResponse('VALIDATION', 'Invalid input', 400, {
+        details: { field: 'email', reason: 'invalid format' }
+      })
+      const body = await response.json()
+      expect(body.error.details).toEqual({ field: 'email', reason: 'invalid format' })
+    })
+
+    it('accepts custom headers', async () => {
+      const response = errorResponse('ERROR', 'msg', 500, {
+        headers: { 'X-Request-Id': 'abc123' }
+      })
+      expect(response.headers.get('X-Request-Id')).toBe('abc123')
+    })
+  })
+
+  describe('badRequest', () => {
+    it('returns 400 status', () => {
+      const response = badRequest('Invalid input')
+      expect(response.status).toBe(400)
+    })
+
+    it('uses INVALID_REQUEST code by default', async () => {
+      const response = badRequest('Invalid input')
+      const body = await response.json()
+      expect(body.error.code).toBe(ErrorCodes.INVALID_REQUEST)
+    })
+
+    it('accepts custom code', async () => {
+      const response = badRequest('Invalid JSON', ErrorCodes.INVALID_JSON)
+      const body = await response.json()
+      expect(body.error.code).toBe(ErrorCodes.INVALID_JSON)
+    })
+  })
+
+  describe('unauthorized', () => {
+    it('returns 401 status', () => {
+      const response = unauthorized()
+      expect(response.status).toBe(401)
+    })
+
+    it('uses default message', async () => {
+      const response = unauthorized()
+      const body = await response.json()
+      expect(body.error.message).toBe('Authentication required')
+    })
+
+    it('accepts custom message', async () => {
+      const response = unauthorized('Token expired')
+      const body = await response.json()
+      expect(body.error.message).toBe('Token expired')
+    })
+  })
+
+  describe('forbidden', () => {
+    it('returns 403 status', () => {
+      const response = forbidden()
+      expect(response.status).toBe(403)
+    })
+
+    it('uses FORBIDDEN code', async () => {
+      const response = forbidden()
+      const body = await response.json()
+      expect(body.error.code).toBe(ErrorCodes.FORBIDDEN)
+    })
+  })
+
+  describe('notFound', () => {
+    it('returns 404 status', () => {
+      const response = notFound()
+      expect(response.status).toBe(404)
+    })
+
+    it('uses NOT_FOUND code', async () => {
+      const response = notFound('User not found')
+      const body = await response.json()
+      expect(body.error.code).toBe(ErrorCodes.NOT_FOUND)
+      expect(body.error.message).toBe('User not found')
+    })
+  })
+
+  describe('methodNotAllowed', () => {
+    it('returns 405 status', () => {
+      const response = methodNotAllowed()
+      expect(response.status).toBe(405)
+    })
+  })
+
+  describe('rateLimited', () => {
+    it('returns 429 status', () => {
+      const response = rateLimited()
+      expect(response.status).toBe(429)
+    })
+
+    it('sets Retry-After header when provided', () => {
+      const response = rateLimited('Too many requests', 60)
+      expect(response.headers.get('Retry-After')).toBe('60')
+    })
+
+    it('includes retryAfter in details', async () => {
+      const response = rateLimited('Too many requests', 30)
+      const body = await response.json()
+      expect(body.error.details?.retryAfter).toBe(30)
+    })
+
+    it('does not set Retry-After when not provided', () => {
+      const response = rateLimited()
+      expect(response.headers.get('Retry-After')).toBeNull()
+    })
+  })
+
+  describe('internalError', () => {
+    it('returns 500 status', () => {
+      const response = internalError()
+      expect(response.status).toBe(500)
+    })
+
+    it('uses INTERNAL_ERROR code', async () => {
+      const response = internalError()
+      const body = await response.json()
+      expect(body.error.code).toBe(ErrorCodes.INTERNAL_ERROR)
+    })
+  })
+
+  describe('notConfigured', () => {
+    it('returns 501 status', () => {
+      const response = notConfigured()
+      expect(response.status).toBe(501)
+    })
+
+    it('uses NOT_CONFIGURED code', async () => {
+      const response = notConfigured('CDC not enabled')
+      const body = await response.json()
+      expect(body.error.code).toBe(ErrorCodes.NOT_CONFIGURED)
+    })
+  })
+
+  describe('serviceUnavailable', () => {
+    it('returns 503 status', () => {
+      const response = serviceUnavailable()
+      expect(response.status).toBe(503)
+    })
+  })
+})
+
+// ============================================================================
+// Timeout Utilities Tests
+// ============================================================================
+
+describe('withTimeout', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  describe('successful operations', () => {
+    it('returns result when promise resolves before timeout', async () => {
+      const promise = Promise.resolve('success')
+      const result = await withTimeout(promise, 1000, 'Operation timed out')
+      expect(result).toBe('success')
+    })
+
+    it('handles async functions that complete quickly', async () => {
+      const asyncFn = async () => {
+        await Promise.resolve()
+        return 42
+      }
+      const result = await withTimeout(asyncFn(), 1000, 'Timed out')
+      expect(result).toBe(42)
+    })
+  })
+
+  describe('timeout behavior', () => {
+    it('throws TimeoutError when promise exceeds timeout', async () => {
+      const slowPromise = new Promise(resolve => setTimeout(resolve, 5000))
+      const resultPromise = withTimeout(slowPromise, 100, 'Too slow')
+
+      vi.advanceTimersByTime(100)
+
+      await expect(resultPromise).rejects.toThrow(TimeoutError)
+      await expect(resultPromise).rejects.toThrow('Too slow')
+    })
+
+    it('includes timeout duration in TimeoutError', async () => {
+      const slowPromise = new Promise(resolve => setTimeout(resolve, 5000))
+      const resultPromise = withTimeout(slowPromise, 250, 'Timed out')
+
+      vi.advanceTimersByTime(250)
+
+      try {
+        await resultPromise
+      } catch (err) {
+        expect(err).toBeInstanceOf(TimeoutError)
+        expect((err as TimeoutError).timeoutMs).toBe(250)
+      }
+    })
+  })
+
+  describe('edge cases', () => {
+    it('returns immediately when timeout is 0 or negative', async () => {
+      const promise = Promise.resolve('instant')
+      const result = await withTimeout(promise, 0, 'Should not timeout')
+      expect(result).toBe('instant')
+    })
+
+    it('propagates errors from the original promise', async () => {
+      const failingPromise = Promise.reject(new Error('Original error'))
+      await expect(withTimeout(failingPromise, 1000, 'Timeout')).rejects.toThrow('Original error')
+    })
+
+    it('clears timeout when promise resolves', async () => {
+      const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout')
+      const promise = Promise.resolve('done')
+
+      await withTimeout(promise, 1000, 'Timeout')
+
+      expect(clearTimeoutSpy).toHaveBeenCalled()
+      clearTimeoutSpy.mockRestore()
+    })
+  })
+})
+
+describe('TimeoutError', () => {
+  it('has correct name', () => {
+    const error = new TimeoutError('Test timeout', 5000)
+    expect(error.name).toBe('TimeoutError')
+  })
+
+  it('stores timeout duration', () => {
+    const error = new TimeoutError('Test timeout', 3000)
+    expect(error.timeoutMs).toBe(3000)
+  })
+
+  it('is instance of Error', () => {
+    const error = new TimeoutError('Test', 100)
+    expect(error).toBeInstanceOf(Error)
+  })
+})
+
+// ============================================================================
+// Circuit Breaker Tests
+// ============================================================================
+
+describe('CircuitBreaker', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  describe('initial state', () => {
+    it('starts in closed state', () => {
+      const breaker = new CircuitBreaker('test')
+      expect(breaker.getState()).toBe('closed')
+    })
+
+    it('allows execution in closed state', async () => {
+      const breaker = new CircuitBreaker('test')
+      const result = await breaker.execute(async () => 'success')
+      expect(result).toBe('success')
+    })
+  })
+
+  describe('failure tracking', () => {
+    it('opens circuit after reaching failure threshold', async () => {
+      const breaker = new CircuitBreaker('test', { failureThreshold: 3 })
+
+      for (let i = 0; i < 3; i++) {
+        await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+      }
+
+      expect(breaker.getState()).toBe('open')
+    })
+
+    it('resets failure count on success', async () => {
+      const breaker = new CircuitBreaker('test', { failureThreshold: 3 })
+
+      // 2 failures
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+
+      // 1 success resets
+      await breaker.execute(async () => 'ok')
+
+      // 2 more failures don't open (need 3)
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+
+      expect(breaker.getState()).toBe('closed')
+    })
+  })
+
+  describe('open state', () => {
+    it('throws CircuitBreakerOpenError when open', async () => {
+      const breaker = new CircuitBreaker('test', { failureThreshold: 1 })
+
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+
+      await expect(breaker.execute(async () => 'should not run')).rejects.toThrow(CircuitBreakerOpenError)
+    })
+
+    it('includes circuit name in error', async () => {
+      const breaker = new CircuitBreaker('my-service', { failureThreshold: 1 })
+
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+
+      try {
+        await breaker.execute(async () => 'x')
+      } catch (err) {
+        expect(err).toBeInstanceOf(CircuitBreakerOpenError)
+        expect((err as CircuitBreakerOpenError).circuitName).toBe('my-service')
+      }
+    })
+
+    it('includes last error in open error', async () => {
+      const breaker = new CircuitBreaker('test', { failureThreshold: 1 })
+
+      await expect(breaker.execute(async () => { throw new Error('original failure') })).rejects.toThrow()
+
+      try {
+        await breaker.execute(async () => 'x')
+      } catch (err) {
+        expect((err as CircuitBreakerOpenError).lastError?.message).toBe('original failure')
+      }
+    })
+  })
+
+  describe('half-open state', () => {
+    it('transitions to half-open after reset timeout', async () => {
+      const breaker = new CircuitBreaker('test', {
+        failureThreshold: 1,
+        resetTimeoutMs: 1000
+      })
+
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+      expect(breaker.getState()).toBe('open')
+
+      vi.advanceTimersByTime(1000)
+
+      expect(breaker.getState()).toBe('half-open')
+    })
+
+    it('closes after successful calls in half-open', async () => {
+      const breaker = new CircuitBreaker('test', {
+        failureThreshold: 1,
+        resetTimeoutMs: 100,
+        successThreshold: 2
+      })
+
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+
+      vi.advanceTimersByTime(100)
+
+      await breaker.execute(async () => 'success 1')
+      expect(breaker.getState()).toBe('half-open')
+
+      await breaker.execute(async () => 'success 2')
+      expect(breaker.getState()).toBe('closed')
+    })
+
+    it('reopens on failure in half-open state', async () => {
+      const breaker = new CircuitBreaker('test', {
+        failureThreshold: 1,
+        resetTimeoutMs: 100
+      })
+
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+
+      vi.advanceTimersByTime(100)
+      expect(breaker.getState()).toBe('half-open')
+
+      await expect(breaker.execute(async () => { throw new Error('fail again') })).rejects.toThrow()
+      expect(breaker.getState()).toBe('open')
+    })
+  })
+
+  describe('manual controls', () => {
+    it('reset() closes the circuit', async () => {
+      const breaker = new CircuitBreaker('test', { failureThreshold: 1 })
+
+      await expect(breaker.execute(async () => { throw new Error('fail') })).rejects.toThrow()
+      expect(breaker.getState()).toBe('open')
+
+      breaker.reset()
+      expect(breaker.getState()).toBe('closed')
+    })
+
+    it('trip() opens the circuit', () => {
+      const breaker = new CircuitBreaker('test')
+      expect(breaker.getState()).toBe('closed')
+
+      breaker.trip(new Error('manual trip'))
+      expect(breaker.getState()).toBe('open')
+    })
+  })
+
+  describe('getStatus', () => {
+    it('returns detailed status', async () => {
+      const breaker = new CircuitBreaker('test', { failureThreshold: 3 })
+
+      await expect(breaker.execute(async () => { throw new Error('fail1') })).rejects.toThrow()
+      await expect(breaker.execute(async () => { throw new Error('fail2') })).rejects.toThrow()
+
+      const status = breaker.getStatus()
+      expect(status.state).toBe('closed')
+      expect(status.failures).toBe(2)
+      expect(status.lastError).toBe('fail2')
+    })
+  })
+})
+
+describe('CircuitBreakerOpenError', () => {
+  it('has correct name', () => {
+    const error = new CircuitBreakerOpenError('Circuit open', 'test-circuit')
+    expect(error.name).toBe('CircuitBreakerOpenError')
+  })
+
+  it('stores circuit name', () => {
+    const error = new CircuitBreakerOpenError('Circuit open', 'my-circuit')
+    expect(error.circuitName).toBe('my-circuit')
+  })
+
+  it('stores last error when provided', () => {
+    const lastError = new Error('Previous failure')
+    const error = new CircuitBreakerOpenError('Circuit open', 'test', lastError)
+    expect(error.lastError).toBe(lastError)
+  })
+})
+
+// ============================================================================
+// protectedCall() Tests
+// ============================================================================
+
+describe('protectedCall', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  describe('timeout protection', () => {
+    it('uses default 5000ms timeout', async () => {
+      const slowFn = () => new Promise(resolve => setTimeout(resolve, 10000))
+      const promise = protectedCall(slowFn, { errorMsg: 'Test' })
+
+      vi.advanceTimersByTime(5000)
+
+      await expect(promise).rejects.toThrow(TimeoutError)
+    })
+
+    it('respects custom timeout', async () => {
+      const slowFn = () => new Promise(resolve => setTimeout(resolve, 10000))
+      const promise = protectedCall(slowFn, { timeoutMs: 100, errorMsg: 'Custom' })
+
+      vi.advanceTimersByTime(100)
+
+      await expect(promise).rejects.toThrow('Custom timed out after 100ms')
+    })
+
+    it('returns result when successful', async () => {
+      const result = await protectedCall(async () => 'success')
+      expect(result).toBe('success')
+    })
+  })
+
+  describe('circuit breaker integration', () => {
+    it('uses circuit breaker when provided', async () => {
+      const breaker = new CircuitBreaker('test', { failureThreshold: 1 })
+
+      await expect(
+        protectedCall(async () => { throw new Error('fail') }, { circuitBreaker: breaker })
+      ).rejects.toThrow()
+
+      await expect(
+        protectedCall(async () => 'ok', { circuitBreaker: breaker })
+      ).rejects.toThrow(CircuitBreakerOpenError)
+    })
+
+    it('works without circuit breaker', async () => {
+      const result = await protectedCall(async () => 'no breaker')
+      expect(result).toBe('no breaker')
+    })
+  })
+
+  describe('combined protection', () => {
+    it('timeout triggers circuit breaker failure', async () => {
+      const breaker = new CircuitBreaker('test', { failureThreshold: 1 })
+      const slowFn = () => new Promise(resolve => setTimeout(resolve, 10000))
+
+      const promise = protectedCall(slowFn, {
+        timeoutMs: 100,
+        circuitBreaker: breaker,
+        errorMsg: 'DO call'
+      })
+
+      vi.advanceTimersByTime(100)
+
+      await expect(promise).rejects.toThrow(TimeoutError)
+      expect(breaker.getState()).toBe('open')
     })
   })
 })
