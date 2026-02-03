@@ -79,6 +79,19 @@ export const MAX_BATCH_SIZE = 1000 // Max events per batch
 export const MAX_TYPE_LENGTH = 128
 
 /**
+ * Timestamp bounds for event validation.
+ * Events with timestamps outside this window are rejected to prevent bad data.
+ *
+ * MAX_TIMESTAMP_AGE_MS: Maximum age of an event timestamp (7 days).
+ * Allows for delayed ingestion, batch processing, and catch-up scenarios.
+ *
+ * MAX_TIMESTAMP_FUTURE_MS: Maximum time an event timestamp can be in the future (1 hour).
+ * Allows for reasonable clock skew and time zone issues.
+ */
+export const MAX_TIMESTAMP_AGE_MS = 7 * 24 * 60 * 60 * 1000 // 7 days
+export const MAX_TIMESTAMP_FUTURE_MS = 60 * 60 * 1000 // 1 hour
+
+/**
  * Regex for valid event type characters.
  * Allows: alphanumeric (a-z, A-Z, 0-9), dots (.), underscores (_), hyphens (-)
  * This prevents injection attacks and parsing issues.

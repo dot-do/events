@@ -10,6 +10,7 @@ import {
   validateEvent,
   validateBatch,
   validateEventSize,
+  isValidTimestamp,
   parseJsonMiddleware,
   validateBatchMiddleware,
   validateEventsMiddleware,
@@ -18,7 +19,29 @@ import {
   MAX_EVENT_SIZE,
   MAX_BATCH_SIZE,
   MAX_TYPE_LENGTH,
+  MAX_TIMESTAMP_AGE_MS,
+  MAX_TIMESTAMP_FUTURE_MS,
 } from '../../../middleware/ingest/types'
+
+// Helper to create a valid timestamp within bounds (current time)
+function validTimestamp(): string {
+  return new Date().toISOString()
+}
+
+// Helper to create a timestamp N hours ago
+function hoursAgo(hours: number): string {
+  return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString()
+}
+
+// Helper to create a timestamp N hours from now
+function hoursFromNow(hours: number): string {
+  return new Date(Date.now() + hours * 60 * 60 * 1000).toISOString()
+}
+
+// Helper to create a timestamp N days ago
+function daysAgo(days: number): string {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()
+}
 import type { IngestContext } from '../../../middleware/ingest/types'
 
 // ============================================================================
@@ -62,13 +85,97 @@ function createRequestWithRawBody(body: string): Request {
 }
 
 // ============================================================================
+// isValidTimestamp Tests
+// ============================================================================
+
+describe('isValidTimestamp', () => {
+  describe('valid timestamps', () => {
+    it('accepts current timestamp', () => {
+      expect(isValidTimestamp(new Date().toISOString())).toBe(true)
+    })
+
+    it('accepts timestamp from 1 hour ago', () => {
+      expect(isValidTimestamp(hoursAgo(1))).toBe(true)
+    })
+
+    it('accepts timestamp from 6 days ago', () => {
+      expect(isValidTimestamp(daysAgo(6))).toBe(true)
+    })
+
+    it('accepts timestamp 30 minutes in the future', () => {
+      const ts = new Date(Date.now() + 30 * 60 * 1000).toISOString()
+      expect(isValidTimestamp(ts)).toBe(true)
+    })
+
+    it('accepts timestamp with milliseconds', () => {
+      expect(isValidTimestamp(new Date().toISOString())).toBe(true)
+    })
+  })
+
+  describe('invalid timestamps - format', () => {
+    it('rejects non-string', () => {
+      expect(isValidTimestamp(123456789)).toBe(false)
+      expect(isValidTimestamp(null)).toBe(false)
+      expect(isValidTimestamp(undefined)).toBe(false)
+    })
+
+    it('rejects unparseable string', () => {
+      expect(isValidTimestamp('not-a-date')).toBe(false)
+      expect(isValidTimestamp('2024-13-45T99:99:99Z')).toBe(false)
+    })
+  })
+
+  describe('invalid timestamps - too old', () => {
+    it('rejects timestamp 8 days ago', () => {
+      expect(isValidTimestamp(daysAgo(8))).toBe(false)
+    })
+
+    it('rejects timestamp 30 days ago', () => {
+      expect(isValidTimestamp(daysAgo(30))).toBe(false)
+    })
+
+    it('accepts timestamp exactly at 7 day boundary', () => {
+      // Just under 7 days ago should be valid
+      const justUnder7Days = new Date(Date.now() - MAX_TIMESTAMP_AGE_MS + 1000).toISOString()
+      expect(isValidTimestamp(justUnder7Days)).toBe(true)
+    })
+
+    it('rejects timestamp just past 7 day boundary', () => {
+      // Just over 7 days ago should be invalid
+      const justOver7Days = new Date(Date.now() - MAX_TIMESTAMP_AGE_MS - 1000).toISOString()
+      expect(isValidTimestamp(justOver7Days)).toBe(false)
+    })
+  })
+
+  describe('invalid timestamps - too far in future', () => {
+    it('rejects timestamp 2 hours in the future', () => {
+      expect(isValidTimestamp(hoursFromNow(2))).toBe(false)
+    })
+
+    it('rejects timestamp 24 hours in the future', () => {
+      expect(isValidTimestamp(hoursFromNow(24))).toBe(false)
+    })
+
+    it('accepts timestamp just under 1 hour in the future', () => {
+      const justUnder1Hour = new Date(Date.now() + MAX_TIMESTAMP_FUTURE_MS - 1000).toISOString()
+      expect(isValidTimestamp(justUnder1Hour)).toBe(true)
+    })
+
+    it('rejects timestamp just over 1 hour in the future', () => {
+      const justOver1Hour = new Date(Date.now() + MAX_TIMESTAMP_FUTURE_MS + 1000).toISOString()
+      expect(isValidTimestamp(justOver1Hour)).toBe(false)
+    })
+  })
+})
+
+// ============================================================================
 // validateEvent Tests
 // ============================================================================
 
 describe('validateEvent', () => {
   describe('valid events', () => {
     it('accepts event with type and ts', () => {
-      const event = { type: 'user.created', ts: '2024-01-15T10:00:00Z' }
+      const event = { type: 'user.created', ts: validTimestamp() }
 
       expect(validateEvent(event)).toBe(true)
     })
@@ -76,7 +183,7 @@ describe('validateEvent', () => {
     it('accepts event with additional fields', () => {
       const event = {
         type: 'user.created',
-        ts: '2024-01-15T10:00:00Z',
+        ts: validTimestamp(),
         userId: '123',
         email: 'test@example.com',
       }
@@ -87,7 +194,7 @@ describe('validateEvent', () => {
     it('accepts event with complex type name', () => {
       const event = {
         type: 'collection.user.profile.updated',
-        ts: '2024-01-15T10:00:00Z',
+        ts: validTimestamp(),
       }
 
       expect(validateEvent(event)).toBe(true)
@@ -96,7 +203,7 @@ describe('validateEvent', () => {
     it('accepts event with millisecond timestamp', () => {
       const event = {
         type: 'event',
-        ts: '2024-01-15T10:00:00.123Z',
+        ts: validTimestamp(),
       }
 
       expect(validateEvent(event)).toBe(true)
@@ -119,19 +226,19 @@ describe('validateEvent', () => {
     })
 
     it('rejects event without type', () => {
-      const event = { ts: '2024-01-15T10:00:00Z' }
+      const event = { ts: validTimestamp() }
 
       expect(validateEvent(event)).toBe(false)
     })
 
     it('rejects event with non-string type', () => {
-      const event = { type: 123, ts: '2024-01-15T10:00:00Z' }
+      const event = { type: 123, ts: validTimestamp() }
 
       expect(validateEvent(event)).toBe(false)
     })
 
     it('rejects event with empty type', () => {
-      const event = { type: '', ts: '2024-01-15T10:00:00Z' }
+      const event = { type: '', ts: validTimestamp() }
 
       expect(validateEvent(event)).toBe(false)
     })
@@ -139,7 +246,7 @@ describe('validateEvent', () => {
     it('rejects event with type exceeding max length', () => {
       const event = {
         type: 'a'.repeat(MAX_TYPE_LENGTH + 1),
-        ts: '2024-01-15T10:00:00Z',
+        ts: validTimestamp(),
       }
 
       expect(validateEvent(event)).toBe(false)
@@ -148,7 +255,7 @@ describe('validateEvent', () => {
     it('accepts event with type at max length', () => {
       const event = {
         type: 'a'.repeat(MAX_TYPE_LENGTH),
-        ts: '2024-01-15T10:00:00Z',
+        ts: validTimestamp(),
       }
 
       expect(validateEvent(event)).toBe(true)
@@ -177,6 +284,24 @@ describe('validateEvent', () => {
 
       expect(validateEvent(event)).toBe(false)
     })
+
+    it('rejects event with timestamp too old (8 days ago)', () => {
+      const event = { type: 'event', ts: daysAgo(8) }
+
+      expect(validateEvent(event)).toBe(false)
+    })
+
+    it('rejects event with timestamp too far in future (2 hours)', () => {
+      const event = { type: 'event', ts: hoursFromNow(2) }
+
+      expect(validateEvent(event)).toBe(false)
+    })
+
+    it('accepts event with timestamp within bounds', () => {
+      const event = { type: 'event', ts: hoursAgo(1) }
+
+      expect(validateEvent(event)).toBe(true)
+    })
   })
 })
 
@@ -195,8 +320,8 @@ describe('validateBatch', () => {
     it('accepts batch with multiple events', () => {
       const batch = {
         events: [
-          { type: 'a', ts: '2024-01-01T00:00:00Z' },
-          { type: 'b', ts: '2024-01-01T00:00:00Z' },
+          { type: 'a', ts: validTimestamp() },
+          { type: 'b', ts: validTimestamp() },
         ],
       }
 
@@ -205,7 +330,7 @@ describe('validateBatch', () => {
 
     it('accepts batch with additional fields', () => {
       const batch = {
-        events: [{ type: 'a', ts: '2024-01-01T00:00:00Z' }],
+        events: [{ type: 'a', ts: validTimestamp() }],
         batchId: 'batch-123',
         source: 'test',
       }
@@ -215,7 +340,7 @@ describe('validateBatch', () => {
 
     it('accepts batch with max events', () => {
       const batch = {
-        events: Array(MAX_BATCH_SIZE).fill({ type: 'event', ts: '2024-01-01T00:00:00Z' }),
+        events: Array(MAX_BATCH_SIZE).fill({ type: 'event', ts: validTimestamp() }),
       }
 
       expect(validateBatch(batch)).toBe(true)
@@ -249,14 +374,14 @@ describe('validateBatch', () => {
     })
 
     it('rejects batch with events as object', () => {
-      const batch = { events: { '0': { type: 'a', ts: '2024-01-01T00:00:00Z' } } }
+      const batch = { events: { '0': { type: 'a', ts: validTimestamp() } } }
 
       expect(validateBatch(batch)).toBe(false)
     })
 
     it('rejects batch exceeding max size', () => {
       const batch = {
-        events: Array(MAX_BATCH_SIZE + 1).fill({ type: 'event', ts: '2024-01-01T00:00:00Z' }),
+        events: Array(MAX_BATCH_SIZE + 1).fill({ type: 'event', ts: validTimestamp() }),
       }
 
       expect(validateBatch(batch)).toBe(false)
@@ -270,21 +395,21 @@ describe('validateBatch', () => {
 
 describe('validateEventSize', () => {
   it('accepts small event', () => {
-    const event = { type: 'event', ts: '2024-01-01T00:00:00Z', data: 'small' }
+    const event = { type: 'event', ts: validTimestamp(), data: 'small' }
 
     expect(validateEventSize(event)).toBe(true)
   })
 
   it('accepts event at max size', () => {
     const data = 'x'.repeat(MAX_EVENT_SIZE - 100) // Leave room for other fields
-    const event = { type: 'event', ts: '2024-01-01T00:00:00Z', data }
+    const event = { type: 'event', ts: validTimestamp(), data }
 
     expect(validateEventSize(event)).toBe(true)
   })
 
   it('rejects event exceeding max size', () => {
     const data = 'x'.repeat(MAX_EVENT_SIZE + 1000)
-    const event = { type: 'event', ts: '2024-01-01T00:00:00Z', data }
+    const event = { type: 'event', ts: validTimestamp(), data }
 
     expect(validateEventSize(event)).toBe(false)
   })
@@ -292,7 +417,7 @@ describe('validateEventSize', () => {
   it('handles deeply nested objects', () => {
     const smallNested = {
       type: 'event',
-      ts: '2024-01-01T00:00:00Z',
+      ts: validTimestamp(),
       a: { b: { c: { d: 'value' } } },
     }
 
@@ -306,7 +431,7 @@ describe('validateEventSize', () => {
 
 describe('parseJsonMiddleware', () => {
   it('parses valid JSON', async () => {
-    const body = { events: [{ type: 'test', ts: '2024-01-01T00:00:00Z' }] }
+    const body = { events: [{ type: 'test', ts: validTimestamp() }] }
     const context = createMockContext({
       request: createRequestWithBody(body),
     })
@@ -361,7 +486,7 @@ describe('validateBatchMiddleware', () => {
   it('validates correct batch structure', async () => {
     const context = createMockContext({
       rawBody: {
-        events: [{ type: 'test', ts: '2024-01-01T00:00:00Z' }],
+        events: [{ type: 'test', ts: validTimestamp() }],
       },
     })
 
@@ -375,7 +500,7 @@ describe('validateBatchMiddleware', () => {
   it('extracts batchId from body', async () => {
     const context = createMockContext({
       rawBody: {
-        events: [{ type: 'test', ts: '2024-01-01T00:00:00Z' }],
+        events: [{ type: 'test', ts: validTimestamp() }],
         batchId: 'batch-abc-123',
       },
     })
@@ -400,7 +525,7 @@ describe('validateBatchMiddleware', () => {
   it('returns error for batch exceeding max size', async () => {
     const context = createMockContext({
       rawBody: {
-        events: Array(MAX_BATCH_SIZE + 1).fill({ type: 'test', ts: '2024-01-01T00:00:00Z' }),
+        events: Array(MAX_BATCH_SIZE + 1).fill({ type: 'test', ts: validTimestamp() }),
       },
     })
 
@@ -419,8 +544,8 @@ describe('validateEventsMiddleware', () => {
     const context = createMockContext({
       batch: {
         events: [
-          { type: 'event1', ts: '2024-01-01T00:00:00Z' },
-          { type: 'event2', ts: '2024-01-01T00:00:01Z' },
+          { type: 'event1', ts: validTimestamp() },
+          { type: 'event2', ts: validTimestamp() },
         ],
       },
     })
@@ -434,9 +559,9 @@ describe('validateEventsMiddleware', () => {
     const context = createMockContext({
       batch: {
         events: [
-          { type: 'valid', ts: '2024-01-01T00:00:00Z' },
-          { type: '', ts: '2024-01-01T00:00:00Z' }, // Invalid: empty type
-          { ts: '2024-01-01T00:00:00Z' }, // Invalid: no type
+          { type: 'valid', ts: validTimestamp() },
+          { type: '', ts: validTimestamp() }, // Invalid: empty type
+          { ts: validTimestamp() }, // Invalid: no type
         ],
       },
     })
@@ -451,10 +576,10 @@ describe('validateEventsMiddleware', () => {
     const context = createMockContext({
       batch: {
         events: [
-          { type: 'valid', ts: '2024-01-01T00:00:00Z' },
-          { type: '', ts: '2024-01-01T00:00:00Z' }, // Invalid at index 1
-          { type: 'valid2', ts: '2024-01-01T00:00:00Z' },
-          { type: 123, ts: '2024-01-01T00:00:00Z' }, // Invalid at index 3
+          { type: 'valid', ts: validTimestamp() },
+          { type: '', ts: validTimestamp() }, // Invalid at index 1
+          { type: 'valid2', ts: validTimestamp() },
+          { type: 123, ts: validTimestamp() }, // Invalid at index 3
         ],
       },
     })
@@ -471,7 +596,7 @@ describe('validateEventsMiddleware', () => {
     const largeData = 'x'.repeat(MAX_EVENT_SIZE + 1000)
     const context = createMockContext({
       batch: {
-        events: [{ type: 'valid', ts: '2024-01-01T00:00:00Z', data: largeData }],
+        events: [{ type: 'valid', ts: validTimestamp(), data: largeData }],
       },
     })
 
@@ -482,7 +607,7 @@ describe('validateEventsMiddleware', () => {
   })
 
   it('limits reported indices to 10', async () => {
-    const invalidEvents = Array(15).fill({ type: '', ts: '2024-01-01T00:00:00Z' })
+    const invalidEvents = Array(15).fill({ type: '', ts: validTimestamp() })
     const context = createMockContext({
       batch: { events: invalidEvents },
     })

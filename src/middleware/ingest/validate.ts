@@ -30,6 +30,8 @@ import {
   MAX_TYPE_LENGTH,
   EVENT_TYPE_PATTERN,
   DEFAULT_MAX_BODY_SIZE,
+  MAX_TIMESTAMP_AGE_MS,
+  MAX_TIMESTAMP_FUTURE_MS,
 } from './types'
 
 // ============================================================================
@@ -50,13 +52,36 @@ export function isValidEventType(type: unknown): type is string {
 }
 
 /**
+ * Validate event timestamp is parseable and within reasonable bounds.
+ * Rejects timestamps that are:
+ * - Unparseable (invalid ISO format)
+ * - Too old (more than 7 days in the past)
+ * - Too far in the future (more than 1 hour ahead)
+ *
+ * @param ts - The timestamp string to validate
+ * @returns True if timestamp is valid and within bounds
+ */
+export function isValidTimestamp(ts: unknown): ts is string {
+  if (typeof ts !== 'string') return false
+
+  const timestamp = Date.parse(ts)
+  if (isNaN(timestamp)) return false
+
+  const now = Date.now()
+  const minTimestamp = now - MAX_TIMESTAMP_AGE_MS
+  const maxTimestamp = now + MAX_TIMESTAMP_FUTURE_MS
+
+  return timestamp >= minTimestamp && timestamp <= maxTimestamp
+}
+
+/**
  * Validate a single event has required fields
  */
 export function validateEvent(event: unknown): event is { type: string; ts: string } {
   if (typeof event !== 'object' || event === null) return false
   const e = event as Record<string, unknown>
   if (!isValidEventType(e.type)) return false
-  if (typeof e.ts !== 'string' || isNaN(Date.parse(e.ts))) return false
+  if (!isValidTimestamp(e.ts)) return false
   return true
 }
 
@@ -273,7 +298,7 @@ export const validateEventsMiddleware: IngestMiddleware = async (
       continue: false,
       response: toErrorResponse(
         new InvalidEventError(
-          `Invalid events at indices: ${invalidEvents.slice(0, 10).join(', ')}${invalidEvents.length > 10 ? '...' : ''}. Each event must have type (string, 1-${MAX_TYPE_LENGTH} chars, alphanumeric/dots/underscores/hyphens only) and ts (valid ISO timestamp)`,
+          `Invalid events at indices: ${invalidEvents.slice(0, 10).join(', ')}${invalidEvents.length > 10 ? '...' : ''}. Each event must have type (string, 1-${MAX_TYPE_LENGTH} chars, alphanumeric/dots/underscores/hyphens only) and ts (valid ISO timestamp within last 7 days and not more than 1 hour in the future)`,
           { indices: invalidEvents.slice(0, 10) }
         ),
         { headers: corsHeaders() }
