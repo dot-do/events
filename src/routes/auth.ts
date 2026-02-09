@@ -115,16 +115,8 @@ export async function handleAuth(
     // Validate redirect URI to prevent open redirects
     const safeReturnTo = validateRedirectUri(returnTo, url.origin, '/events')
 
-    const oauthUrl = new URL('/login', 'https://oauth.do')
-    oauthUrl.searchParams.set('returnTo', safeReturnTo)
-
-    // Proxy to oauth.do via service binding
-    return env.OAUTH.fetch(new Request(oauthUrl.toString(), {
-      headers: {
-        'Accept': request.headers.get('Accept') || '*/*',
-      },
-      redirect: 'manual',
-    }))
+    // Proxy to oauth.do via RPC
+    return env.OAUTH.login(safeReturnTo)
   }
 
   // Callback - exchange code for token via oauth.do/exchange
@@ -185,13 +177,9 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
     return badRequest('Missing code', 'INVALID_REQUEST', { headers: corsHeaders() })
   }
 
-  // Exchange code for token via oauth.do service binding
+  // Exchange code for token via oauth.do RPC
   log.info('Exchanging code with oauth.do')
-  const response = await env.OAUTH.fetch(new Request('https://oauth.do/exchange', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code }),
-  }))
+  const response = await env.OAUTH.exchange(code)
 
   log.info('Exchange response received', { status: response.status })
 

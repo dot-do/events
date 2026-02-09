@@ -23,6 +23,19 @@ import type { AnalyticsEngineDataset } from './metrics'
 
 export type { WebhookEnv, AuthRequest }
 
+/**
+ * RPC interface for the OAuth worker service binding.
+ * Methods match the RPC entrypoints on OAuthWorker (`.do/oauth/workers/oauth/index.ts`).
+ */
+export interface OAuthRPC {
+  /** Initiate login — returns a redirect Response from the upstream auth provider */
+  login(returnTo: string): Promise<Response>
+  /** Exchange an authorization code for tokens — returns the DO's JSON Response */
+  exchange(code: string): Promise<Response>
+  /** HTTP fetch fallback */
+  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>
+}
+
 export interface Env extends WebhookEnv {
   EVENTS_BUCKET: R2Bucket
   PIPELINE_BUCKET: R2Bucket
@@ -47,7 +60,7 @@ export interface Env extends WebhookEnv {
   /** When true, allows unauthenticated access to /ingest endpoint. Only use for development/testing. */
   ALLOW_UNAUTHENTICATED_INGEST?: string
   AUTH: AuthBinding
-  OAUTH: Fetcher
+  OAUTH: OAuthRPC
   ENVIRONMENT: string
   ALLOWED_ORIGINS?: string
   TAIL_AUTH_SECRET?: string
