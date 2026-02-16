@@ -85,7 +85,8 @@
 
   // Tail worker for event streaming
   "tail_consumers": [
-    { "service": "tail" }
+    { "service": "tail" },
+    { "service": "otel" }
   ],
 
   // Development environment
