@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "events-do",
   "main": "src/index.ts",
-  "compatibility_date": "2026-01-25",
+  "compatibility_date": "2026-02-17",
   "compatibility_flags": ["nodejs_compat"],
   "account_id": "b6641681fe423910342b9ffa1364c76d",
 
@@ -17,7 +17,7 @@
 
   // Cloudflare Pipeline for event ingestion into ClickHouse
   "pipelines": [
-    { "binding": "EVENTS_PIPELINE", "pipeline": "headlessly_events" }
+    { "binding": "EVENTS_PIPELINE", "pipeline": "d8f32274e86b42f68624144111579a26" }
   ],
 
   // R2 buckets
@@ -90,8 +90,7 @@
 
   // Tail worker for event streaming
   "tail_consumers": [
-    { "service": "tail" },
-    { "service": "otel" }
+    { "service": "tail" }
   ],
 
   // Development environment

@@ -16,7 +16,7 @@
 
   // Cloudflare Pipeline for event ingestion into ClickHouse
   "pipelines": [
-    { "binding": "EVENTS_PIPELINE", "pipeline": "headlessly_events" }
+    { "binding": "EVENTS_PIPELINE", "pipeline": "d8f32274e86b42f68624144111579a26" }
   ],
 
   // Shared EventWriterDO - same DO used by events.do worker
