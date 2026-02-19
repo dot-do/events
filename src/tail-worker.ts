@@ -20,7 +20,9 @@ import { logger, sanitize } from './logger'
 
 const log = logger.child({ component: 'tail' })
 
-type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'TAIL_AUTH_SECRET'>
+type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'TAIL_AUTH_SECRET'> & {
+  EVENTS_PIPELINE?: Pipeline<Record<string, unknown>>
+}
 
 // ============================================================================
 // Auth helper
@@ -197,16 +199,20 @@ export default {
       records.push(record)
     }
 
-    // Send directly to EventWriterDO - no module-level buffering.
-    // The DO handles batching and persistence with alarm-based retries.
-    if (records.length > 0) {
-      log.info('Sending events to EventWriterDO', { count: records.length })
-      const result = await ingestWithOverflow(env, records, 'tail')
-      if (!result.ok) {
-        log.error('Failed to ingest', { shard: result.shard })
-      } else {
-        log.info('Ingested successfully', { shard: result.shard, buffered: result.buffered })
-      }
-    }
+    if (records.length === 0) return
+
+    // Send to EventWriterDO (Parquet on R2) and Pipeline (→ ClickHouse) in parallel
+    const doIngest = ingestWithOverflow(env, records, 'tail').then((result) => {
+      if (!result.ok) log.error('Failed DO ingest', { shard: result.shard })
+      else log.info('DO ingested', { shard: result.shard, buffered: result.buffered })
+    })
+
+    const pipelineIngest = env.EVENTS_PIPELINE
+      ? env.EVENTS_PIPELINE.send(records as unknown as Record<string, unknown>[]).catch((err) => {
+          log.error('Pipeline send failed', { error: String(err) })
+        })
+      : Promise.resolve()
+
+    await Promise.all([doIngest, pipelineIngest])
   },
 }

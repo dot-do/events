@@ -201,6 +201,15 @@ export async function handleIngest(
   context.useQueueFanout = useQueueFanout
   context.namespacedSource = buildNamespacedR2Path(tenant, 'events')
 
+  // Send to Pipeline for ClickHouse ingestion (in background)
+  if (env.EVENTS_PIPELINE) {
+    ctx.waitUntil(
+      env.EVENTS_PIPELINE.send(records as unknown as Record<string, unknown>[]).catch((err) => {
+        log.error('Pipeline send failed', { error: String(err), namespace: tenant.namespace })
+      })
+    )
+  }
+
   // Send to EventWriterDO for batched Parquet writes (in background for fast response)
   ctx.waitUntil(
     (async () => {

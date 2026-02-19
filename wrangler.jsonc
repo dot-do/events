@@ -15,6 +15,11 @@
     { "pattern": "events.do/*", "zone_name": "events.do" }
   ],
 
+  // Cloudflare Pipeline for event ingestion into ClickHouse
+  "pipelines": [
+    { "binding": "EVENTS_PIPELINE", "pipeline": "headlessly_events" }
+  ],
+
   // R2 buckets
   "r2_buckets": [
     { "binding": "EVENTS_BUCKET", "bucket_name": "events" },
