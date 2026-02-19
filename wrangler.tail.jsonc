@@ -14,10 +14,9 @@
     { "binding": "EVENTS_BUCKET", "bucket_name": "events" }
   ],
 
-  // Cloudflare Pipeline for event ingestion into ClickHouse
-  "pipelines": [
-    { "binding": "EVENTS_PIPELINE", "pipeline": "d8f32274e86b42f68624144111579a26" }
-  ],
+  // NOTE: No EVENTS_PIPELINE binding here. The headlessly-tail worker handles
+  // pipeline ingestion with the canonical EventRecord shape. This tail worker
+  // writes to EventWriterDO with a flat Parquet-optimized schema.
 
   // Shared EventWriterDO - same DO used by events.do worker
   "durable_objects": {

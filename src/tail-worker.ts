@@ -20,9 +20,7 @@ import { logger, sanitize } from './logger'
 
 const log = logger.child({ component: 'tail' })
 
-type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'TAIL_AUTH_SECRET'> & {
-  EVENTS_PIPELINE?: Pipeline<Record<string, unknown>>
-}
+type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'TAIL_AUTH_SECRET'>
 
 // ============================================================================
 // Auth helper
@@ -201,18 +199,13 @@ export default {
 
     if (records.length === 0) return
 
-    // Send to EventWriterDO (Parquet on R2) and Pipeline (→ ClickHouse) in parallel
-    const doIngest = ingestWithOverflow(env, records, 'tail').then((result) => {
-      if (!result.ok) log.error('Failed DO ingest', { shard: result.shard })
-      else log.info('DO ingested', { shard: result.shard, buffered: result.buffered })
-    })
-
-    const pipelineIngest = env.EVENTS_PIPELINE
-      ? env.EVENTS_PIPELINE.send(records as unknown as Record<string, unknown>[]).catch((err) => {
-          log.error('Pipeline send failed', { error: String(err) })
-        })
-      : Promise.resolve()
-
-    await Promise.all([doIngest, pipelineIngest])
+    // Send to EventWriterDO (Parquet on R2) — events.do's own storage path.
+    // NOTE: Do NOT send to EVENTS_PIPELINE here. The headlessly-tail worker
+    // handles pipeline ingestion with the canonical EventRecord shape.
+    // This tail worker uses a flat Parquet-optimized schema that doesn't
+    // match the platform's expected { id, ns, ts, type, event, source, data }.
+    const result = await ingestWithOverflow(env, records, 'tail')
+    if (!result.ok) log.error('Failed DO ingest', { shard: result.shard })
+    else log.info('DO ingested', { shard: result.shard, buffered: result.buffered })
   },
 }
