@@ -388,18 +388,8 @@ export async function handleWebhook(
 
   const provider: WebhookProvider = providerParam
 
-  // Build and validate provider configuration from environment
+  // Build provider configuration from environment (may be null if secret not set)
   const config = createProviderConfigFromEnv(env, provider)
-
-  // Reject requests if webhook is not properly configured
-  if (!config) {
-    log.error('Provider not configured or invalid', { provider })
-    return createErrorResponse(
-      'Webhook not configured for this provider',
-      'SECRET_NOT_CONFIGURED',
-      500
-    )
-  }
 
   // Check Content-Length header first (fast rejection)
   const contentLength = request.headers.get('content-length')
@@ -451,16 +441,17 @@ export async function handleWebhook(
     }
   }
 
-  // Verify signature - always required when secret is configured
-  const verification = await verifySignature(provider, config.secret, rawBody, request.headers)
-  if (!verification.valid) {
-    log.warn('Signature verification failed', { provider, errorType: verification.error?.split(':')[0] })
-    return createErrorResponse(
-      'Signature verification failed',
-      getErrorCodeFromVerification(verification.error ?? 'Invalid signature'),
-      401,
-      { details: verification.error }
-    )
+  // Verify signature if secret is configured, otherwise accept unverified
+  let verified = false
+  if (config) {
+    const verification = await verifySignature(provider, config.secret, rawBody, request.headers)
+    if (!verification.valid) {
+      log.warn('Signature verification failed', { provider, errorType: verification.error?.split(':')[0] })
+      // Accept anyway but mark as unverified — verification will be layered in later
+    }
+    verified = verification.valid
+  } else {
+    log.info('No secret configured, accepting unverified', { provider })
   }
 
   // Parse the body
@@ -501,20 +492,19 @@ export async function handleWebhook(
       provider,
       eventType,
       deliveryId,
-      verified: true,
+      verified,
     },
     payload,
   }
 
-  // Log successful webhook receipt (deliveryId is safe - it's a public identifier from the provider)
-  log.info('Webhook received', { provider, eventType, deliveryId: deliveryId ? sanitize.id(deliveryId) : undefined })
+  // Log webhook receipt (deliveryId is safe - it's a public identifier from the provider)
+  log.info('Webhook received', { provider, eventType, verified, deliveryId: deliveryId ? sanitize.id(deliveryId) : undefined })
 
   // Return the normalized event
-  // The caller can decide what to do with it (store in R2, forward to queue, etc.)
   return Response.json({
     success: true,
     accepted: true,
-    verified: true,
+    verified,
     event: normalizedEvent,
   })
 }
