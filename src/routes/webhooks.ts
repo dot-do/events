@@ -41,16 +41,18 @@ async function checkWebhookRateLimit(
 }
 
 /**
- * Send a verified webhook event to EventWriterDO for batched Parquet writes.
- * The DO handles buffering, persistence, and alarm-based flush retries.
+ * Send a verified webhook event to EventWriterDO (flat Parquet schema)
+ * AND to the headlessly pipeline (canonical shape for platform visibility).
  */
 async function sendWebhookEvent(
   response: Response,
   env: Env,
+  ctx: ExecutionContext,
 ): Promise<void> {
   const result = await response.clone().json() as { event?: NormalizedWebhookEvent }
   if (!result.event) return
 
+  // 1. Flat shape for events.do's own EventWriterDO/Parquet storage
   const record: EventRecord = {
     ts: result.event.ts,
     type: result.event.type,
@@ -61,20 +63,41 @@ async function sendWebhookEvent(
     payload: result.event.payload,
   }
 
-  // Send directly to EventWriterDO - no module-level buffering.
-  // The DO handles batching and persistence with alarm-based retries.
-  const result2 = await ingestWithOverflow(env, [record], 'webhook')
-  if (!result2.ok) {
-    log.error('Failed to ingest event to EventWriterDO', { shard: result2.shard })
-  } else {
-    log.info('Ingested webhook event', { shard: result2.shard, buffered: result2.buffered })
-  }
+  const doWrite = ingestWithOverflow(env, [record], 'webhook').then((r) => {
+    if (!r.ok) log.error('Failed to ingest event to EventWriterDO', { shard: r.shard })
+    else log.info('Ingested webhook event', { shard: r.shard, buffered: r.buffered })
+  })
+
+  // 2. Canonical shape for headless.ly pipeline: { id, ns, ts, type, event, source, data }
+  const pipelineWrite = env.EVENTS_PIPELINE
+    ? env.EVENTS_PIPELINE.send([{
+        id: crypto.randomUUID(),
+        ns: `webhook.${result.event.webhook.provider}`,
+        ts: result.event.ts,
+        type: 'webhook',
+        event: result.event.type,
+        source: result.event.source,
+        data: {
+          provider: result.event.webhook.provider,
+          eventType: result.event.webhook.eventType,
+          deliveryId: result.event.webhook.deliveryId,
+          verified: result.event.webhook.verified,
+          payload: result.event.payload,
+        },
+      }]).catch((err) => {
+        log.error('Pipeline send failed', { error: String(err) })
+      })
+    : Promise.resolve()
+
+  // Run both in parallel — pipeline write in background so it doesn't block response
+  ctx.waitUntil(pipelineWrite)
+  await doWrite
 }
 
 export async function handleWebhooks(
   request: Request,
   env: Env,
-  _ctx: ExecutionContext,
+  ctx: ExecutionContext,
   url: URL,
   isWebhooksDomain: boolean,
   startTime: number,
@@ -97,9 +120,9 @@ export async function handleWebhooks(
 
     const response = await handleWebhook(request, env, provider)
 
-    // Send webhook events to EventWriterDO for batched Parquet writes
+    // Send to EventWriterDO (flat) + headlessly pipeline (canonical)
     if (response.status === 200) {
-      await sendWebhookEvent(response, env)
+      await sendWebhookEvent(response, env, ctx)
     }
 
     const cpuTime = performance.now() - startTime
@@ -119,9 +142,9 @@ export async function handleWebhooks(
 
       const response = await handleWebhook(request, env, provider)
 
-      // Send webhook events to EventWriterDO for batched Parquet writes
+      // Send to EventWriterDO (flat) + headlessly pipeline (canonical)
       if (response.status === 200) {
-        await sendWebhookEvent(response, env)
+        await sendWebhookEvent(response, env, ctx)
       }
 
       const cpuTime = performance.now() - startTime

@@ -15,10 +15,11 @@
     { "pattern": "events.do/*", "zone_name": "events.do" }
   ],
 
-  // NOTE: No EVENTS_PIPELINE — events.do uses its own EventWriterDO/R2 path.
-  // The headlessly_events pipeline is for headless.ly workers only (apps/payload,
-  // apps/tail, apps/platform). When events.do gets its own pipeline, it will be
-  // a separate stream with its own R2 sink.
+  // Headlessly pipeline — used ONLY by webhook handler to forward canonical-shaped
+  // events to headless.ly. The ingest route and tail worker do NOT use this.
+  "pipelines": [
+    { "binding": "EVENTS_PIPELINE", "pipeline": "d8f32274e86b42f68624144111579a26" }
+  ],
 
   // R2 buckets
   "r2_buckets": [

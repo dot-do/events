@@ -40,8 +40,8 @@ export interface Env extends WebhookEnv {
   EVENTS_BUCKET: R2Bucket
   PIPELINE_BUCKET: R2Bucket
   BENCHMARK_BUCKET: R2Bucket
-  // NOTE: No EVENTS_PIPELINE — events.do uses its own EventWriterDO/R2 path.
-  // When events.do gets its own pipeline, add it here as a separate binding.
+  /** Headlessly pipeline — used ONLY by webhook handler to forward canonical events to headless.ly */
+  EVENTS_PIPELINE?: Pipeline<Record<string, unknown>>
   CATALOG: DurableObjectNamespace<CatalogDO>
   SUBSCRIPTIONS: DurableObjectNamespace<SubscriptionDO>
   CDC_PROCESSOR: DurableObjectNamespace<CDCProcessorDO>
