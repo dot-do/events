@@ -40,8 +40,8 @@ export interface Env extends WebhookEnv {
   EVENTS_BUCKET: R2Bucket
   PIPELINE_BUCKET: R2Bucket
   BENCHMARK_BUCKET: R2Bucket
-  /** Cloudflare Pipeline for event ingestion into ClickHouse */
-  EVENTS_PIPELINE?: Pipeline<Record<string, unknown>>
+  // NOTE: No EVENTS_PIPELINE — events.do uses its own EventWriterDO/R2 path.
+  // When events.do gets its own pipeline, add it here as a separate binding.
   CATALOG: DurableObjectNamespace<CatalogDO>
   SUBSCRIPTIONS: DurableObjectNamespace<SubscriptionDO>
   CDC_PROCESSOR: DurableObjectNamespace<CDCProcessorDO>
