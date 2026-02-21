@@ -13,6 +13,7 @@
 
 export { EventEmitter } from './emitter.js'
 export type { EmitInput } from './emitter.js'
+export type { PipelineLike, ResolvedEmitterOptions } from './types.js'
 
 // === New ClickHouse-aligned event types ===
 export type {
@@ -466,7 +467,6 @@ export {
 export { coreConfig } from './config.js'
 export {
   // Emitter defaults
-  DEFAULT_EMITTER_ENDPOINT,
   DEFAULT_BATCH_SIZE,
   DEFAULT_FLUSH_INTERVAL_MS,
   DEFAULT_MAX_RETRY_QUEUE_SIZE,
@@ -495,7 +495,6 @@ export {
   // Storage keys
   STORAGE_KEY_RETRY,
   STORAGE_KEY_RETRY_COUNT,
-  STORAGE_KEY_BATCH,
   STORAGE_KEY_CIRCUIT_BREAKER,
   // Parallel compaction configuration
   DEFAULT_COMPACTION_PARALLELISM,

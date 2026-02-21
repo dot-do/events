@@ -228,10 +228,11 @@ export default {
 }
 `,
 
-    indexTs: () => `import { EventEmitter, CDCCollection, type DurableEvent } from '@dotdo/events'
+    indexTs: () => `import { EventEmitter, CDCCollection, type DurableEvent, type PipelineLike } from '@dotdo/events'
 import { DurableObject } from 'cloudflare:workers'
 
 export interface Env {
+  EVENTS_PIPELINE: PipelineLike
   EVENTS_BUCKET: R2Bucket
   ITEMS: DurableObjectNamespace<ItemsDO>
 }
@@ -257,12 +258,12 @@ export class ItemsDO extends DurableObject<Env> {
     // Initialize CDC collection
     this.items = new CDCCollection<Item>(ctx, 'items')
 
-    // Initialize event emitter
-    this.emitter = new EventEmitter(ctx, {
-      endpoint: 'https://events.do/ingest',
-      cdc: true,
-      trackPrevious: true,
-    })
+    // Initialize event emitter — Pipeline-first, alarm retry on failure
+    this.emitter = new EventEmitter(
+      env.EVENTS_PIPELINE,
+      { cdc: true, trackPrevious: true },
+      ctx,
+    )
   }
 
   async fetch(request: Request): Promise<Response> {

@@ -9,9 +9,6 @@
 // EventEmitter Configuration
 // ============================================================================
 
-/** Default endpoint for event ingestion */
-export const DEFAULT_EMITTER_ENDPOINT = 'https://events.workers.do/ingest'
-
 /** Default number of events to batch before auto-flushing */
 export const DEFAULT_BATCH_SIZE = 100
 
@@ -29,9 +26,6 @@ export const DEFAULT_CIRCUIT_BREAKER_RESET_MS = 300000
 
 /** Maximum circuit breaker reset time (ms) - 1 hour */
 export const MAX_CIRCUIT_BREAKER_RESET_MS = 3600000
-
-/** Default fetch timeout (ms) for event delivery - 30 seconds */
-export const DEFAULT_FETCH_TIMEOUT_MS = 30000
 
 // ============================================================================
 // Retry Configuration
@@ -123,9 +117,6 @@ export const STORAGE_KEY_RETRY = '_events:retry'
 /** Storage key for retry count */
 export const STORAGE_KEY_RETRY_COUNT = '_events:retryCount'
 
-/** Storage key for pending batch (hibernation) */
-export const STORAGE_KEY_BATCH = '_events:batch'
-
 /** Storage key for circuit breaker state */
 export const STORAGE_KEY_CIRCUIT_BREAKER = '_events:circuitBreaker'
 
@@ -135,14 +126,12 @@ export const STORAGE_KEY_CIRCUIT_BREAKER = '_events:circuitBreaker'
 
 export const coreConfig = {
   emitter: {
-    defaultEndpoint: DEFAULT_EMITTER_ENDPOINT,
     defaultBatchSize: DEFAULT_BATCH_SIZE,
     defaultFlushIntervalMs: DEFAULT_FLUSH_INTERVAL_MS,
     defaultMaxRetryQueueSize: DEFAULT_MAX_RETRY_QUEUE_SIZE,
     defaultMaxConsecutiveFailures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
     defaultCircuitBreakerResetMs: DEFAULT_CIRCUIT_BREAKER_RESET_MS,
     maxCircuitBreakerResetMs: MAX_CIRCUIT_BREAKER_RESET_MS,
-    defaultFetchTimeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
   },
   retry: {
     baseDelayMs: RETRY_BASE_DELAY_MS,
@@ -169,7 +158,6 @@ export const coreConfig = {
   storageKeys: {
     retry: STORAGE_KEY_RETRY,
     retryCount: STORAGE_KEY_RETRY_COUNT,
-    batch: STORAGE_KEY_BATCH,
     circuitBreaker: STORAGE_KEY_CIRCUIT_BREAKER,
   },
   compaction: {

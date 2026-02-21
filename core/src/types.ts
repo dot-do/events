@@ -74,21 +74,47 @@ export interface EventLogger {
 }
 
 // ============================================================================
+// Pipeline Interface
+// ============================================================================
+
+export interface PipelineLike {
+  send(records: Record<string, unknown>[]): Promise<void>
+}
+
+// ============================================================================
 // EventEmitter Configuration
 // ============================================================================
 
 export interface EventEmitterOptions {
-  endpoint?: string | undefined
+  /** Pipeline binding — primary transport */
+  pipeline: PipelineLike
+  /** Batch size before auto-flush (default: 100) */
   batchSize?: number | undefined
+  /** Flush interval in ms (default: 1000) */
   flushIntervalMs?: number | undefined
+  /** Enable CDC event emission */
   cdc?: boolean | undefined
+  /** Track previous document state for CDC */
   trackPrevious?: boolean | undefined
-  apiKey?: string | undefined
+  /** Max events to persist in retry queue (default: 10000) */
   maxRetryQueueSize?: number | undefined
+  /** Consecutive failures before circuit breaker opens (default: 10) */
   maxConsecutiveFailures?: number | undefined
+  /** Time before circuit breaker resets in ms (default: 300000) */
   circuitBreakerResetMs?: number | undefined
-  fetchTimeoutMs?: number | undefined
+  /** Logger */
   logger?: EventLogger | undefined
+}
+
+/** Resolved options with defaults applied */
+export interface ResolvedEmitterOptions {
+  batchSize: number
+  flushIntervalMs: number
+  cdc: boolean
+  trackPrevious: boolean
+  maxRetryQueueSize: number
+  maxConsecutiveFailures: number
+  circuitBreakerResetMs: number
 }
 
 // ============================================================================
