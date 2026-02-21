@@ -1,4 +1,4 @@
-export type { EventType, BaseEvent, ExperimentEvent, RecordingEvent } from './base.js'
+export type { EventType, EpcisEventType, BaseEvent, RecordingEvent } from './base.js'
 
 export type { CdcEventData, CdcEvent } from './cdc.js'
 export type { ActionEventData, ActionEvent } from './action.js'
@@ -10,6 +10,50 @@ export type { StripeEventShape, GitHubEventShape, WebhookProvider, WebhookEventD
 export type { PageEventData, PageEvent, TrackEventData, TrackEvent, IdentifyEventData, IdentifyEvent, AnalyticsEvent } from './analytics.js'
 export type { TailEventData, TailEvent } from './tail.js'
 export type { CustomEvent } from './custom.js'
+export type { MeterEventData, MeterEvent, StripeEventData, StripeEvent, BillingEvent } from './billing.js'
+export type {
+  BizStep,
+  Disposition,
+  EpcisAction,
+  QuantityElement,
+  BizTransaction,
+  SourceDest,
+  SensorReport,
+  SensorElement,
+  PersistentDisposition,
+  ErrorDeclaration,
+  EpcisCommonData,
+  ObjectEventData,
+  ObjectEvent,
+  AggregationEventData,
+  AggregationEvent,
+  TransactionEventData,
+  TransactionEvent,
+  TransformationEventData,
+  TransformationEvent,
+  AssociationEventData,
+  AssociationEvent,
+  EpcisEvent,
+} from './epcis.js'
+export type {
+  ExperimentAssignmentEventData,
+  ExperimentAssignmentEvent,
+  ExperimentMetricEventData,
+  ExperimentMetricEvent,
+  FlagEvaluatedEventData,
+  FlagEvaluatedEvent,
+  ExperimentationEvent,
+} from './experimentation.js'
+export type {
+  SegmentContext,
+  ScreenEventData,
+  ScreenEvent,
+  GroupEventData,
+  GroupEvent,
+  AliasEventData,
+  AliasEvent,
+  SegmentEvent,
+} from './segment.js'
 
 export {
   isCdcEvent,
@@ -25,6 +69,23 @@ export {
   isTrackEvent,
   isIdentifyEvent,
   isAnalyticsEvent,
+  isScreenEvent,
+  isGroupEvent,
+  isAliasEvent,
+  isSegmentEvent,
+  isExperimentAssignmentEvent,
+  isExperimentMetricEvent,
+  isFlagEvaluatedEvent,
+  isExperimentationEvent,
+  isMeterEvent,
+  isStripeEvent,
+  isBillingEvent,
+  isEpcisEvent,
+  isObjectEvent,
+  isAggregationEvent,
+  isTransactionEvent,
+  isTransformationEvent,
+  isAssociationEvent,
   isTailEvent,
   isCustomEvent,
   isBaseEvent,
@@ -39,8 +100,12 @@ import type { LlmObservationEvent, LlmScoreEvent } from './llm.js'
 import type { WebhookEvent } from './webhook.js'
 import type { PageEvent, TrackEvent, IdentifyEvent } from './analytics.js'
 import type { TailEvent } from './tail.js'
-import type { ExperimentEvent, RecordingEvent } from './base.js'
+import type { RecordingEvent } from './base.js'
 import type { CustomEvent } from './custom.js'
+import type { MeterEvent, StripeEvent } from './billing.js'
+import type { ObjectEvent, AggregationEvent, TransactionEvent, TransformationEvent, AssociationEvent } from './epcis.js'
+import type { ExperimentAssignmentEvent, ExperimentMetricEvent, FlagEvaluatedEvent } from './experimentation.js'
+import type { ScreenEvent, GroupEvent, AliasEvent } from './segment.js'
 
 export type Event =
   | CdcEvent
@@ -55,8 +120,20 @@ export type Event =
   | PageEvent
   | TrackEvent
   | IdentifyEvent
+  | ScreenEvent
+  | GroupEvent
+  | AliasEvent
+  | MeterEvent
+  | StripeEvent
+  | ObjectEvent
+  | AggregationEvent
+  | TransactionEvent
+  | TransformationEvent
+  | AssociationEvent
+  | ExperimentAssignmentEvent
+  | ExperimentMetricEvent
+  | FlagEvaluatedEvent
   | TailEvent
-  | ExperimentEvent
   | RecordingEvent
   | CustomEvent
 

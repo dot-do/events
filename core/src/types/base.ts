@@ -14,9 +14,19 @@ export type EventType =
   | 'page'
   | 'track'
   | 'identify'
-  | 'experiment'
+  | 'screen'
+  | 'group'
+  | 'alias'
+  | 'meter'
+  | 'stripe'
+  | 'experiment.assigned'
+  | 'experiment.metric'
+  | 'flag.evaluated'
+  | EpcisEventType
   | 'recording'
   | `custom.${string}`
+
+export type EpcisEventType = 'epcis.object' | 'epcis.aggregation' | 'epcis.transaction' | 'epcis.transformation' | 'epcis.association'
 
 export interface BaseEvent<T extends string = string, D = Record<string, unknown>> {
   id: string
@@ -30,7 +40,5 @@ export interface BaseEvent<T extends string = string, D = Record<string, unknown
   data: D
   meta: Record<string, unknown>
 }
-
-export interface ExperimentEvent extends BaseEvent<'experiment', Record<string, unknown>> {}
 
 export interface RecordingEvent extends BaseEvent<'recording', Record<string, unknown>> {}
