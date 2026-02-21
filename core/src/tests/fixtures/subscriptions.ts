@@ -152,8 +152,8 @@ export const sampleCdcSubscription: TestSubscriptionConfig = {
 export const sampleCollectionInsertSubscription: TestSubscriptionConfig = {
   id: 'sub_insert_abc',
   workerId: 'user-service',
-  pattern: 'collection.insert',
-  patternPrefix: 'collection.insert',
+  pattern: 'collection.created',
+  patternPrefix: 'collection.created',
   rpcMethod: 'onUserCreated',
   maxRetries: 5,
   timeoutMs: 30000,

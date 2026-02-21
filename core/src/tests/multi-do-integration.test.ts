@@ -69,7 +69,7 @@ function createMockR2Bucket() {
 // ============================================================================
 
 interface CDCEvent {
-  type: 'collection.insert' | 'collection.update' | 'collection.delete'
+  type: 'collection.created' | 'collection.updated' | 'collection.deleted'
   ts: string
   collection: string
   docId: string
@@ -120,9 +120,9 @@ describe('EventWriterDO -> R2 -> CDCProcessorDO Flow', () => {
   it('simulates event flow from EventWriter flush to R2', async () => {
     // Simulate EventWriter behavior: batch events and flush to R2
     const eventsToWrite = [
-      { type: 'collection.insert', ts: '2024-01-31T10:00:00Z', collection: 'users', docId: 'user-1', doc: { name: 'Alice' } },
-      { type: 'collection.insert', ts: '2024-01-31T10:00:01Z', collection: 'users', docId: 'user-2', doc: { name: 'Bob' } },
-      { type: 'collection.update', ts: '2024-01-31T10:00:02Z', collection: 'users', docId: 'user-1', doc: { name: 'Alice Smith' }, prev: { name: 'Alice' } },
+      { type: 'collection.created', ts: '2024-01-31T10:00:00Z', collection: 'users', docId: 'user-1', doc: { name: 'Alice' } },
+      { type: 'collection.created', ts: '2024-01-31T10:00:01Z', collection: 'users', docId: 'user-2', doc: { name: 'Bob' } },
+      { type: 'collection.updated', ts: '2024-01-31T10:00:02Z', collection: 'users', docId: 'user-1', doc: { name: 'Alice Smith' }, prev: { name: 'Alice' } },
     ]
 
     // Step 1: EventWriter writes JSONL to R2
@@ -149,8 +149,8 @@ describe('EventWriterDO -> R2 -> CDCProcessorDO Flow', () => {
   it('reads events from R2 and parses JSONL format', async () => {
     // Write events to R2
     const events = [
-      { type: 'collection.insert', docId: 'user-1', doc: { name: 'Alice' } },
-      { type: 'collection.insert', docId: 'user-2', doc: { name: 'Bob' } },
+      { type: 'collection.created', docId: 'user-1', doc: { name: 'Alice' } },
+      { type: 'collection.created', docId: 'user-2', doc: { name: 'Bob' } },
     ]
     const jsonlContent = events.map(e => JSON.stringify(e)).join('\n')
     await mockR2.put('events/batch.jsonl', jsonlContent)
@@ -169,7 +169,7 @@ describe('EventWriterDO -> R2 -> CDCProcessorDO Flow', () => {
 
   it('handles R2 read failure gracefully', async () => {
     // Write initial event to R2
-    await mockR2.put('events/batch.jsonl', '{"type":"collection.insert","docId":"user-1"}')
+    await mockR2.put('events/batch.jsonl', '{"type":"collection.created","docId":"user-1"}')
 
     // Simulate R2 read failure
     mockR2.get = vi.fn().mockResolvedValue(null)
@@ -182,7 +182,7 @@ describe('EventWriterDO -> R2 -> CDCProcessorDO Flow', () => {
 
   it('maintains event ordering in JSONL format', async () => {
     const orderedEvents = Array.from({ length: 100 }, (_, i) => ({
-      type: 'collection.update',
+      type: 'collection.updated',
       ts: `2024-01-31T10:00:${String(i).padStart(2, '0')}Z`,
       docId: 'user-1',
       doc: { seq: i + 1 },
@@ -204,7 +204,7 @@ describe('EventWriterDO -> R2 -> CDCProcessorDO Flow', () => {
   it('handles high-volume event batches', async () => {
     const eventCount = 1000
     const events = Array.from({ length: eventCount }, (_, i) => ({
-      type: 'collection.insert',
+      type: 'collection.created',
       ts: new Date(Date.now() + i).toISOString(),
       collection: 'items',
       docId: `item-${i}`,
@@ -224,8 +224,8 @@ describe('EventWriterDO -> R2 -> CDCProcessorDO Flow', () => {
   it('simulates CDC processing of events from R2', async () => {
     // Write events to R2
     const events = [
-      { type: 'collection.insert', collection: 'users', docId: 'user-1', doc: { name: 'Alice', version: 1 } },
-      { type: 'collection.update', collection: 'users', docId: 'user-1', doc: { name: 'Alice Smith', version: 2 }, prev: { name: 'Alice', version: 1 } },
+      { type: 'collection.created', collection: 'users', docId: 'user-1', doc: { name: 'Alice', version: 1 } },
+      { type: 'collection.updated', collection: 'users', docId: 'user-1', doc: { name: 'Alice Smith', version: 2 }, prev: { name: 'Alice', version: 1 } },
     ]
     await mockR2.put('events/batch.jsonl', events.map(e => JSON.stringify(e)).join('\n'))
 
@@ -527,8 +527,8 @@ describe('End-to-End: Ingest -> CDC -> Subscription Flow', () => {
   it('processes complete event lifecycle from ingest to subscription delivery', async () => {
     // Step 1: Simulate event ingestion (EventWriterDO)
     const ingestedEvents = [
-      createCDCEvent('collection.insert', 'users', 'user-1', { name: 'Alice', email: 'alice@example.com' }),
-      createCDCEvent('collection.insert', 'users', 'user-2', { name: 'Bob', email: 'bob@example.com' }),
+      createCDCEvent('collection.created', 'users', 'user-1', { name: 'Alice', email: 'alice@example.com' }),
+      createCDCEvent('collection.created', 'users', 'user-2', { name: 'Bob', email: 'bob@example.com' }),
     ]
 
     // Write to R2 (simulating EventWriterDO flush)
@@ -548,7 +548,7 @@ describe('End-to-End: Ingest -> CDC -> Subscription Flow', () => {
 
     // Step 3: Subscription fanout
     const subscriptions = [
-      { id: 'sub-user-events', pattern: 'collection.insert', patternPrefix: 'collection.insert', workerId: 'user-service' },
+      { id: 'sub-user-events', pattern: 'collection.created', patternPrefix: 'collection.created', workerId: 'user-service' },
       { id: 'sub-audit', pattern: '**', patternPrefix: '', workerId: 'audit-service' },
     ]
 
@@ -579,9 +579,9 @@ describe('End-to-End: Ingest -> CDC -> Subscription Flow', () => {
   it('tracks bookmarks through the pipeline for PITR', async () => {
     // Events with explicit bookmarks for PITR
     const eventsWithBookmarks = [
-      { ...createCDCEvent('collection.insert', 'users', 'user-1', { name: 'v1' }), bookmark: 'bk-001' },
-      { ...createCDCEvent('collection.update', 'users', 'user-1', { name: 'v2' }, { name: 'v1' }), bookmark: 'bk-002' },
-      { ...createCDCEvent('collection.update', 'users', 'user-1', { name: 'v3' }, { name: 'v2' }), bookmark: 'bk-003' },
+      { ...createCDCEvent('collection.created', 'users', 'user-1', { name: 'v1' }), bookmark: 'bk-001' },
+      { ...createCDCEvent('collection.updated', 'users', 'user-1', { name: 'v2' }, { name: 'v1' }), bookmark: 'bk-002' },
+      { ...createCDCEvent('collection.updated', 'users', 'user-1', { name: 'v3' }, { name: 'v2' }), bookmark: 'bk-003' },
     ]
 
     // Simulate CDC processing with bookmark tracking
@@ -614,11 +614,11 @@ describe('End-to-End: Ingest -> CDC -> Subscription Flow', () => {
 
   it('handles concurrent events across multiple collections', async () => {
     const multiCollectionEvents: CDCEvent[] = [
-      createCDCEvent('collection.insert', 'users', 'user-1', { name: 'Alice' }, undefined, '2024-01-31T10:00:00Z'),
-      createCDCEvent('collection.insert', 'orders', 'order-1', { userId: 'user-1', amount: 100 }, undefined, '2024-01-31T10:00:01Z'),
-      createCDCEvent('collection.insert', 'products', 'prod-1', { name: 'Widget', price: 50 }, undefined, '2024-01-31T10:00:02Z'),
-      createCDCEvent('collection.update', 'users', 'user-1', { name: 'Alice Smith' }, { name: 'Alice' }, '2024-01-31T10:00:03Z'),
-      createCDCEvent('collection.update', 'orders', 'order-1', { userId: 'user-1', amount: 150, discount: 10 }, { userId: 'user-1', amount: 100 }, '2024-01-31T10:00:04Z'),
+      createCDCEvent('collection.created', 'users', 'user-1', { name: 'Alice' }, undefined, '2024-01-31T10:00:00Z'),
+      createCDCEvent('collection.created', 'orders', 'order-1', { userId: 'user-1', amount: 100 }, undefined, '2024-01-31T10:00:01Z'),
+      createCDCEvent('collection.created', 'products', 'prod-1', { name: 'Widget', price: 50 }, undefined, '2024-01-31T10:00:02Z'),
+      createCDCEvent('collection.updated', 'users', 'user-1', { name: 'Alice Smith' }, { name: 'Alice' }, '2024-01-31T10:00:03Z'),
+      createCDCEvent('collection.updated', 'orders', 'order-1', { userId: 'user-1', amount: 150, discount: 10 }, { userId: 'user-1', amount: 100 }, '2024-01-31T10:00:04Z'),
     ]
 
     // Simulate CDC processing per collection
@@ -651,27 +651,27 @@ describe('End-to-End: Ingest -> CDC -> Subscription Flow', () => {
 
   it('propagates events to subscriptions based on event type patterns', () => {
     const subscriptions = [
-      { id: 'sub-all-inserts', pattern: 'collection.insert', patternPrefix: 'collection.insert' },
-      { id: 'sub-all-updates', pattern: 'collection.update', patternPrefix: 'collection.update' },
-      { id: 'sub-all-deletes', pattern: 'collection.delete', patternPrefix: 'collection.delete' },
+      { id: 'sub-all-inserts', pattern: 'collection.created', patternPrefix: 'collection.created' },
+      { id: 'sub-all-updates', pattern: 'collection.updated', patternPrefix: 'collection.updated' },
+      { id: 'sub-all-deletes', pattern: 'collection.deleted', patternPrefix: 'collection.deleted' },
       { id: 'sub-all', pattern: 'collection.*', patternPrefix: 'collection' },
     ]
 
     // Test insert event matching
-    const insertMatches = findMatchingSubscriptions('collection.insert', subscriptions)
+    const insertMatches = findMatchingSubscriptions('collection.created', subscriptions)
     expect(insertMatches.map(m => m.id)).toContain('sub-all-inserts')
     expect(insertMatches.map(m => m.id)).toContain('sub-all')
     expect(insertMatches.map(m => m.id)).not.toContain('sub-all-updates')
     expect(insertMatches.map(m => m.id)).not.toContain('sub-all-deletes')
 
     // Test update event matching
-    const updateMatches = findMatchingSubscriptions('collection.update', subscriptions)
+    const updateMatches = findMatchingSubscriptions('collection.updated', subscriptions)
     expect(updateMatches.map(m => m.id)).toContain('sub-all-updates')
     expect(updateMatches.map(m => m.id)).toContain('sub-all')
     expect(updateMatches.map(m => m.id)).not.toContain('sub-all-inserts')
 
     // Test delete event matching
-    const deleteMatches = findMatchingSubscriptions('collection.delete', subscriptions)
+    const deleteMatches = findMatchingSubscriptions('collection.deleted', subscriptions)
     expect(deleteMatches.map(m => m.id)).toContain('sub-all-deletes')
     expect(deleteMatches.map(m => m.id)).toContain('sub-all')
   })
@@ -886,8 +886,8 @@ describe('Cross-DO Data Consistency', () => {
   it('maintains consistency between event storage and CDC state', async () => {
     // Write events to R2
     const events = [
-      { type: 'collection.insert', collection: 'users', docId: 'user-1', doc: { name: 'Alice' } },
-      { type: 'collection.insert', collection: 'users', docId: 'user-2', doc: { name: 'Bob' } },
+      { type: 'collection.created', collection: 'users', docId: 'user-1', doc: { name: 'Alice' } },
+      { type: 'collection.created', collection: 'users', docId: 'user-2', doc: { name: 'Bob' } },
     ]
 
     await mockR2.put('events/batch.jsonl', events.map(e => JSON.stringify(e)).join('\n'))
@@ -914,7 +914,7 @@ describe('Cross-DO Data Consistency', () => {
   it('ensures event ordering is preserved across DO boundaries', async () => {
     // Events with explicit timestamps for ordering
     const orderedEvents = Array.from({ length: 100 }, (_, i) => ({
-      type: 'collection.update',
+      type: 'collection.updated',
       ts: `2024-01-31T10:00:${String(i).padStart(2, '0')}.000Z`,
       docId: 'counter-1',
       doc: { value: i + 1 },
@@ -923,7 +923,7 @@ describe('Cross-DO Data Consistency', () => {
 
     // Add initial insert
     orderedEvents.unshift({
-      type: 'collection.insert',
+      type: 'collection.created',
       ts: '2024-01-31T09:59:59.000Z',
       docId: 'counter-1',
       doc: { value: 0 },
@@ -956,10 +956,10 @@ describe('Cross-DO Data Consistency', () => {
     // Simulate concurrent updates (in practice, DO serialization prevents this)
     // But we test that last-write-wins semantics are maintained
     const concurrentEvents = [
-      { type: 'collection.insert', docId: 'doc-1', doc: { value: 'initial' }, ts: '2024-01-31T10:00:00Z' },
-      { type: 'collection.update', docId: 'doc-1', doc: { value: 'update-a' }, ts: '2024-01-31T10:00:01Z' },
-      { type: 'collection.update', docId: 'doc-1', doc: { value: 'update-b' }, ts: '2024-01-31T10:00:01Z' }, // Same timestamp
-      { type: 'collection.update', docId: 'doc-1', doc: { value: 'final' }, ts: '2024-01-31T10:00:02Z' },
+      { type: 'collection.created', docId: 'doc-1', doc: { value: 'initial' }, ts: '2024-01-31T10:00:00Z' },
+      { type: 'collection.updated', docId: 'doc-1', doc: { value: 'update-a' }, ts: '2024-01-31T10:00:01Z' },
+      { type: 'collection.updated', docId: 'doc-1', doc: { value: 'update-b' }, ts: '2024-01-31T10:00:01Z' }, // Same timestamp
+      { type: 'collection.updated', docId: 'doc-1', doc: { value: 'final' }, ts: '2024-01-31T10:00:02Z' },
     ]
 
     // Process events in order - last write wins
@@ -1005,9 +1005,9 @@ describe('Cross-DO Data Consistency', () => {
   it('maintains referential integrity across collections', () => {
     // Simulate related entities
     const events = [
-      { type: 'collection.insert', collection: 'users', docId: 'user-1', doc: { name: 'Alice' } },
-      { type: 'collection.insert', collection: 'orders', docId: 'order-1', doc: { userId: 'user-1', items: ['item-1'] } },
-      { type: 'collection.insert', collection: 'orders', docId: 'order-2', doc: { userId: 'user-1', items: ['item-2', 'item-3'] } },
+      { type: 'collection.created', collection: 'users', docId: 'user-1', doc: { name: 'Alice' } },
+      { type: 'collection.created', collection: 'orders', docId: 'order-1', doc: { userId: 'user-1', items: ['item-1'] } },
+      { type: 'collection.created', collection: 'orders', docId: 'order-2', doc: { userId: 'user-1', items: ['item-2', 'item-3'] } },
     ]
 
     // Build state per collection

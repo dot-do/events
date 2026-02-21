@@ -56,7 +56,7 @@ describe('CDCCollection', () => {
       cdcCollection.put('user-1', { name: 'Alice' })
 
       expect(mockEmitter.emitChange).toHaveBeenCalledWith(
-        'insert',
+        'created',
         'users',
         'user-1',
         { name: 'Alice' }
@@ -84,7 +84,7 @@ describe('CDCCollection', () => {
       cdcCollection.put('user-1', { name: 'Bob' })
 
       expect(mockEmitter.emitChange).toHaveBeenCalledWith(
-        'update',
+        'updated',
         'users',
         'user-1',
         { name: 'Bob' },
@@ -98,7 +98,7 @@ describe('CDCCollection', () => {
       cdcCollection.put('user-1', { name: 'Alice', active: false })
 
       const [type, collection, docId, doc, prev] = mockEmitter.emitChange.mock.calls[0]
-      expect(type).toBe('update')
+      expect(type).toBe('updated')
       expect(prev).toEqual({ name: 'Alice', active: true })
     })
 
@@ -118,7 +118,7 @@ describe('CDCCollection', () => {
       cdcCollection.delete('user-1')
 
       expect(mockEmitter.emitChange).toHaveBeenCalledWith(
-        'delete',
+        'deleted',
         'users',
         'user-1',
         undefined,
@@ -297,8 +297,8 @@ describe('CDCCollection', () => {
       ])
 
       const calls = mockEmitter.emitChange.mock.calls
-      const updateCall = calls.find((c: unknown[]) => c[0] === 'update')
-      const insertCall = calls.find((c: unknown[]) => c[0] === 'insert')
+      const updateCall = calls.find((c: unknown[]) => c[0] === 'updated')
+      const insertCall = calls.find((c: unknown[]) => c[0] === 'created')
 
       expect(updateCall?.[2]).toBe('user-1')
       expect(insertCall?.[2]).toBe('user-2')
@@ -353,7 +353,7 @@ describe('CDCCollection', () => {
       cdcCollection.put('empty-doc', {} as any)
 
       expect(mockEmitter.emitChange).toHaveBeenCalledWith(
-        'insert',
+        'created',
         'users',
         'empty-doc',
         {}
@@ -388,7 +388,7 @@ describe('CDCCollection', () => {
       expect(mockEmitter.emitChange).toHaveBeenCalledTimes(4)
 
       const types = mockEmitter.emitChange.mock.calls.map((call: unknown[]) => call[0])
-      expect(types).toEqual(['insert', 'update', 'delete', 'insert'])
+      expect(types).toEqual(['created', 'updated', 'deleted', 'created'])
     })
 
     it('should handle special characters in document id', () => {
@@ -397,7 +397,7 @@ describe('CDCCollection', () => {
       cdcCollection.put(specialId, { name: 'Special' })
 
       expect(mockEmitter.emitChange).toHaveBeenCalledWith(
-        'insert',
+        'created',
         'users',
         specialId,
         { name: 'Special' }
@@ -438,7 +438,7 @@ describe('CDCCollection', () => {
 
       // Each delete should reference the correct collection
       for (const call of mockEmitter.emitChange.mock.calls) {
-        expect(call[0]).toBe('delete')
+        expect(call[0]).toBe('deleted')
         expect(call[1]).toBe('users')
       }
     })

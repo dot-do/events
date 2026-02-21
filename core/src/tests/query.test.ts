@@ -140,9 +140,9 @@ describe('buildQuery', () => {
     it('adds multiple eventTypes filter', () => {
       const sql = buildQuery({
         bucket: 'test',
-        eventTypes: ['rpc.call', 'collection.insert', 'collection.update'],
+        eventTypes: ['rpc.call', 'collection.created', 'collection.updated'],
       })
-      expect(sql).toContain("type IN ('rpc.call', 'collection.insert', 'collection.update')")
+      expect(sql).toContain("type IN ('rpc.call', 'collection.created', 'collection.updated')")
     })
 
     it('adds date range filters to WHERE clause', () => {
@@ -270,7 +270,7 @@ describe('buildHistoryQuery', () => {
     })
     expect(sql).toContain("docId = 'user-123'")
     expect(sql).toContain("collection = 'users'")
-    expect(sql).toContain("type IN ('collection.insert', 'collection.update', 'collection.delete')")
+    expect(sql).toContain("type IN ('collection.created', 'collection.updated', 'collection.deleted')")
   })
 
   it('orders by ts ASC for chronological history', () => {
@@ -719,7 +719,7 @@ describe('edge cases', () => {
         doId: 'do-12345',
         doClass: 'ChatRoom',
         colo: 'SFO',
-        eventTypes: ['rpc.call', 'collection.insert'],
+        eventTypes: ['rpc.call', 'collection.created'],
         collection: 'messages',
         limit: 500,
         orderBy: 'ts DESC',
@@ -729,7 +729,7 @@ describe('edge cases', () => {
       expect(sql).toContain("\"do\".id = 'do-12345'")
       expect(sql).toContain("\"do\".class = 'ChatRoom'")
       expect(sql).toContain("\"do\".colo = 'SFO'")
-      expect(sql).toContain("type IN ('rpc.call', 'collection.insert')")
+      expect(sql).toContain("type IN ('rpc.call', 'collection.created')")
       expect(sql).toContain("collection = 'messages'")
       expect(sql).toContain(`ts >= '${start.toISOString()}'`)
       expect(sql).toContain(`ts <= '${end.toISOString()}'`)

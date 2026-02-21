@@ -187,7 +187,7 @@ export function buildHistoryQuery(options: {
   const base = buildQuery({
     bucket: options.bucket,
     dateRange: options.dateRange,
-    eventTypes: ['collection.insert', 'collection.update', 'collection.delete'],
+    eventTypes: ['collection.created', 'collection.updated', 'collection.deleted'],
     collection: options.collection,
     orderBy: 'ts ASC',
   })

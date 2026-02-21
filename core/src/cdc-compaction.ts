@@ -6,7 +6,7 @@
  * Compaction process:
  * 1. Read current data.parquet (if exists)
  * 2. Read all pending delta files in sequence order
- * 3. Apply deltas to current state (insert/update/delete)
+ * 3. Apply deltas to current state (created/updated/deleted)
  * 4. Write new data.parquet sorted by primary key
  * 5. Optionally archive or delete processed deltas
  * 6. Update collection manifest with stats
@@ -31,11 +31,11 @@ import {
  * A single CDC delta record representing a change operation (compaction-specific)
  */
 export interface CompactionDeltaRecord {
-  /** Operation type: insert, update, or delete */
-  op: 'insert' | 'update' | 'delete'
+  /** Operation type: created, updated, or deleted */
+  op: 'created' | 'updated' | 'deleted'
   /** Document ID (primary key) */
   id: string
-  /** Document data (required for insert/update, undefined for delete) */
+  /** Document data (required for created/updated, undefined for deleted) */
   doc?: Record<string, unknown> | undefined
   /** Timestamp of the change */
   ts: number
@@ -341,8 +341,8 @@ export async function compactCollection(
  * ```typescript
  * const state = new Map([['user-1', { name: 'Alice' }]])
  * const deltas: CompactionDeltaRecord[] = [
- *   { op: 'update', id: 'user-1', doc: { name: 'Alice Updated' }, ts: 123, seq: 1 },
- *   { op: 'insert', id: 'user-2', doc: { name: 'Bob' }, ts: 124, seq: 2 }
+ *   { op: 'updated', id: 'user-1', doc: { name: 'Alice Updated' }, ts: 123, seq: 1 },
+ *   { op: 'created', id: 'user-2', doc: { name: 'Bob' }, ts: 124, seq: 2 }
  * ]
  * const newState = applyDeltasToState(state, deltas)
  * // newState has user-1 updated and user-2 added
@@ -357,21 +357,21 @@ export function applyDeltasToState(
 
   for (const delta of deltas) {
     switch (delta.op) {
-      case 'insert':
+      case 'created':
         // Insert requires a doc; skip if missing
         if (delta.doc) {
           newState.set(delta.id, delta.doc)
         }
         break
 
-      case 'update':
+      case 'updated':
         // Update acts as upsert - insert if not exists
         if (delta.doc) {
           newState.set(delta.id, delta.doc)
         }
         break
 
-      case 'delete':
+      case 'deleted':
         // Delete removes the record (no-op if not exists)
         newState.delete(delta.id)
         break
@@ -475,13 +475,13 @@ async function processChunk(
       // Apply deltas to this chunk's state
       for (const delta of deltas) {
         switch (delta.op) {
-          case 'insert':
-          case 'update':
+          case 'created':
+          case 'updated':
             if (delta.doc) {
               state.set(delta.id, delta.doc)
             }
             break
-          case 'delete':
+          case 'deleted':
             state.set(delta.id, { __deleted__: true })
             break
         }

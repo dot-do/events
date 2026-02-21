@@ -78,7 +78,7 @@ export const sampleRpcCallEventNoNamespace: RpcCallEvent = {
 
 /** Sample collection insert event */
 export const sampleCollectionInsertEvent: CollectionChangeEvent = {
-  type: 'collection.insert',
+  type: 'collection.created',
   ts: defaultTimestamp,
   do: { ...defaultDoIdentity },
   collection: 'users',
@@ -89,7 +89,7 @@ export const sampleCollectionInsertEvent: CollectionChangeEvent = {
 
 /** Sample collection update event */
 export const sampleCollectionUpdateEvent: CollectionChangeEvent = {
-  type: 'collection.update',
+  type: 'collection.updated',
   ts: defaultTimestamp,
   do: { ...defaultDoIdentity },
   collection: 'users',
@@ -101,7 +101,7 @@ export const sampleCollectionUpdateEvent: CollectionChangeEvent = {
 
 /** Sample collection delete event */
 export const sampleCollectionDeleteEvent: CollectionChangeEvent = {
-  type: 'collection.delete',
+  type: 'collection.deleted',
   ts: defaultTimestamp,
   do: { ...defaultDoIdentity },
   collection: 'users',
@@ -112,7 +112,7 @@ export const sampleCollectionDeleteEvent: CollectionChangeEvent = {
 
 /** Sample collection update event without previous value */
 export const sampleCollectionUpdateEventNoPrev: CollectionChangeEvent = {
-  type: 'collection.update',
+  type: 'collection.updated',
   ts: defaultTimestamp,
   do: { ...defaultDoIdentity },
   collection: 'orders',
@@ -245,7 +245,7 @@ export function createCollectionInsertEvent(
   overrides: Partial<CollectionChangeEvent> = {}
 ): CollectionChangeEvent {
   return {
-    type: 'collection.insert',
+    type: 'collection.created',
     ts: new Date().toISOString(),
     do: { ...defaultDoIdentity },
     collection: 'test_collection',
@@ -263,7 +263,7 @@ export function createCollectionUpdateEvent(
   overrides: Partial<CollectionChangeEvent> = {}
 ): CollectionChangeEvent {
   return {
-    type: 'collection.update',
+    type: 'collection.updated',
     ts: new Date().toISOString(),
     do: { ...defaultDoIdentity },
     collection: 'test_collection',
@@ -282,7 +282,7 @@ export function createCollectionDeleteEvent(
   overrides: Partial<CollectionChangeEvent> = {}
 ): CollectionChangeEvent {
   return {
-    type: 'collection.delete',
+    type: 'collection.deleted',
     ts: new Date().toISOString(),
     do: { ...defaultDoIdentity },
     collection: 'test_collection',
@@ -376,7 +376,7 @@ export function createEventBatch(count: number = 10): DurableEvent[] {
  */
 export function createCdcEventBatch(
   collection: string,
-  operations: Array<{ op: 'insert' | 'update' | 'delete'; docId: string; doc?: Record<string, unknown>; prev?: Record<string, unknown> }>
+  operations: Array<{ op: 'created' | 'updated' | 'deleted'; docId: string; doc?: Record<string, unknown>; prev?: Record<string, unknown> }>
 ): CollectionChangeEvent[] {
   return operations.map((op, i) => {
     const base = {
@@ -388,23 +388,23 @@ export function createCdcEventBatch(
     }
 
     switch (op.op) {
-      case 'insert':
+      case 'created':
         return {
           ...base,
-          type: 'collection.insert' as const,
+          type: 'collection.created' as const,
           doc: op.doc ?? { id: op.docId },
         }
-      case 'update':
+      case 'updated':
         return {
           ...base,
-          type: 'collection.update' as const,
+          type: 'collection.updated' as const,
           doc: op.doc ?? { id: op.docId, updated: true },
           prev: op.prev ?? { id: op.docId },
         }
-      case 'delete':
+      case 'deleted':
         return {
           ...base,
-          type: 'collection.delete' as const,
+          type: 'collection.deleted' as const,
           prev: op.prev ?? { id: op.docId },
         }
     }

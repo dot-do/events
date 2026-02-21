@@ -588,9 +588,9 @@ export async function reconstructState(
 
   // Apply deltas in order
   for (const delta of allDeltas) {
-    if (delta.op === 'insert' || delta.op === 'update') {
+    if (delta.op === 'created' || delta.op === 'updated') {
       state.set(delta.id, delta.doc)
-    } else if (delta.op === 'delete') {
+    } else if (delta.op === 'deleted') {
       state.delete(delta.id)
     }
   }

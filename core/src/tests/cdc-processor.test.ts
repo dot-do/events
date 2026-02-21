@@ -474,7 +474,7 @@ function createMockR2Bucket() {
  */
 function createInsertEvent(collection: string, docId: string, doc: Record<string, unknown>, ts?: string): CDCEvent {
   return {
-    type: 'collection.insert',
+    type: 'collection.created',
     ts: ts ?? new Date().toISOString(),
     collection,
     docId,
@@ -495,7 +495,7 @@ function createUpdateEvent(
   ts?: string
 ): CDCEvent {
   return {
-    type: 'collection.update',
+    type: 'collection.updated',
     ts: ts ?? new Date().toISOString(),
     collection,
     docId,
@@ -516,7 +516,7 @@ function createDeleteEvent(
   ts?: string
 ): CDCEvent {
   return {
-    type: 'collection.delete',
+    type: 'collection.deleted',
     ts: ts ?? new Date().toISOString(),
     collection,
     docId,

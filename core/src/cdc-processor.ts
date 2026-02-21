@@ -1,7 +1,7 @@
 /**
  * CDCProcessorDO - Durable Object for CDC Event Processing
  *
- * Processes CDC events (insert/update/delete), maintains state in SQLite,
+ * Processes CDC events (created/updated/deleted), maintains state in SQLite,
  * and flushes deltas to R2 as Parquet files with debounced flushing.
  */
 
@@ -104,7 +104,7 @@ interface PendingDelta {
   id: number
   collection: string
   docId: string
-  op: 'insert' | 'update' | 'delete'
+  op: 'created' | 'updated' | 'deleted'
   data: Record<string, unknown> | null
   prev: Record<string, unknown> | null
   ts: string
@@ -338,11 +338,11 @@ export class CDCProcessorDO extends DurableObject<Env> {
     let newVersion = 1
     let deleted = false
 
-    if (op === 'insert') {
+    if (op === 'created') {
       newData = docFields
       newVersion = existing ? existing.version + 1 : 1
       deleted = false
-    } else if (op === 'update') {
+    } else if (op === 'updated') {
       newData = docFields
       prevData = existing ? existing.doc : (prev ?? null)
       newVersion = existing ? existing.version + 1 : 1
@@ -385,12 +385,12 @@ export class CDCProcessorDO extends DurableObject<Env> {
 
   /**
    * Extract operation type from the event name.
-   * Format: `{collection}.{op}` (e.g. 'contacts.insert')
+   * Format: `{collection}.{op}` (e.g. 'contacts.created')
    */
-  private extractOp(eventName: string): 'insert' | 'update' | 'delete' {
+  private extractOp(eventName: string): 'created' | 'updated' | 'deleted' {
     const dot = eventName.lastIndexOf('.')
     const op = dot >= 0 ? eventName.slice(dot + 1) : eventName
-    if (op === 'insert' || op === 'update' || op === 'delete') {
+    if (op === 'created' || op === 'updated' || op === 'deleted') {
       return op
     }
     throw new Error(`Unknown CDC operation in event name: ${eventName}`)
@@ -479,7 +479,7 @@ export class CDCProcessorDO extends DurableObject<Env> {
       id: getNumber(row as SqlRow, 'id'),
       collection: getString(row as SqlRow, 'collection'),
       docId: getString(row as SqlRow, 'doc_id'),
-      op: getString(row as SqlRow, 'op') as 'insert' | 'update' | 'delete',
+      op: getString(row as SqlRow, 'op') as 'created' | 'updated' | 'deleted',
       data: getOptionalJson<Record<string, unknown>>(row as SqlRow, 'data'),
       prev: getOptionalJson<Record<string, unknown>>(row as SqlRow, 'prev'),
       ts: getString(row as SqlRow, 'ts'),
@@ -607,9 +607,9 @@ export class CDCProcessorDO extends DurableObject<Env> {
     // Update stats
     for (const delta of deltas) {
       manifest.stats.totalEvents++
-      if (delta.op === 'insert') manifest.stats.insertCount++
-      else if (delta.op === 'update') manifest.stats.updateCount++
-      else if (delta.op === 'delete') manifest.stats.deleteCount++
+      if (delta.op === 'created') manifest.stats.insertCount++
+      else if (delta.op === 'updated') manifest.stats.updateCount++
+      else if (delta.op === 'deleted') manifest.stats.deleteCount++
     }
 
     // Calculate totalDocs (non-deleted documents) from SQLite

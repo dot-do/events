@@ -202,7 +202,7 @@ export class EventEmitter {
    * Automatically captures the SQLite bookmark for PITR (point-in-time recovery).
    * Only emits if the `cdc` option is enabled.
    */
-  emitChange(type: 'insert' | 'update' | 'delete', collection: string, docId: string, doc?: Record<string, unknown>, prev?: Record<string, unknown>): void {
+  emitChange(type: 'created' | 'updated' | 'deleted', collection: string, docId: string, doc?: Record<string, unknown>, prev?: Record<string, unknown>): void {
     if (!this.options.cdc) return
 
     this.getBookmarkAndEmit(type, collection, docId, doc, prev).catch((error) => {
@@ -211,7 +211,7 @@ export class EventEmitter {
   }
 
   private async getBookmarkAndEmit(
-    type: 'insert' | 'update' | 'delete',
+    type: 'created' | 'updated' | 'deleted',
     collection: string,
     docId: string,
     doc?: Record<string, unknown>,

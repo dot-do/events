@@ -4,7 +4,7 @@
  * Provides functions for creating, writing, and reading delta files for CDC.
  * Delta files store incremental changes in Parquet format with schema:
  * - pk: STRING (primary key)
- * - op: STRING (insert/update/delete)
+ * - op: STRING (created/updated/deleted)
  * - data: STRING (JSON-encoded VARIANT - new document state, null for delete)
  * - prev: STRING (JSON-encoded VARIANT - previous state, optional)
  * - ts: STRING (ISO 8601 timestamp)
@@ -27,8 +27,8 @@ import type { CdcEvent } from './types/cdc.js'
  */
 export type CDCEvent = CdcEvent
 
-/** Operation type extracted from the event name */
-export type CDCOp = 'insert' | 'update' | 'delete'
+/** Operation type extracted from the event name (past tense — action=create, event=created) */
+export type CDCOp = 'created' | 'updated' | 'deleted'
 
 /**
  * Delta record for Parquet storage
@@ -67,12 +67,12 @@ function parseRecordJson(str: string, fieldName: string): Record<string, unknown
 
 /**
  * Extracts operation type from the CDC event name.
- * Expected format: `{collection}.{op}` (e.g. 'contacts.insert', 'users.delete')
+ * Expected format: `{collection}.{op}` (e.g. 'contacts.created', 'users.deleted')
  */
 export function extractOp(eventName: string): CDCOp {
   const dot = eventName.lastIndexOf('.')
   const op = dot >= 0 ? eventName.slice(dot + 1) : eventName
-  if (op === 'insert' || op === 'update' || op === 'delete') {
+  if (op === 'created' || op === 'updated' || op === 'deleted') {
     return op
   }
   throw new Error(`Unknown CDC operation in event name: ${eventName}`)

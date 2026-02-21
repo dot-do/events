@@ -552,7 +552,7 @@ describe('integration scenarios', () => {
   it('handles CDC event row', () => {
     const row: SqlRow = {
       id: 'evt-123',
-      type: 'collection.insert',
+      type: 'collection.created',
       collection: 'users',
       doc_id: 'user-456',
       ts: 1704067200000,
@@ -562,7 +562,7 @@ describe('integration scenarios', () => {
     }
 
     expect(getString(row, 'id')).toBe('evt-123')
-    expect(getString(row, 'type')).toBe('collection.insert')
+    expect(getString(row, 'type')).toBe('collection.created')
     expect(getString(row, 'collection')).toBe('users')
     expect(getString(row, 'doc_id')).toBe('user-456')
     expect(getNumber(row, 'ts')).toBe(1704067200000)
@@ -1078,7 +1078,7 @@ describe('integration with validated JSON', () => {
 
     const row: SqlRow = {
       id: 'evt-123',
-      type: 'collection.insert',
+      type: 'collection.created',
       doc: '{"name":"Alice","email":"alice@test.com"}',
       prev: null,
     }

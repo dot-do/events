@@ -70,7 +70,7 @@ function createTestParquet(
 function createDeltaParquet(
   records: Array<{
     id: string
-    op: 'insert' | 'update' | 'delete'
+    op: 'created' | 'updated' | 'deleted'
     ts: number
     doc?: Record<string, unknown>
   }>
@@ -489,9 +489,9 @@ describe('CDC Snapshots', () => {
 
       // Deltas after snapshot
       const deltaBuffer = createDeltaParquet([
-        { id: 'user-1', op: 'update', ts: 2000, doc: { id: 'user-1', name: 'Alice Updated' } },
-        { id: 'user-3', op: 'insert', ts: 2500, doc: { id: 'user-3', name: 'Charlie' } },
-        { id: 'user-2', op: 'delete', ts: 3000 },
+        { id: 'user-1', op: 'updated', ts: 2000, doc: { id: 'user-1', name: 'Alice Updated' } },
+        { id: 'user-3', op: 'created', ts: 2500, doc: { id: 'user-3', name: 'Charlie' } },
+        { id: 'user-2', op: 'deleted', ts: 3000 },
       ])
       mockBucket.files.set('ns/coll/deltas/2024-01-16.parquet', deltaBuffer)
 
@@ -524,7 +524,7 @@ describe('CDC Snapshots', () => {
 
       // Delta after Jan 20
       const deltaBuffer = createDeltaParquet([
-        { id: 'user-3', op: 'insert', ts: 3000, doc: { id: 'user-3', name: 'Charlie' } },
+        { id: 'user-3', op: 'created', ts: 3000, doc: { id: 'user-3', name: 'Charlie' } },
       ])
       mockBucket.files.set('ns/coll/deltas/2024-01-21.parquet', deltaBuffer)
 
@@ -544,10 +544,10 @@ describe('CDC Snapshots', () => {
 
       // Multiple delta files
       const delta1 = createDeltaParquet([
-        { id: 'user-2', op: 'insert', ts: 2000, doc: { id: 'user-2', name: 'Bob' } },
+        { id: 'user-2', op: 'created', ts: 2000, doc: { id: 'user-2', name: 'Bob' } },
       ])
       const delta2 = createDeltaParquet([
-        { id: 'user-1', op: 'update', ts: 3000, doc: { id: 'user-1', name: 'Alice Updated' } },
+        { id: 'user-1', op: 'updated', ts: 3000, doc: { id: 'user-1', name: 'Alice Updated' } },
       ])
 
       mockBucket.files.set('ns/coll/deltas/2024-01-15.parquet', delta1)
@@ -575,9 +575,9 @@ describe('CDC Snapshots', () => {
 
       // Multiple updates to same record
       const deltaBuffer = createDeltaParquet([
-        { id: 'user-1', op: 'update', ts: 2000, doc: { id: 'user-1', name: 'Alice V2' } },
-        { id: 'user-1', op: 'update', ts: 3000, doc: { id: 'user-1', name: 'Alice V3' } },
-        { id: 'user-1', op: 'update', ts: 4000, doc: { id: 'user-1', name: 'Alice V4' } },
+        { id: 'user-1', op: 'updated', ts: 2000, doc: { id: 'user-1', name: 'Alice V2' } },
+        { id: 'user-1', op: 'updated', ts: 3000, doc: { id: 'user-1', name: 'Alice V3' } },
+        { id: 'user-1', op: 'updated', ts: 4000, doc: { id: 'user-1', name: 'Alice V4' } },
       ])
       mockBucket.files.set('ns/coll/deltas/2024-01-16.parquet', deltaBuffer)
 

@@ -127,7 +127,7 @@ function createMockEnv(): MockEnv {
  */
 function createCDCEvent(overrides: Partial<CollectionChangeEvent> = {}): CollectionChangeEvent {
   return {
-    type: 'collection.insert',
+    type: 'collection.created',
     ts: new Date().toISOString(),
     do: {
       id: 'test-do-id',
@@ -344,7 +344,7 @@ describe('Queue Consumer', () => {
 
     it('uses default namespace when DO identity is missing', async () => {
       const cdcEvent: DurableEvent = {
-        type: 'collection.insert',
+        type: 'collection.created',
         ts: new Date().toISOString(),
         do: { id: 'test-id' },
         collection: 'items',
@@ -361,14 +361,14 @@ describe('Queue Consumer', () => {
     })
 
     it('handles all CDC event types', async () => {
-      const insertEvent = createCDCEvent({ type: 'collection.insert', docId: 'doc-1' })
+      const insertEvent = createCDCEvent({ type: 'collection.created', docId: 'doc-1' })
       const updateEvent = createCDCEvent({
-        type: 'collection.update',
+        type: 'collection.updated',
         docId: 'doc-2',
         prev: { name: 'Old' },
       })
       const deleteEvent = createCDCEvent({
-        type: 'collection.delete',
+        type: 'collection.deleted',
         docId: 'doc-3',
         doc: undefined,
         prev: { name: 'Deleted' },
@@ -754,7 +754,7 @@ describe('Queue Consumer Integration Logic', () => {
     it('extracts correct shard key from event types', () => {
       const testCases = [
         { type: 'rpc.call', expectedShard: 'rpc' },
-        { type: 'collection.insert', expectedShard: 'collection' },
+        { type: 'collection.created', expectedShard: 'collection' },
         { type: 'ws.connect', expectedShard: 'ws' },
         { type: 'do.alarm', expectedShard: 'do' },
         { type: 'webhook.github.push', expectedShard: 'webhook' },
@@ -806,9 +806,9 @@ describe('Queue Consumer Integration Logic', () => {
   describe('CDC Event Identification', () => {
     it('correctly identifies CDC events by type prefix', () => {
       const cdcTypes = [
-        'collection.insert',
-        'collection.update',
-        'collection.delete',
+        'collection.created',
+        'collection.updated',
+        'collection.deleted',
       ]
 
       const nonCdcTypes = [

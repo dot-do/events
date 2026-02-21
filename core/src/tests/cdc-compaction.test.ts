@@ -6,7 +6,7 @@
  * CDC compaction merges delta files into the main data.parquet file:
  * 1. Read current data.parquet (if exists)
  * 2. Read all pending delta files
- * 3. Apply deltas to current state (insert/update/delete)
+ * 3. Apply deltas to current state (created/updated/deleted)
  * 4. Write new data.parquet
  * 5. Archive or delete processed deltas
  */
@@ -87,7 +87,7 @@ function createMockR2Bucket(initialObjects: Map<string, MockR2ObjectBody> = new 
  * Creates a delta record for testing
  */
 function createDelta(
-  op: 'insert' | 'update' | 'delete',
+  op: 'created' | 'updated' | 'deleted',
   id: string,
   doc?: Record<string, unknown>,
   seq?: number
@@ -133,8 +133,8 @@ describe('CDC Compaction', () => {
 
       // Add delta files with inserts
       const delta1 = deltasToParquet([
-        createDelta('insert', 'user-1', { name: 'Alice', age: 30 }, 1),
-        createDelta('insert', 'user-2', { name: 'Bob', age: 25 }, 2),
+        createDelta('created', 'user-1', { name: 'Alice', age: 30 }, 1),
+        createDelta('created', 'user-2', { name: 'Bob', age: 25 }, 2),
       ])
       await bucket.put('ns/users/deltas/000001.parquet', delta1)
 
@@ -169,9 +169,9 @@ describe('CDC Compaction', () => {
 
       // Add deltas in non-sorted order
       const deltas = deltasToParquet([
-        createDelta('insert', 'user-c', { name: 'Charlie' }, 1),
-        createDelta('insert', 'user-a', { name: 'Alice' }, 2),
-        createDelta('insert', 'user-b', { name: 'Bob' }, 3),
+        createDelta('created', 'user-c', { name: 'Charlie' }, 1),
+        createDelta('created', 'user-a', { name: 'Alice' }, 2),
+        createDelta('created', 'user-b', { name: 'Bob' }, 3),
       ])
       await bucket.put('ns/users/deltas/000001.parquet', deltas)
 
@@ -197,7 +197,7 @@ describe('CDC Compaction', () => {
   describe('merge strategy', () => {
     it('applies insert to empty state', () => {
       const state = new Map<string, Record<string, unknown>>()
-      const deltas: CompactionDeltaRecord[] = [createDelta('insert', 'user-1', { name: 'Alice' })]
+      const deltas: CompactionDeltaRecord[] = [createDelta('created', 'user-1', { name: 'Alice' })]
 
       const newState = applyDeltasToState(state, deltas)
 
@@ -207,7 +207,7 @@ describe('CDC Compaction', () => {
 
     it('applies update to existing record', () => {
       const state = new Map<string, Record<string, unknown>>([['user-1', { name: 'Alice', age: 30 }]])
-      const deltas: CompactionDeltaRecord[] = [createDelta('update', 'user-1', { name: 'Alice', age: 31 })]
+      const deltas: CompactionDeltaRecord[] = [createDelta('updated', 'user-1', { name: 'Alice', age: 31 })]
 
       const newState = applyDeltasToState(state, deltas)
 
@@ -219,7 +219,7 @@ describe('CDC Compaction', () => {
         ['user-1', { name: 'Alice' }],
         ['user-2', { name: 'Bob' }],
       ])
-      const deltas: CompactionDeltaRecord[] = [createDelta('delete', 'user-1')]
+      const deltas: CompactionDeltaRecord[] = [createDelta('deleted', 'user-1')]
 
       const newState = applyDeltasToState(state, deltas)
 
@@ -231,9 +231,9 @@ describe('CDC Compaction', () => {
     it('handles multiple updates to same record (last wins)', () => {
       const state = new Map<string, Record<string, unknown>>()
       const deltas: CompactionDeltaRecord[] = [
-        createDelta('insert', 'user-1', { name: 'Alice', version: 1 }, 1),
-        createDelta('update', 'user-1', { name: 'Alice', version: 2 }, 2),
-        createDelta('update', 'user-1', { name: 'Alice', version: 3 }, 3),
+        createDelta('created', 'user-1', { name: 'Alice', version: 1 }, 1),
+        createDelta('updated', 'user-1', { name: 'Alice', version: 2 }, 2),
+        createDelta('updated', 'user-1', { name: 'Alice', version: 3 }, 3),
       ]
 
       const newState = applyDeltasToState(state, deltas)
@@ -247,7 +247,7 @@ describe('CDC Compaction', () => {
         ['user-2', { name: 'Bob' }],
         ['user-3', { name: 'Charlie' }],
       ])
-      const deltas: CompactionDeltaRecord[] = [createDelta('update', 'user-2', { name: 'Bobby' })]
+      const deltas: CompactionDeltaRecord[] = [createDelta('updated', 'user-2', { name: 'Bobby' })]
 
       const newState = applyDeltasToState(state, deltas)
 
@@ -260,8 +260,8 @@ describe('CDC Compaction', () => {
     it('handles insert then delete of same record', () => {
       const state = new Map<string, Record<string, unknown>>()
       const deltas: CompactionDeltaRecord[] = [
-        createDelta('insert', 'user-1', { name: 'Alice' }, 1),
-        createDelta('delete', 'user-1', undefined, 2),
+        createDelta('created', 'user-1', { name: 'Alice' }, 1),
+        createDelta('deleted', 'user-1', undefined, 2),
       ]
 
       const newState = applyDeltasToState(state, deltas)
@@ -273,8 +273,8 @@ describe('CDC Compaction', () => {
     it('handles delete then reinsert of same record', () => {
       const state = new Map<string, Record<string, unknown>>([['user-1', { name: 'Alice', version: 1 }]])
       const deltas: CompactionDeltaRecord[] = [
-        createDelta('delete', 'user-1', undefined, 1),
-        createDelta('insert', 'user-1', { name: 'Alice', version: 2 }, 2),
+        createDelta('deleted', 'user-1', undefined, 1),
+        createDelta('created', 'user-1', { name: 'Alice', version: 2 }, 2),
       ]
 
       const newState = applyDeltasToState(state, deltas)
@@ -293,9 +293,9 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // Delta files should be processed in numeric order
-      await bucket.put('ns/users/deltas/000003.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 3 }, 3)]))
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { v: 1 }, 1)]))
-      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 2 }, 2)]))
+      await bucket.put('ns/users/deltas/000003.parquet', deltasToParquet([createDelta('updated', 'user-1', { v: 3 }, 3)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { v: 1 }, 1)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('updated', 'user-1', { v: 2 }, 2)]))
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
@@ -316,15 +316,15 @@ describe('CDC Compaction', () => {
       await bucket.put(
         'ns/users/deltas/000001.parquet',
         deltasToParquet([
-          createDelta('insert', 'user-1', { name: 'Alice', status: 'active' }, 1),
-          createDelta('insert', 'user-2', { name: 'Bob', status: 'active' }, 2),
+          createDelta('created', 'user-1', { name: 'Alice', status: 'active' }, 1),
+          createDelta('created', 'user-2', { name: 'Bob', status: 'active' }, 2),
         ])
       )
       await bucket.put(
         'ns/users/deltas/000002.parquet',
         deltasToParquet([
-          createDelta('update', 'user-1', { name: 'Alice', status: 'inactive' }, 3),
-          createDelta('delete', 'user-2', undefined, 4),
+          createDelta('updated', 'user-1', { name: 'Alice', status: 'inactive' }, 3),
+          createDelta('deleted', 'user-2', undefined, 4),
         ])
       )
 
@@ -346,9 +346,9 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // Files named out of order but should still be sorted by name
-      await bucket.put('ns/users/deltas/000010.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 10 }, 10)]))
-      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-1', { v: 2 }, 2)]))
-      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 5 }, 5)]))
+      await bucket.put('ns/users/deltas/000010.parquet', deltasToParquet([createDelta('updated', 'user-1', { v: 10 }, 10)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('created', 'user-1', { v: 2 }, 2)]))
+      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('updated', 'user-1', { v: 5 }, 5)]))
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
@@ -374,9 +374,9 @@ describe('CDC Compaction', () => {
       await bucket.put(
         'ns/users/deltas/000001.parquet',
         deltasToParquet([
-          createDelta('insert', 'z-user', { name: 'Zara' }, 1),
-          createDelta('insert', 'a-user', { name: 'Adam' }, 2),
-          createDelta('insert', 'm-user', { name: 'Mary' }, 3),
+          createDelta('created', 'z-user', { name: 'Zara' }, 1),
+          createDelta('created', 'a-user', { name: 'Adam' }, 2),
+          createDelta('created', 'm-user', { name: 'Mary' }, 3),
         ])
       )
 
@@ -398,12 +398,12 @@ describe('CDC Compaction', () => {
       await bucket.put(
         'ns/users/deltas/000001.parquet',
         deltasToParquet([
-          createDelta('insert', 'user-1', { name: 'Alice' }, 1),
-          createDelta('insert', 'user-2', { name: 'Bob' }, 2),
-          createDelta('insert', 'user-3', { name: 'Charlie' }, 3),
+          createDelta('created', 'user-1', { name: 'Alice' }, 1),
+          createDelta('created', 'user-2', { name: 'Bob' }, 2),
+          createDelta('created', 'user-3', { name: 'Charlie' }, 3),
         ])
       )
-      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('delete', 'user-2', undefined, 4)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('deleted', 'user-2', undefined, 4)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
@@ -427,7 +427,7 @@ describe('CDC Compaction', () => {
         metadata: JSON.stringify({ role: 'admin', permissions: ['read', 'write'] }),
       }
 
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', complexDoc, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', complexDoc, 1)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
@@ -508,8 +508,8 @@ describe('CDC Compaction', () => {
     it('lists processed delta files in result', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
-      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-2', { name: 'Bob' }, 2)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('created', 'user-2', { name: 'Bob' }, 2)]))
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
@@ -521,7 +521,7 @@ describe('CDC Compaction', () => {
     it('archives deltas to processed folder when archive option is set', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { name: 'Alice' }, 1)]))
 
       const result = await compactCollection(bucket, 'ns', 'users', { archiveDeltas: true })
 
@@ -539,8 +539,8 @@ describe('CDC Compaction', () => {
     it('deletes old delta files after compaction when delete option is set', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
-      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-2', { name: 'Bob' }, 2)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('created', 'user-2', { name: 'Bob' }, 2)]))
 
       const result = await compactCollection(bucket, 'ns', 'users', { deleteDeltas: true })
 
@@ -556,7 +556,7 @@ describe('CDC Compaction', () => {
     it('keeps delta files by default', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { name: 'Alice' }, 1)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
@@ -577,8 +577,8 @@ describe('CDC Compaction', () => {
       await bucket.put(
         'ns/users/deltas/000001.parquet',
         deltasToParquet([
-          createDelta('insert', 'user-1', { name: 'Alice' }, 1),
-          createDelta('insert', 'user-2', { name: 'Bob' }, 2),
+          createDelta('created', 'user-1', { name: 'Alice' }, 1),
+          createDelta('created', 'user-2', { name: 'Bob' }, 2),
         ])
       )
 
@@ -600,7 +600,7 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       const beforeCompaction = Date.now()
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { name: 'Alice' }, 1)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
@@ -619,9 +619,9 @@ describe('CDC Compaction', () => {
       await bucket.put(
         'ns/users/deltas/000001.parquet',
         deltasToParquet([
-          createDelta('insert', 'user-1', { name: 'Alice', data: 'some data' }, 1),
-          createDelta('insert', 'user-2', { name: 'Bob', data: 'more data' }, 2),
-          createDelta('insert', 'user-3', { name: 'Charlie', data: 'extra data' }, 3),
+          createDelta('created', 'user-1', { name: 'Alice', data: 'some data' }, 1),
+          createDelta('created', 'user-2', { name: 'Bob', data: 'more data' }, 2),
+          createDelta('created', 'user-3', { name: 'Charlie', data: 'extra data' }, 3),
         ])
       )
 
@@ -641,11 +641,11 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // First compaction
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { name: 'Alice' }, 1)]))
       await compactCollection(bucket, 'ns', 'users', { deleteDeltas: true })
 
       // Second compaction with more data
-      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-2', { name: 'Bob' }, 2)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('created', 'user-2', { name: 'Bob' }, 2)]))
       await compactCollection(bucket, 'ns', 'users', { deleteDeltas: true })
 
       const manifestFile = await bucket.get('ns/users/manifest.json')
@@ -658,8 +658,8 @@ describe('CDC Compaction', () => {
     it('tracks delta sequence number in manifest', async () => {
       const bucket = createMockR2Bucket()
 
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
-      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('insert', 'user-2', { name: 'Bob' }, 5)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('created', 'user-2', { name: 'Bob' }, 5)]))
 
       await compactCollection(bucket, 'ns', 'users')
 
@@ -690,8 +690,8 @@ describe('CDC Compaction', () => {
       await bucket.put(
         'ns/users/deltas/000001.parquet',
         deltasToParquet([
-          createDelta('update', 'user-1', { name: 'Alice', age: 31 }, 1),
-          createDelta('insert', 'user-3', { name: 'Charlie', age: 35 }, 2),
+          createDelta('updated', 'user-1', { name: 'Alice', age: 31 }, 1),
+          createDelta('created', 'user-3', { name: 'Charlie', age: 35 }, 2),
         ])
       )
 
@@ -725,7 +725,7 @@ describe('CDC Compaction', () => {
       await bucket.put('ns/users/data.parquet', existingParquet)
 
       // Delta deletes user-1
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('delete', 'user-1', undefined, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('deleted', 'user-1', undefined, 1)]))
 
       const result = await compactCollection(bucket, 'ns', 'users')
 
@@ -748,7 +748,7 @@ describe('CDC Compaction', () => {
     it('handles delta with missing doc for insert (should skip)', () => {
       const state = new Map<string, Record<string, unknown>>()
       const deltas: CompactionDeltaRecord[] = [
-        { op: 'insert', id: 'user-1', ts: Date.now(), seq: 1 }, // Missing doc
+        { op: 'created', id: 'user-1', ts: Date.now(), seq: 1 }, // Missing doc
       ]
 
       const newState = applyDeltasToState(state, deltas)
@@ -759,7 +759,7 @@ describe('CDC Compaction', () => {
 
     it('handles update to non-existent record (upsert behavior)', () => {
       const state = new Map<string, Record<string, unknown>>()
-      const deltas: CompactionDeltaRecord[] = [createDelta('update', 'user-1', { name: 'Alice' })]
+      const deltas: CompactionDeltaRecord[] = [createDelta('updated', 'user-1', { name: 'Alice' })]
 
       const newState = applyDeltasToState(state, deltas)
 
@@ -770,7 +770,7 @@ describe('CDC Compaction', () => {
 
     it('handles delete of non-existent record (no-op)', () => {
       const state = new Map<string, Record<string, unknown>>()
-      const deltas: CompactionDeltaRecord[] = [createDelta('delete', 'user-1')]
+      const deltas: CompactionDeltaRecord[] = [createDelta('deleted', 'user-1')]
 
       const newState = applyDeltasToState(state, deltas)
 
@@ -795,7 +795,7 @@ describe('CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // Add one valid delta file and one corrupted file
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { name: 'Alice' }, 1)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { name: 'Alice' }, 1)]))
       await bucket.put('ns/users/deltas/000002.parquet', new TextEncoder().encode('not valid parquet data').buffer)
 
       const result = await compactCollection(bucket, 'ns', 'users')
@@ -813,7 +813,7 @@ describe('CDC Compaction', () => {
       // Generate many deltas
       const deltas: CompactionDeltaRecord[] = []
       for (let i = 0; i < 1000; i++) {
-        deltas.push(createDelta('insert', `user-${i.toString().padStart(4, '0')}`, { name: `User ${i}`, index: i }, i))
+        deltas.push(createDelta('created', `user-${i.toString().padStart(4, '0')}`, { name: `User ${i}`, index: i }, i))
       }
 
       await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet(deltas))
@@ -939,7 +939,7 @@ describe('Parallel CDC Compaction', () => {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
           deltasToParquet([
-            createDelta('insert', `user-${i}`, { name: `User ${i}`, batch: i }, i),
+            createDelta('created', `user-${i}`, { name: `User ${i}`, batch: i }, i),
           ])
         )
       }
@@ -961,7 +961,7 @@ describe('Parallel CDC Compaction', () => {
       for (let i = 1; i <= 3; i++) {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
-          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+          deltasToParquet([createDelta('created', `user-${i}`, { name: `User ${i}` }, i)])
         )
       }
 
@@ -975,12 +975,12 @@ describe('Parallel CDC Compaction', () => {
       const bucket = createMockR2Bucket()
 
       // Create files where later deltas update earlier records
-      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('insert', 'user-1', { v: 1 }, 1)]))
-      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 2 }, 2)]))
-      await bucket.put('ns/users/deltas/000003.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 3 }, 3)]))
-      await bucket.put('ns/users/deltas/000004.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 4 }, 4)]))
-      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 5 }, 5)]))
-      await bucket.put('ns/users/deltas/000006.parquet', deltasToParquet([createDelta('update', 'user-1', { v: 6 }, 6)]))
+      await bucket.put('ns/users/deltas/000001.parquet', deltasToParquet([createDelta('created', 'user-1', { v: 1 }, 1)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('updated', 'user-1', { v: 2 }, 2)]))
+      await bucket.put('ns/users/deltas/000003.parquet', deltasToParquet([createDelta('updated', 'user-1', { v: 3 }, 3)]))
+      await bucket.put('ns/users/deltas/000004.parquet', deltasToParquet([createDelta('updated', 'user-1', { v: 4 }, 4)]))
+      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('updated', 'user-1', { v: 5 }, 5)]))
+      await bucket.put('ns/users/deltas/000006.parquet', deltasToParquet([createDelta('updated', 'user-1', { v: 6 }, 6)]))
 
       const result = await compactCollectionParallel(bucket, 'ns', 'users', {
         parallelism: 3,
@@ -1005,15 +1005,15 @@ describe('Parallel CDC Compaction', () => {
       await bucket.put(
         'ns/users/deltas/000001.parquet',
         deltasToParquet([
-          createDelta('insert', 'user-1', { name: 'Alice' }, 1),
-          createDelta('insert', 'user-2', { name: 'Bob' }, 2),
-          createDelta('insert', 'user-3', { name: 'Charlie' }, 3),
+          createDelta('created', 'user-1', { name: 'Alice' }, 1),
+          createDelta('created', 'user-2', { name: 'Bob' }, 2),
+          createDelta('created', 'user-3', { name: 'Charlie' }, 3),
         ])
       )
-      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('insert', 'user-4', { name: 'Dave' }, 4)]))
-      await bucket.put('ns/users/deltas/000003.parquet', deltasToParquet([createDelta('delete', 'user-2', undefined, 5)]))
-      await bucket.put('ns/users/deltas/000004.parquet', deltasToParquet([createDelta('insert', 'user-5', { name: 'Eve' }, 6)]))
-      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('delete', 'user-4', undefined, 7)]))
+      await bucket.put('ns/users/deltas/000002.parquet', deltasToParquet([createDelta('created', 'user-4', { name: 'Dave' }, 4)]))
+      await bucket.put('ns/users/deltas/000003.parquet', deltasToParquet([createDelta('deleted', 'user-2', undefined, 5)]))
+      await bucket.put('ns/users/deltas/000004.parquet', deltasToParquet([createDelta('created', 'user-5', { name: 'Eve' }, 6)]))
+      await bucket.put('ns/users/deltas/000005.parquet', deltasToParquet([createDelta('deleted', 'user-4', undefined, 7)]))
 
       const result = await compactCollectionParallel(bucket, 'ns', 'users', {
         parallelism: 2,
@@ -1042,7 +1042,7 @@ describe('Parallel CDC Compaction', () => {
       for (let i = 1; i <= 8; i++) {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
-          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+          deltasToParquet([createDelta('created', `user-${i}`, { name: `User ${i}` }, i)])
         )
       }
 
@@ -1078,7 +1078,7 @@ describe('Parallel CDC Compaction', () => {
       for (let i = 1; i <= 6; i++) {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
-          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+          deltasToParquet([createDelta('created', `user-${i}`, { name: `User ${i}` }, i)])
         )
       }
 
@@ -1102,7 +1102,7 @@ describe('Parallel CDC Compaction', () => {
       for (let i = 1; i <= 4; i++) {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
-          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+          deltasToParquet([createDelta('created', `user-${i}`, { name: `User ${i}` }, i)])
         )
       }
 
@@ -1113,7 +1113,7 @@ describe('Parallel CDC Compaction', () => {
       for (let i = 6; i <= 8; i++) {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
-          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+          deltasToParquet([createDelta('created', `user-${i}`, { name: `User ${i}` }, i)])
         )
       }
 
@@ -1143,7 +1143,7 @@ describe('Parallel CDC Compaction', () => {
       for (let i = 1; i <= 6; i++) {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
-          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+          deltasToParquet([createDelta('created', `user-${i}`, { name: `User ${i}` }, i)])
         )
       }
 
@@ -1170,7 +1170,7 @@ describe('Parallel CDC Compaction', () => {
       for (let i = 1; i <= 6; i++) {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
-          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+          deltasToParquet([createDelta('created', `user-${i}`, { name: `User ${i}` }, i)])
         )
       }
 
@@ -1195,7 +1195,7 @@ describe('Parallel CDC Compaction', () => {
       for (let i = 1; i <= 6; i++) {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
-          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+          deltasToParquet([createDelta('created', `user-${i}`, { name: `User ${i}` }, i)])
         )
       }
 
@@ -1223,7 +1223,7 @@ describe('Parallel CDC Compaction', () => {
       for (let i = 1; i <= 6; i++) {
         await bucket.put(
           `ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`,
-          deltasToParquet([createDelta('insert', `user-${i}`, { name: `User ${i}` }, i)])
+          deltasToParquet([createDelta('created', `user-${i}`, { name: `User ${i}` }, i)])
         )
       }
 
@@ -1253,7 +1253,7 @@ describe('Parallel CDC Compaction', () => {
         for (let j = 0; j < 20; j++) {
           const userId = (i - 1) * 20 + j
           deltas.push(
-            createDelta('insert', `user-${userId.toString().padStart(5, '0')}`, { name: `User ${userId}`, batch: i }, userId)
+            createDelta('created', `user-${userId.toString().padStart(5, '0')}`, { name: `User ${userId}`, batch: i }, userId)
           )
         }
         await bucket.put(`ns/users/deltas/${i.toString().padStart(6, '0')}.parquet`, deltasToParquet(deltas))

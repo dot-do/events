@@ -73,7 +73,7 @@ describe('isValidEventType', () => {
 
     it('accepts type with dots', () => {
       expect(isValidEventType('rpc.call')).toBe(true)
-      expect(isValidEventType('collection.insert')).toBe(true)
+      expect(isValidEventType('collection.created')).toBe(true)
       expect(isValidEventType('user.profile.updated')).toBe(true)
     })
 
@@ -408,7 +408,7 @@ describe('validateEventSize', () => {
 
   it('accepts event with nested objects within size limit', () => {
     const event = {
-      type: 'collection.update',
+      type: 'collection.updated',
       ts: '2024-01-01T00:00:00Z',
       collection: 'users',
       doc: {
@@ -579,7 +579,7 @@ describe('validateQueryRequest', () => {
       doClass: 'ChatRoom',
       collection: 'messages',
       colo: 'SFO',
-      eventTypes: ['rpc.call', 'collection.insert'],
+      eventTypes: ['rpc.call', 'collection.created'],
       limit: 500,
     })).toBe(true)
   })

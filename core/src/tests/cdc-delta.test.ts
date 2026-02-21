@@ -5,7 +5,7 @@
  *
  * Delta files store incremental changes with schema:
  * - pk: STRING (primary key)
- * - op: STRING (insert/update/delete)
+ * - op: STRING (created/updated/deleted)
  * - data: VARIANT (new document state, null for delete)
  * - prev: VARIANT (previous state, optional)
  * - ts: TIMESTAMP
@@ -32,7 +32,7 @@ import {
  */
 function createMockCDCEvent(overrides: Partial<CDCEvent> = {}): CDCEvent {
   return {
-    type: 'collection.insert',
+    type: 'collection.created',
     collection: 'users',
     docId: 'user-123',
     doc: { name: 'Alice', active: true },
@@ -54,7 +54,7 @@ describe('createDeltaRecord', () => {
   describe('insert operations', () => {
     it('creates insert delta with correct fields', () => {
       const event = createMockCDCEvent({
-        type: 'collection.insert',
+        type: 'collection.created',
         docId: 'user-123',
         doc: { name: 'Alice', active: true },
         bookmark: 'bookmark-abc',
@@ -63,7 +63,7 @@ describe('createDeltaRecord', () => {
       const delta = createDeltaRecord(event)
 
       expect(delta.pk).toBe('user-123')
-      expect(delta.op).toBe('insert')
+      expect(delta.op).toBe('created')
       expect(delta.data).toEqual({ name: 'Alice', active: true })
       expect(delta.prev).toBeNull()
       expect(delta.bookmark).toBe('bookmark-abc')
@@ -81,7 +81,7 @@ describe('createDeltaRecord', () => {
 
     it('handles nested document data', () => {
       const event = createMockCDCEvent({
-        type: 'collection.insert',
+        type: 'collection.created',
         doc: {
           name: 'Alice',
           metadata: {
@@ -106,7 +106,7 @@ describe('createDeltaRecord', () => {
   describe('update operations', () => {
     it('creates update delta with prev state captured', () => {
       const event = createMockCDCEvent({
-        type: 'collection.update',
+        type: 'collection.updated',
         docId: 'user-123',
         doc: { name: 'Alice', active: false },
         prev: { name: 'Alice', active: true },
@@ -116,7 +116,7 @@ describe('createDeltaRecord', () => {
       const delta = createDeltaRecord(event)
 
       expect(delta.pk).toBe('user-123')
-      expect(delta.op).toBe('update')
+      expect(delta.op).toBe('updated')
       expect(delta.data).toEqual({ name: 'Alice', active: false })
       expect(delta.prev).toEqual({ name: 'Alice', active: true })
       expect(delta.bookmark).toBe('bookmark-def')
@@ -124,7 +124,7 @@ describe('createDeltaRecord', () => {
 
     it('handles update without prev state', () => {
       const event = createMockCDCEvent({
-        type: 'collection.update',
+        type: 'collection.updated',
         docId: 'user-123',
         doc: { name: 'Bob' },
         prev: undefined,
@@ -132,7 +132,7 @@ describe('createDeltaRecord', () => {
 
       const delta = createDeltaRecord(event)
 
-      expect(delta.op).toBe('update')
+      expect(delta.op).toBe('updated')
       expect(delta.prev).toBeNull()
     })
   })
@@ -140,7 +140,7 @@ describe('createDeltaRecord', () => {
   describe('delete operations', () => {
     it('creates delete delta with null data', () => {
       const event = createMockCDCEvent({
-        type: 'collection.delete',
+        type: 'collection.deleted',
         docId: 'user-123',
         doc: undefined,
         prev: { name: 'Alice', active: true },
@@ -150,7 +150,7 @@ describe('createDeltaRecord', () => {
       const delta = createDeltaRecord(event)
 
       expect(delta.pk).toBe('user-123')
-      expect(delta.op).toBe('delete')
+      expect(delta.op).toBe('deleted')
       expect(delta.data).toBeNull()
       expect(delta.prev).toEqual({ name: 'Alice', active: true })
       expect(delta.bookmark).toBe('bookmark-ghi')
@@ -158,7 +158,7 @@ describe('createDeltaRecord', () => {
 
     it('handles delete without prev state', () => {
       const event = createMockCDCEvent({
-        type: 'collection.delete',
+        type: 'collection.deleted',
         docId: 'user-123',
         doc: undefined,
         prev: undefined,
@@ -166,7 +166,7 @@ describe('createDeltaRecord', () => {
 
       const delta = createDeltaRecord(event)
 
-      expect(delta.op).toBe('delete')
+      expect(delta.op).toBe('deleted')
       expect(delta.data).toBeNull()
       expect(delta.prev).toBeNull()
     })
@@ -175,9 +175,9 @@ describe('createDeltaRecord', () => {
   describe('bookmark handling', () => {
     it('includes SQLite bookmark in each record', () => {
       const events = [
-        createMockCDCEvent({ type: 'collection.insert', bookmark: 'bookmark-1' }),
-        createMockCDCEvent({ type: 'collection.update', bookmark: 'bookmark-2' }),
-        createMockCDCEvent({ type: 'collection.delete', bookmark: 'bookmark-3' }),
+        createMockCDCEvent({ type: 'collection.created', bookmark: 'bookmark-1' }),
+        createMockCDCEvent({ type: 'collection.updated', bookmark: 'bookmark-2' }),
+        createMockCDCEvent({ type: 'collection.deleted', bookmark: 'bookmark-3' }),
       ]
 
       for (const event of events) {
@@ -207,7 +207,7 @@ describe('writeDeltaFile', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'user-1',
-        op: 'insert',
+        op: 'created',
         data: { name: 'Alice' },
         prev: null,
         ts: '2024-01-15T10:00:00.000Z',
@@ -215,7 +215,7 @@ describe('writeDeltaFile', () => {
       },
       {
         pk: 'user-2',
-        op: 'insert',
+        op: 'created',
         data: { name: 'Bob' },
         prev: null,
         ts: '2024-01-15T10:01:00.000Z',
@@ -233,7 +233,7 @@ describe('writeDeltaFile', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'doc-1',
-        op: 'update',
+        op: 'updated',
         data: { value: 42 },
         prev: { value: 41 },
         ts: '2024-01-15T12:00:00.000Z',
@@ -266,7 +266,7 @@ describe('writeDeltaFile', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'doc-1',
-        op: 'insert',
+        op: 'created',
         data: { nested: { deeply: { value: [1, 2, 3] } } },
         prev: null,
         ts: '2024-01-15T10:00:00.000Z',
@@ -284,7 +284,7 @@ describe('writeDeltaFile', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'doc-1',
-        op: 'delete',
+        op: 'deleted',
         data: null,
         prev: { name: 'Old' },
         ts: '2024-01-15T10:00:00.000Z',
@@ -302,7 +302,7 @@ describe('writeDeltaFile', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'doc-1',
-        op: 'insert',
+        op: 'created',
         data: { name: 'New' },
         prev: null,
         ts: '2024-01-15T10:00:00.000Z',
@@ -326,7 +326,7 @@ describe('readDeltaFile', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'user-1',
-        op: 'insert',
+        op: 'created',
         data: { name: 'Alice', age: 30 },
         prev: null,
         ts: '2024-01-15T10:00:00.000Z',
@@ -344,7 +344,7 @@ describe('readDeltaFile', () => {
   it('preserves all fields correctly', async () => {
     const original: DeltaRecord = {
       pk: 'doc-xyz',
-      op: 'update',
+      op: 'updated',
       data: { status: 'active', count: 42 },
       prev: { status: 'inactive', count: 41 },
       ts: '2024-01-15T14:30:00.000Z',
@@ -378,7 +378,7 @@ describe('readDeltaFile', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'complex-doc',
-        op: 'insert',
+        op: 'created',
         data: complexData,
         prev: null,
         ts: '2024-01-15T10:00:00.000Z',
@@ -394,9 +394,9 @@ describe('readDeltaFile', () => {
 
   it('handles multiple records', async () => {
     const records: DeltaRecord[] = [
-      { pk: 'a', op: 'insert', data: { v: 1 }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
-      { pk: 'b', op: 'update', data: { v: 2 }, prev: { v: 1 }, ts: '2024-01-15T10:01:00.000Z', bookmark: 'b2' },
-      { pk: 'c', op: 'delete', data: null, prev: { v: 3 }, ts: '2024-01-15T10:02:00.000Z', bookmark: 'b3' },
+      { pk: 'a', op: 'created', data: { v: 1 }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
+      { pk: 'b', op: 'updated', data: { v: 2 }, prev: { v: 1 }, ts: '2024-01-15T10:01:00.000Z', bookmark: 'b2' },
+      { pk: 'c', op: 'deleted', data: null, prev: { v: 3 }, ts: '2024-01-15T10:02:00.000Z', bookmark: 'b3' },
     ]
 
     const buffer = writeDeltaFile(records)
@@ -404,7 +404,7 @@ describe('readDeltaFile', () => {
 
     expect(readBack).toHaveLength(3)
     expect(readBack.map((r) => r.pk)).toEqual(['a', 'b', 'c'])
-    expect(readBack.map((r) => r.op)).toEqual(['insert', 'update', 'delete'])
+    expect(readBack.map((r) => r.op)).toEqual(['created', 'updated', 'deleted'])
   })
 
   it('handles empty parquet file', async () => {
@@ -424,10 +424,10 @@ describe('readDeltaFile', () => {
 describe('accumulateDeltas', () => {
   it('accumulates multiple changes to same record', () => {
     const deltas: DeltaRecord[] = [
-      { pk: 'user-1', op: 'insert', data: { name: 'Alice' }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
+      { pk: 'user-1', op: 'created', data: { name: 'Alice' }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
       {
         pk: 'user-1',
-        op: 'update',
+        op: 'updated',
         data: { name: 'Alice', age: 30 },
         prev: { name: 'Alice' },
         ts: '2024-01-15T10:01:00.000Z',
@@ -435,7 +435,7 @@ describe('accumulateDeltas', () => {
       },
       {
         pk: 'user-1',
-        op: 'update',
+        op: 'updated',
         data: { name: 'Alice Updated', age: 30 },
         prev: { name: 'Alice', age: 30 },
         ts: '2024-01-15T10:02:00.000Z',
@@ -448,7 +448,7 @@ describe('accumulateDeltas', () => {
     // Last-write-wins: should have final state
     expect(accumulated.get('user-1')).toEqual({
       pk: 'user-1',
-      op: 'update',
+      op: 'updated',
       data: { name: 'Alice Updated', age: 30 },
       prev: { name: 'Alice', age: 30 },
       ts: '2024-01-15T10:02:00.000Z',
@@ -458,9 +458,9 @@ describe('accumulateDeltas', () => {
 
   it('last-write-wins for conflicts', () => {
     const deltas: DeltaRecord[] = [
-      { pk: 'doc-1', op: 'insert', data: { v: 1 }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
-      { pk: 'doc-1', op: 'update', data: { v: 2 }, prev: { v: 1 }, ts: '2024-01-15T10:01:00.000Z', bookmark: 'b2' },
-      { pk: 'doc-1', op: 'update', data: { v: 3 }, prev: { v: 2 }, ts: '2024-01-15T10:02:00.000Z', bookmark: 'b3' },
+      { pk: 'doc-1', op: 'created', data: { v: 1 }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
+      { pk: 'doc-1', op: 'updated', data: { v: 2 }, prev: { v: 1 }, ts: '2024-01-15T10:01:00.000Z', bookmark: 'b2' },
+      { pk: 'doc-1', op: 'updated', data: { v: 3 }, prev: { v: 2 }, ts: '2024-01-15T10:02:00.000Z', bookmark: 'b3' },
     ]
 
     const accumulated = accumulateDeltas(deltas)
@@ -471,10 +471,10 @@ describe('accumulateDeltas', () => {
 
   it('maintains operation order within batch', () => {
     const deltas: DeltaRecord[] = [
-      { pk: 'a', op: 'insert', data: { v: 1 }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
-      { pk: 'b', op: 'insert', data: { v: 2 }, prev: null, ts: '2024-01-15T10:00:01.000Z', bookmark: 'b2' },
-      { pk: 'a', op: 'update', data: { v: 10 }, prev: { v: 1 }, ts: '2024-01-15T10:00:02.000Z', bookmark: 'b3' },
-      { pk: 'c', op: 'insert', data: { v: 3 }, prev: null, ts: '2024-01-15T10:00:03.000Z', bookmark: 'b4' },
+      { pk: 'a', op: 'created', data: { v: 1 }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
+      { pk: 'b', op: 'created', data: { v: 2 }, prev: null, ts: '2024-01-15T10:00:01.000Z', bookmark: 'b2' },
+      { pk: 'a', op: 'updated', data: { v: 10 }, prev: { v: 1 }, ts: '2024-01-15T10:00:02.000Z', bookmark: 'b3' },
+      { pk: 'c', op: 'created', data: { v: 3 }, prev: null, ts: '2024-01-15T10:00:03.000Z', bookmark: 'b4' },
     ]
 
     const accumulated = accumulateDeltas(deltas)
@@ -487,25 +487,25 @@ describe('accumulateDeltas', () => {
 
   it('handles insert-then-delete sequence', () => {
     const deltas: DeltaRecord[] = [
-      { pk: 'temp', op: 'insert', data: { v: 1 }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
-      { pk: 'temp', op: 'delete', data: null, prev: { v: 1 }, ts: '2024-01-15T10:01:00.000Z', bookmark: 'b2' },
+      { pk: 'temp', op: 'created', data: { v: 1 }, prev: null, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
+      { pk: 'temp', op: 'deleted', data: null, prev: { v: 1 }, ts: '2024-01-15T10:01:00.000Z', bookmark: 'b2' },
     ]
 
     const accumulated = accumulateDeltas(deltas)
 
-    expect(accumulated.get('temp')?.op).toBe('delete')
+    expect(accumulated.get('temp')?.op).toBe('deleted')
     expect(accumulated.get('temp')?.data).toBeNull()
   })
 
   it('handles delete-then-insert (resurrection)', () => {
     const deltas: DeltaRecord[] = [
-      { pk: 'zombie', op: 'delete', data: null, prev: { v: 'old' }, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
-      { pk: 'zombie', op: 'insert', data: { v: 'resurrected' }, prev: null, ts: '2024-01-15T10:01:00.000Z', bookmark: 'b2' },
+      { pk: 'zombie', op: 'deleted', data: null, prev: { v: 'old' }, ts: '2024-01-15T10:00:00.000Z', bookmark: 'b1' },
+      { pk: 'zombie', op: 'created', data: { v: 'resurrected' }, prev: null, ts: '2024-01-15T10:01:00.000Z', bookmark: 'b2' },
     ]
 
     const accumulated = accumulateDeltas(deltas)
 
-    expect(accumulated.get('zombie')?.op).toBe('insert')
+    expect(accumulated.get('zombie')?.op).toBe('created')
     expect(accumulated.get('zombie')?.data).toEqual({ v: 'resurrected' })
   })
 
@@ -594,7 +594,7 @@ describe('edge cases', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'large-doc',
-        op: 'insert',
+        op: 'created',
         data: largeObject,
         prev: null,
         ts: '2024-01-15T10:00:00.000Z',
@@ -613,7 +613,7 @@ describe('edge cases', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'unicode-doc',
-        op: 'insert',
+        op: 'created',
         data: {
           japanese: 'nihongo',
           emoji: 'test',
@@ -660,7 +660,7 @@ describe('edge cases', () => {
     const records: DeltaRecord[] = [
       {
         pk: 'null-values',
-        op: 'insert',
+        op: 'created',
         data: { name: 'Test', optional: null, nested: { value: null } },
         prev: null,
         ts: '2024-01-15T10:00:00.000Z',
