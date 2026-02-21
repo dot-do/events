@@ -24,6 +24,11 @@ export type EventType =
   | 'flag.evaluated'
   | EpcisEventType
   | 'recording'
+  | 'rpc.batch'
+  | 'rpc.call'
+  | 'mcp'
+  | 'eval'
+  | 'api.request'
   | `custom.${string}`
 
 export type EpcisEventType = 'epcis.object' | 'epcis.aggregation' | 'epcis.transaction' | 'epcis.transformation' | 'epcis.association'

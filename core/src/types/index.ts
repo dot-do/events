@@ -54,6 +54,10 @@ export type {
   AliasEvent,
   SegmentEvent,
 } from './segment.js'
+export type { RpcBatchEventData, RpcBatchEvent, RpcCallEventData, RpcCallEvent } from './rpc.js'
+export type { McpEventData, McpEvent } from './mcp.js'
+export type { EvalEventData, EvalEvent } from './eval.js'
+export type { ApiRequestEventData, ApiRequestEvent } from './api.js'
 
 export {
   isCdcEvent,
@@ -88,6 +92,12 @@ export {
   isAssociationEvent,
   isTailEvent,
   isCustomEvent,
+  isRpcBatchEvent,
+  isRpcCallEvent,
+  isRpcEvent,
+  isMcpEvent,
+  isEvalEvent,
+  isApiRequestEvent,
   isBaseEvent,
 } from './guards.js'
 
@@ -106,6 +116,10 @@ import type { MeterEvent, StripeEvent } from './billing.js'
 import type { ObjectEvent, AggregationEvent, TransactionEvent, TransformationEvent, AssociationEvent } from './epcis.js'
 import type { ExperimentAssignmentEvent, ExperimentMetricEvent, FlagEvaluatedEvent } from './experimentation.js'
 import type { ScreenEvent, GroupEvent, AliasEvent } from './segment.js'
+import type { RpcBatchEvent, RpcCallEvent } from './rpc.js'
+import type { McpEvent } from './mcp.js'
+import type { EvalEvent } from './eval.js'
+import type { ApiRequestEvent } from './api.js'
 
 export type Event =
   | CdcEvent
@@ -136,6 +150,11 @@ export type Event =
   | TailEvent
   | RecordingEvent
   | CustomEvent
+  | RpcBatchEvent
+  | RpcCallEvent
+  | McpEvent
+  | EvalEvent
+  | ApiRequestEvent
 
 export interface EventBatch {
   events: Event[]

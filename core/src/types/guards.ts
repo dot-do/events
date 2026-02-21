@@ -13,6 +13,10 @@ import type { ScreenEvent, GroupEvent, AliasEvent } from './segment.js'
 import type { ExperimentAssignmentEvent, ExperimentMetricEvent, FlagEvaluatedEvent } from './experimentation.js'
 import type { MeterEvent, StripeEvent } from './billing.js'
 import type { ObjectEvent, AggregationEvent, TransactionEvent, TransformationEvent, AssociationEvent, EpcisEvent } from './epcis.js'
+import type { RpcBatchEvent, RpcCallEvent } from './rpc.js'
+import type { McpEvent } from './mcp.js'
+import type { EvalEvent } from './eval.js'
+import type { ApiRequestEvent } from './api.js'
 
 export function isCdcEvent<E extends { type: string }>(event: E): event is E & CdcEvent {
   return event.type === 'cdc'
@@ -140,6 +144,30 @@ export function isTransformationEvent<E extends { type: string }>(event: E): eve
 
 export function isAssociationEvent<E extends { type: string }>(event: E): event is E & AssociationEvent {
   return event.type === 'epcis.association'
+}
+
+export function isRpcBatchEvent<E extends { type: string }>(event: E): event is E & RpcBatchEvent {
+  return event.type === 'rpc.batch'
+}
+
+export function isRpcCallEvent<E extends { type: string }>(event: E): event is E & RpcCallEvent {
+  return event.type === 'rpc.call'
+}
+
+export function isRpcEvent<E extends { type: string }>(event: E): event is E & (RpcBatchEvent | RpcCallEvent) {
+  return event.type === 'rpc.batch' || event.type === 'rpc.call'
+}
+
+export function isMcpEvent<E extends { type: string }>(event: E): event is E & McpEvent {
+  return event.type === 'mcp'
+}
+
+export function isEvalEvent<E extends { type: string }>(event: E): event is E & EvalEvent {
+  return event.type === 'eval'
+}
+
+export function isApiRequestEvent<E extends { type: string }>(event: E): event is E & ApiRequestEvent {
+  return event.type === 'api.request'
 }
 
 export function isBaseEvent(value: unknown): value is BaseEvent {
