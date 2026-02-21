@@ -61,9 +61,6 @@
     "hyparquet": "^1.24.1",
     "picomatch": "^4.0.3"
   },
-  "optionalDependencies": {
-    "@dotdo/deltalake": "file:../../deltalake"
-  },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250121.0",
     "@types/picomatch": "^4.0.2",
