@@ -14,33 +14,31 @@
 import { parquetReadObjects } from 'hyparquet'
 import { parquetWriteBuffer } from '@dotdo/hyparquet-writer'
 import { createAsyncBuffer } from './async-buffer.js'
-import type { CollectionChangeEvent } from './types.js'
+import type { CdcEvent } from './types/cdc.js'
 
 // ============================================================================
 // Types
 // ============================================================================
 
 /**
- * CDC Event from the emitter - alias for CollectionChangeEvent
- * This ensures type compatibility and enables proper type narrowing
+ * CDC Event from the emitter — alias for the ClickHouse-aligned CdcEvent type.
+ * The event's `data` contains entity fields ({ type, id, ...rest }),
+ * and `meta` may contain `prev` and `bookmark`.
  */
-export type CDCEvent = CollectionChangeEvent
+export type CDCEvent = CdcEvent
+
+/** Operation type extracted from the event name */
+export type CDCOp = 'insert' | 'update' | 'delete'
 
 /**
  * Delta record for Parquet storage
  */
 export interface DeltaRecord {
-  /** Primary key (document ID) */
   pk: string
-  /** Operation type: insert, update, or delete */
-  op: 'insert' | 'update' | 'delete'
-  /** New document state (JSON object), null for deletes */
+  op: CDCOp
   data: Record<string, unknown> | null
-  /** Previous document state (JSON object), null if not tracked */
   prev: Record<string, unknown> | null
-  /** ISO 8601 timestamp */
   ts: string
-  /** SQLite bookmark for PITR (Point-in-Time Recovery) */
   bookmark: string | null
 }
 
@@ -48,23 +46,10 @@ export interface DeltaRecord {
 // Type Validators
 // ============================================================================
 
-/**
- * Type guard for Record<string, unknown>
- * Validates that parsed JSON is a plain object (not array, not null)
- */
 function isRecordObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/**
- * Parse JSON string to Record<string, unknown> with validation
- * Returns null for empty strings or invalid JSON
- *
- * @param str - JSON string to parse
- * @param fieldName - Field name for error messages
- * @returns Parsed object or null
- * @throws Error if JSON is valid but not an object
- */
 function parseRecordJson(str: string, fieldName: string): Record<string, unknown> | null {
   if (str === '') {
     return null
@@ -81,35 +66,34 @@ function parseRecordJson(str: string, fieldName: string): Record<string, unknown
 // ============================================================================
 
 /**
- * Extracts operation type from CDC event type
+ * Extracts operation type from the CDC event name.
+ * Expected format: `{collection}.{op}` (e.g. 'contacts.insert', 'users.delete')
  */
-function extractOp(eventType: CDCEvent['type']): DeltaRecord['op'] {
-  switch (eventType) {
-    case 'collection.insert':
-      return 'insert'
-    case 'collection.update':
-      return 'update'
-    case 'collection.delete':
-      return 'delete'
+export function extractOp(eventName: string): CDCOp {
+  const dot = eventName.lastIndexOf('.')
+  const op = dot >= 0 ? eventName.slice(dot + 1) : eventName
+  if (op === 'insert' || op === 'update' || op === 'delete') {
+    return op
   }
+  throw new Error(`Unknown CDC operation in event name: ${eventName}`)
 }
 
 /**
  * Creates a DeltaRecord from a CDC event
- *
- * @param event - CDC event from the emitter
- * @returns DeltaRecord ready for Parquet storage
  */
 export function createDeltaRecord(event: CDCEvent): DeltaRecord {
-  const op = extractOp(event.type)
+  const op = extractOp(event.event)
+  const { type: _type, id, ...rest } = event.data
+  const prev = (event.meta as Record<string, unknown>).prev as Record<string, unknown> | undefined
+  const bookmark = (event.meta as Record<string, unknown>).bookmark as string | undefined
 
   return {
-    pk: event.docId,
+    pk: id,
     op,
-    data: event.doc ?? null,
-    prev: event.prev ?? null,
+    data: Object.keys(rest).length > 0 ? rest : null,
+    prev: prev ?? null,
     ts: event.ts,
-    bookmark: event.bookmark ?? null,
+    bookmark: bookmark ?? null,
   }
 }
 
@@ -117,17 +101,7 @@ export function createDeltaRecord(event: CDCEvent): DeltaRecord {
 // Parquet File Operations
 // ============================================================================
 
-/**
- * Writes delta records to a Parquet file buffer
- *
- * Uses STRING type for VARIANT columns (data/prev) by JSON-encoding the objects.
- * This allows efficient storage and querying with DuckDB's json_extract functions.
- *
- * @param records - Array of delta records to write
- * @returns Parquet file as ArrayBuffer
- */
 export function writeDeltaFile(records: DeltaRecord[]): ArrayBuffer {
-  // Handle empty records case
   if (records.length === 0) {
     return parquetWriteBuffer({
       columnData: [
@@ -184,12 +158,6 @@ export function writeDeltaFile(records: DeltaRecord[]): ArrayBuffer {
   })
 }
 
-/**
- * Reads delta records from a Parquet file buffer
- *
- * @param buffer - Parquet file as ArrayBuffer
- * @returns Array of delta records
- */
 export async function readDeltaFile(buffer: ArrayBuffer): Promise<DeltaRecord[]> {
   const file = createAsyncBuffer(buffer)
   const rows = await parquetReadObjects({ file })
@@ -218,15 +186,6 @@ export async function readDeltaFile(buffer: ArrayBuffer): Promise<DeltaRecord[]>
 // Delta Accumulation
 // ============================================================================
 
-/**
- * Accumulates deltas for the same primary key (last-write-wins)
- *
- * This is useful for compaction where multiple changes to the same record
- * should be collapsed to the final state.
- *
- * @param deltas - Array of delta records
- * @returns Map of pk -> final delta record
- */
 export function accumulateDeltas(deltas: DeltaRecord[]): Map<string, DeltaRecord> {
   const accumulated = new Map<string, DeltaRecord>()
 
@@ -241,35 +200,13 @@ export function accumulateDeltas(deltas: DeltaRecord[]): Map<string, DeltaRecord
 // Path Generation
 // ============================================================================
 
-/**
- * Formats a timestamp for safe use in filenames
- *
- * Converts ISO 8601 format to filesystem-safe format by replacing colons
- * with dashes and dots with dashes.
- *
- * @param date - Date to format
- * @returns Filesystem-safe timestamp string
- */
 function formatTimestampForFilename(date: Date): string {
   return date.toISOString().replace(/:/g, '-').replace(/\./g, '-')
 }
 
-/**
- * Generates the path for a delta file
- *
- * Path format: {ns}/{collection}/deltas/{seq}_{timestamp}.parquet
- *
- * @param ns - Namespace
- * @param collection - Collection name
- * @param seq - Sequence number (will be zero-padded to at least 3 digits)
- * @param timestamp - Optional timestamp (defaults to now)
- * @returns Delta file path
- */
 export function generateDeltaPath(ns: string, collection: string, seq: number, timestamp?: Date): string {
   const ts = timestamp ?? new Date()
   const formattedTs = formatTimestampForFilename(ts)
-
-  // Zero-pad sequence number to at least 3 digits
   const paddedSeq = seq.toString().padStart(3, '0')
 
   return `${ns}/${collection}/deltas/${paddedSeq}_${formattedTs}.parquet`

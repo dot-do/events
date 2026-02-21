@@ -12,6 +12,7 @@
 // === Core: EventEmitter ===
 
 export { EventEmitter } from './emitter.js'
+export type { EmitInput } from './emitter.js'
 
 // === New ClickHouse-aligned event types ===
 export type {

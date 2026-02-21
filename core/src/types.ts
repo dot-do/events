@@ -82,7 +82,6 @@ export interface EventEmitterOptions {
   batchSize?: number | undefined
   flushIntervalMs?: number | undefined
   cdc?: boolean | undefined
-  r2Bucket?: R2Bucket | undefined
   trackPrevious?: boolean | undefined
   apiKey?: string | undefined
   maxRetryQueueSize?: number | undefined

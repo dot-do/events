@@ -19,9 +19,9 @@ import {
   type SqlRow,
 } from './sql-mapper.js'
 
-// Re-export CDCEvent and type guard for backwards compatibility
+// Re-export CDCEvent and type guard
 export type { CDCEvent } from './cdc-delta.js'
-export { isCollectionChangeEvent } from './types.js'
+export { isCdcEvent } from './types.js'
 
 // ============================================================================
 // Types
@@ -318,11 +318,17 @@ export class CDCProcessorDO extends DurableObject<Env> {
   }
 
   /**
-   * Process a single CDC event
+   * Process a single CDC event.
+   * In the new Event format: data contains { type, id, ...fields }, meta may contain prev/bookmark.
    */
   private async processEvent(event: CDCEvent): Promise<void> {
-    const { collection, docId, ts, bookmark } = event
-    const op = this.extractOp(event.type)
+    const { type: _entityType, id: docId, ...docFields } = event.data
+    const collection = event.data.type
+    const ts = event.ts
+    const meta = event.meta as Record<string, unknown>
+    const prev = meta.prev as Record<string, unknown> | undefined
+    const bookmark = meta.bookmark as string | undefined
+    const op = this.extractOp(event.event)
 
     // Get existing document state from SQLite
     const existing = this.getDocumentState(collection, docId)
@@ -333,17 +339,17 @@ export class CDCProcessorDO extends DurableObject<Env> {
     let deleted = false
 
     if (op === 'insert') {
-      newData = event.doc ?? {}
+      newData = docFields
       newVersion = existing ? existing.version + 1 : 1
       deleted = false
     } else if (op === 'update') {
-      newData = event.doc ?? {}
-      prevData = existing ? existing.doc : (event.prev ?? null)
+      newData = docFields
+      prevData = existing ? existing.doc : (prev ?? null)
       newVersion = existing ? existing.version + 1 : 1
       deleted = false
     } else {
       // delete
-      prevData = existing ? existing.doc : (event.prev ?? null)
+      prevData = existing ? existing.doc : (prev ?? null)
       newData = prevData ?? {}
       newVersion = existing ? existing.version + 1 : 1
       deleted = true
@@ -378,17 +384,16 @@ export class CDCProcessorDO extends DurableObject<Env> {
   }
 
   /**
-   * Extract operation type from event type
+   * Extract operation type from the event name.
+   * Format: `{collection}.{op}` (e.g. 'contacts.insert')
    */
-  private extractOp(eventType: CDCEvent['type']): 'insert' | 'update' | 'delete' {
-    switch (eventType) {
-      case 'collection.insert':
-        return 'insert'
-      case 'collection.update':
-        return 'update'
-      case 'collection.delete':
-        return 'delete'
+  private extractOp(eventName: string): 'insert' | 'update' | 'delete' {
+    const dot = eventName.lastIndexOf('.')
+    const op = dot >= 0 ? eventName.slice(dot + 1) : eventName
+    if (op === 'insert' || op === 'update' || op === 'delete') {
+      return op
     }
+    throw new Error(`Unknown CDC operation in event name: ${eventName}`)
   }
 
   /**
