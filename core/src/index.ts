@@ -12,17 +12,59 @@
 // === Core: EventEmitter ===
 
 export { EventEmitter } from './emitter.js'
+
+// === New ClickHouse-aligned event types ===
 export type {
+  EventType,
   BaseEvent,
-  RpcCallEvent,
-  CollectionChangeEvent,
-  LifecycleEvent,
-  WebSocketEvent,
-  ClientEvent,
-  CustomEvent,
-  DurableEvent,
-  EmitInput,
+  Event,
   EventBatch,
+  // CDC
+  CdcEventData,
+  CdcEvent,
+  // Actions
+  ActionEventData,
+  ActionEvent,
+  // Relationships
+  RelEventData,
+  RelEvent,
+  // OTEL
+  OtelSpanEventData,
+  OtelSpanEvent,
+  OtelLogEventData,
+  OtelLogEvent,
+  // Sessions
+  SessionEventData,
+  SessionEvent,
+  // LLM Observability
+  LlmObservationType,
+  LlmObservationEventData,
+  LlmObservationEvent,
+  LlmScoreEventData,
+  LlmScoreEvent,
+  // Webhooks
+  StripeEventShape,
+  GitHubEventShape,
+  WebhookProvider,
+  WebhookEventData,
+  WebhookEvent,
+  // Analytics
+  PageEventData,
+  PageEvent,
+  TrackEventData,
+  TrackEvent,
+  IdentifyEventData,
+  IdentifyEvent,
+  AnalyticsEvent,
+  // Tail
+  TailEventData,
+  TailEvent,
+  // Custom
+  CustomEvent,
+  // Future
+  ExperimentEvent,
+  RecordingEvent,
+  // Config
   EventEmitterOptions,
   EventLogger,
   // Branded ID types
@@ -34,12 +76,24 @@ export type {
   SchemaId,
 } from './types.js'
 export {
-  isRpcCallEvent,
-  isCollectionChangeEvent,
-  isLifecycleEvent,
-  isWebSocketEvent,
-  isClientEvent,
+  // Type guards
+  isCdcEvent,
+  isActionEvent,
+  isRelEvent,
+  isOtelSpanEvent,
+  isOtelLogEvent,
+  isSessionEvent,
+  isLlmObservationEvent,
+  isLlmScoreEvent,
+  isWebhookEvent,
+  isPageEvent,
+  isTrackEvent,
+  isIdentifyEvent,
+  isAnalyticsEvent,
+  isTailEvent,
   isCustomEvent,
+  isBaseEvent,
+  // Error classes
   EventBufferFullError,
   CircuitBreakerOpenError,
   // Branded ID factory functions
