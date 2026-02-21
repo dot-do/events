@@ -67,7 +67,7 @@ function parseRecordJson(str: string, fieldName: string): Record<string, unknown
 
 /**
  * Extracts operation type from the CDC event name.
- * Expected format: `{collection}.{op}` (e.g. 'contacts.created', 'users.deleted')
+ * Expected format: `{noun}.{op}` (e.g. 'contact.created', 'user.deleted')
  */
 export function extractOp(eventName: string): CDCOp {
   const dot = eventName.lastIndexOf('.')

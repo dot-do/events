@@ -320,18 +320,19 @@ export class CDCProcessorDO extends DurableObject<Env> {
   /**
    * Process a single CDC event.
    * In the new Event format: data contains { type, id, ...fields }, meta may contain prev/bookmark.
+   * The `type` field in data is the singular noun (e.g. 'contact', 'deal').
    */
   private async processEvent(event: CDCEvent): Promise<void> {
-    const { type: _entityType, id: docId, ...docFields } = event.data
-    const collection = event.data.type
+    const { type: _noun, id: docId, ...docFields } = event.data
+    const noun = event.data.type
     const ts = event.ts
     const meta = event.meta as Record<string, unknown>
     const prev = meta.prev as Record<string, unknown> | undefined
     const bookmark = meta.bookmark as string | undefined
     const op = this.extractOp(event.event)
 
-    // Get existing document state from SQLite
-    const existing = this.getDocumentState(collection, docId)
+    // Get existing document state from SQLite (column named 'collection' for backward compat)
+    const existing = this.getDocumentState(noun, docId)
 
     let newData: Record<string, unknown>
     let prevData: Record<string, unknown> | null = null
@@ -364,13 +365,13 @@ export class CDCProcessorDO extends DurableObject<Env> {
       bookmark: bookmark ?? undefined,
       deleted,
     }
-    this.upsertDocumentState(collection, docState)
+    this.upsertDocumentState(noun, docState)
 
-    // Add to pending_deltas in SQLite
+    // Add to pending_deltas in SQLite (column named 'collection' for backward compat)
     this.ctx.storage.sql.exec(
       `INSERT INTO pending_deltas (collection, doc_id, op, data, prev, ts, bookmark)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      collection,
+      noun,
       docId,
       op,
       JSON.stringify(newData),
@@ -379,13 +380,13 @@ export class CDCProcessorDO extends DurableObject<Env> {
       bookmark ?? null,
     )
 
-    // Ensure manifest exists for this collection
-    this.ensureManifest(collection)
+    // Ensure manifest exists for this noun
+    this.ensureManifest(noun)
   }
 
   /**
    * Extract operation type from the event name.
-   * Format: `{collection}.{op}` (e.g. 'contacts.created')
+   * Format: `{noun}.{op}` (e.g. 'contact.created')
    */
   private extractOp(eventName: string): 'created' | 'updated' | 'deleted' {
     const dot = eventName.lastIndexOf('.')

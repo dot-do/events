@@ -27,23 +27,25 @@ export interface Collection<T extends Record<string, unknown>> {
  * - The previous document state (if trackPrevious is enabled)
  * - SQLite bookmark for PITR
  *
+ * @param noun - Singular entity type name (e.g. 'contact', 'deal', 'invoice')
+ *
  * @example
  * ```typescript
- * const users = new CDCCollection(
- *   this.collection<User>('users'),
+ * const contacts = new CDCCollection(
+ *   this.collection<Contact>('contacts'),
  *   this.events,
- *   'users'
+ *   'contact'  // singular noun — events become contact.created, contact.updated, etc.
  * )
  *
- * // This emits a CDC event
- * users.put('user-123', { name: 'Alice', active: true })
+ * // This emits a CDC event: { type: 'cdc', event: 'contact.created', data: { type: 'contact', id, ... } }
+ * contacts.put('contact-123', { name: 'Alice', active: true })
  * ```
  */
 export class CDCCollection<T extends Record<string, unknown>> {
   constructor(
     private collection: Collection<T>,
     private emitter: EventEmitter,
-    private name: string
+    private noun: string
   ) {}
 
   /**
@@ -61,9 +63,9 @@ export class CDCCollection<T extends Record<string, unknown>> {
     this.collection.put(id, doc)
 
     if (prev) {
-      this.emitter.emitChange('updated', this.name, id, doc, prev)
+      this.emitter.emitChange('updated', this.noun, id, doc, prev)
     } else {
-      this.emitter.emitChange('created', this.name, id, doc)
+      this.emitter.emitChange('created', this.noun, id, doc)
     }
   }
 
@@ -75,7 +77,7 @@ export class CDCCollection<T extends Record<string, unknown>> {
     const deleted = this.collection.delete(id)
 
     if (deleted && prev) {
-      this.emitter.emitChange('deleted', this.name, id, undefined, prev)
+      this.emitter.emitChange('deleted', this.noun, id, undefined, prev)
     }
 
     return deleted
@@ -125,7 +127,7 @@ export class CDCCollection<T extends Record<string, unknown>> {
 
     // Emit delete for each document
     for (const id of keys) {
-      this.emitter.emitChange('deleted', this.name, id)
+      this.emitter.emitChange('deleted', this.noun, id)
     }
 
     return count

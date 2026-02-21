@@ -198,21 +198,27 @@ export class EventEmitter {
   }
 
   /**
-   * Emit a CDC (Change Data Capture) event for a collection change.
+   * Emit a CDC (Change Data Capture) event for an entity mutation.
    * Automatically captures the SQLite bookmark for PITR (point-in-time recovery).
    * Only emits if the `cdc` option is enabled.
+   *
+   * @param op - The operation: 'created', 'updated', or 'deleted'
+   * @param noun - Singular entity type name (e.g. 'contact', 'deal', 'invoice')
+   * @param docId - Document ID
+   * @param doc - Current document state (omit for deletes)
+   * @param prev - Previous document state (when trackPrevious is enabled)
    */
-  emitChange(type: 'created' | 'updated' | 'deleted', collection: string, docId: string, doc?: Record<string, unknown>, prev?: Record<string, unknown>): void {
+  emitChange(op: 'created' | 'updated' | 'deleted', noun: string, docId: string, doc?: Record<string, unknown>, prev?: Record<string, unknown>): void {
     if (!this.options.cdc) return
 
-    this.getBookmarkAndEmit(type, collection, docId, doc, prev).catch((error) => {
-      this.log.error('Failed to emit CDC event', { error: error instanceof Error ? error.message : String(error), collection, docId })
+    this.getBookmarkAndEmit(op, noun, docId, doc, prev).catch((error) => {
+      this.log.error('Failed to emit CDC event', { error: error instanceof Error ? error.message : String(error), noun, docId })
     })
   }
 
   private async getBookmarkAndEmit(
-    type: 'created' | 'updated' | 'deleted',
-    collection: string,
+    op: 'created' | 'updated' | 'deleted',
+    noun: string,
     docId: string,
     doc?: Record<string, unknown>,
     prev?: Record<string, unknown>,
@@ -226,8 +232,8 @@ export class EventEmitter {
 
     this.emit({
       type: 'cdc',
-      event: `${collection}.${type}`,
-      data: { type: collection, id: docId, ...(doc ?? {}) },
+      event: `${noun}.${op}`,
+      data: { type: noun, id: docId, ...(doc ?? {}) },
       meta: {
         ...(this.options.trackPrevious && prev ? { prev } : {}),
         ...(bookmark ? { bookmark } : {}),
