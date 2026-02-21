@@ -335,8 +335,8 @@ await deleteSnapshot(this.env.SNAPSHOTS_BUCKET, 'snapshots/abc123/2024-01-15T12-
 
 ```typescript
 interface EventEmitterOptions {
-  /** Endpoint to send events (default: 'https://events.do/ingest') */
-  endpoint?: string
+  /** Pipeline binding — primary transport (required) */
+  pipeline: PipelineLike
 
   /** Batch size before auto-flush (default: 100) */
   batchSize?: number

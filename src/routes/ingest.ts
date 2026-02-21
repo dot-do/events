@@ -1,5 +1,5 @@
 /**
- * Ingest route handler - POST /ingest, /e
+ * Ingest route handler - POST /e (canonical), POST /ingest (deprecated)
  *
  * This is the main entry point that composes the ingest middleware chain.
  * The actual middleware implementations are in src/middleware/ingest/

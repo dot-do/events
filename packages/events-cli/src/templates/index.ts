@@ -140,7 +140,7 @@ export default {
     const url = new URL(request.url)
 
     // Event ingestion endpoint
-    if (url.pathname === '/ingest' && request.method === 'POST') {
+    if ((url.pathname === '/e' || url.pathname === '/ingest') && request.method === 'POST') {
       try {
         const events = await request.json() as { events: DurableEvent[] }
 
@@ -458,7 +458,7 @@ export default {
     const url = new URL(request.url)
 
     // Event ingestion
-    if (url.pathname === '/ingest' && request.method === 'POST') {
+    if ((url.pathname === '/e' || url.pathname === '/ingest') && request.method === 'POST') {
       try {
         const { events } = await request.json() as { events: DurableEvent[] }
 

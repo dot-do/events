@@ -72,7 +72,7 @@ import { EventEmitter, CDCCollection } from '@dotdo/events'
 
 export class MyDO extends DurableRPC {
   events = new EventEmitter(this.ctx, this.env, {
-    endpoint: 'https://events.workers.do/ingest',
+    pipeline: this.env.EVENTS_PIPELINE,
     cdc: true,
     trackPrevious: true,
   })

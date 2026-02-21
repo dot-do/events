@@ -19,7 +19,7 @@ import { EventBufferFullError } from './types.js'
 
 /** Default configuration values */
 const DEFAULTS = {
-  endpoint: 'https://events.workers.do/ingest',
+  endpoint: 'https://events.workers.do/e',
   batchSize: 100,
   flushIntervalMs: 1000,
   maxRetries: 3,

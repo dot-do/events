@@ -73,7 +73,7 @@ export interface EventBatch {
 export interface EventsClientConfig {
   /**
    * API endpoint URL
-   * @default 'https://events.workers.do/ingest'
+   * @default 'https://events.workers.do/e'
    */
   endpoint?: string
 

@@ -30,7 +30,7 @@ describe('EventsClient', () => {
       await client.flush()
 
       expect(mockFetch).toHaveBeenCalledWith(
-        'https://events.workers.do/ingest',
+        'https://events.workers.do/e',
         expect.objectContaining({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -41,13 +41,13 @@ describe('EventsClient', () => {
     })
 
     it('should accept custom endpoint', async () => {
-      const client = new EventsClient({ endpoint: 'https://custom.endpoint.com/ingest' })
+      const client = new EventsClient({ endpoint: 'https://custom.endpoint.com/e' })
 
       client.track('test_event')
       await client.flush()
 
       expect(mockFetch).toHaveBeenCalledWith(
-        'https://custom.endpoint.com/ingest',
+        'https://custom.endpoint.com/e',
         expect.any(Object)
       )
 

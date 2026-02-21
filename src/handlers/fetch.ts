@@ -2,7 +2,8 @@
  * Fetch handler - Main fetch handler and routing
  *
  * Routes:
- * - POST /ingest, /e - Receive batched events
+ * - POST /e - Receive batched events (canonical path)
+ * - POST /ingest - Deprecated alias for /e (returns Deprecation header)
  * - POST /webhooks?provider=xxx - Receive and verify webhooks
  * - GET /health - Health check
  * - GET /metrics - Prometheus metrics endpoint
@@ -138,8 +139,9 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   const authResponse = await handleAuth(request, env, url)
   if (authResponse) return addCorrelationId(authResponse, correlationId)
 
-  // Ingest endpoint
-  if (url.pathname === '/ingest' || url.pathname === '/e') {
+  // Event ingest endpoint — canonical path is /e
+  // /ingest is deprecated; kept for backwards compatibility with a Deprecation header
+  if (url.pathname === '/e' || url.pathname === '/ingest') {
     if (request.method !== 'POST') {
       return addCorrelationId(
         Response.json({ error: 'Method not allowed' }, {
@@ -152,7 +154,12 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     const response = await handleIngest(request, env, ctx)
     const cpuTime = performance.now() - startTime
     log.info('Request completed', { cpuMs: parseFloat(cpuTime.toFixed(2)), status: response.status })
-    return addCorrelationId(response, correlationId)
+    const final = addCorrelationId(response, correlationId)
+    if (url.pathname === '/ingest') {
+      final.headers.set('Deprecation', 'true')
+      final.headers.set('Link', '</e>; rel="successor-version"')
+    }
+    return final
   }
 
   // Webhook endpoints
