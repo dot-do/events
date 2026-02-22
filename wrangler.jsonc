@@ -50,7 +50,8 @@
       { "name": "SHARD_COORDINATOR", "class_name": "ShardCoordinatorDO" },
       { "name": "SUBSCRIPTION_SHARD_COORDINATOR", "class_name": "SubscriptionShardCoordinatorDO" },
       { "name": "RATE_LIMITER", "class_name": "RateLimiterDO" },
-      { "name": "SCHEMA_REGISTRY", "class_name": "SchemaRegistryDO" }
+      { "name": "SCHEMA_REGISTRY", "class_name": "SchemaRegistryDO" },
+      { "name": "CH_BUFFER", "class_name": "ClickHouseBufferDO" }
     ]
   },
 
@@ -63,7 +64,8 @@
     { "tag": "v5", "new_sqlite_classes": ["RateLimiterDO"] },
     { "tag": "v6", "new_sqlite_classes": ["SchemaRegistryDO"] },
     { "tag": "v7", "new_classes": ["ShardCoordinatorDO"] },
-    { "tag": "v8", "new_classes": ["SubscriptionShardCoordinatorDO"] }
+    { "tag": "v8", "new_classes": ["SubscriptionShardCoordinatorDO"] },
+    { "tag": "v9", "new_classes": ["ClickHouseBufferDO"] }
   ],
 
   // Queue for CDC/subscription fanout

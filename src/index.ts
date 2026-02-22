@@ -27,10 +27,12 @@ import { CatalogDO } from '../core/src/catalog'
 import { SubscriptionDO } from '../core/src/subscription'
 import { CDCProcessorDO } from '../core/src/cdc-processor'
 import { SchemaRegistryDO } from '../core/src/schema-registry'
+import { ClickHouseBufferDO } from '../core/src/ch-buffer-do'
 import { EventWriterDO } from './event-writer-do'
 import { ShardCoordinatorDO } from './shard-coordinator-do'
 import { SubscriptionShardCoordinatorDO } from './subscription-shard-coordinator-do'
 import { RateLimiterDO } from './middleware/rate-limiter-do'
+import { BufferService } from './buffer-service'
 
 // Import handlers
 import { handleFetch } from './handlers/fetch'
@@ -38,7 +40,7 @@ import { handleQueue } from './handlers/queue'
 import { handleScheduled } from './handlers/scheduled'
 
 // Re-export DOs for wrangler
-export { CatalogDO, SubscriptionDO, CDCProcessorDO, SchemaRegistryDO, EventWriterDO, ShardCoordinatorDO, SubscriptionShardCoordinatorDO, RateLimiterDO }
+export { CatalogDO, SubscriptionDO, CDCProcessorDO, SchemaRegistryDO, EventWriterDO, ShardCoordinatorDO, SubscriptionShardCoordinatorDO, RateLimiterDO, ClickHouseBufferDO, BufferService }
 
 export default {
   fetch: handleFetch,
