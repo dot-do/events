@@ -502,3 +502,7 @@ export {
   MIN_DELTAS_FOR_PARALLEL,
   MAX_COMPACTION_PARALLELISM,
 } from './config.js'
+
+// === ClickHouse Buffer DO ===
+export { ClickHouseBufferDO, toNdjsonRow, FLUSH_INTERVAL_MS, FIRST_SHARD_LIMITS, DEFAULT_LIMITS } from './ch-buffer-do.js'
+export type { BufferEnv } from './ch-buffer-do.js'
