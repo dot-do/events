@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "events-do",
+  "name": "events",
   "main": "src/index.ts",
   "compatibility_date": "2026-02-17",
   "compatibility_flags": ["nodejs_compat"],

@@ -21,7 +21,7 @@
   // Shared EventWriterDO - same DO used by events.do worker
   "durable_objects": {
     "bindings": [
-      { "name": "EVENT_WRITER", "class_name": "EventWriterDO", "script_name": "events-do" }
+      { "name": "EVENT_WRITER", "class_name": "EventWriterDO", "script_name": "events" }
     ]
   },
 
