@@ -17,6 +17,10 @@ import { ingestWithOverflow } from './event-writer-do'
 import type { EventRecord } from './event-writer'
 import type { Env as FullEnv } from './env'
 import { logger, sanitize } from './logger'
+import { ClickHouseBufferDO } from '../core/src/ch-buffer-do'
+
+// Re-export for wrangler (tail worker deploys its own ClickHouseBufferDO)
+export { ClickHouseBufferDO }
 
 const log = logger.child({ component: 'tail' })
 

@@ -21,9 +21,16 @@
   // Shared EventWriterDO - same DO used by events.do worker
   "durable_objects": {
     "bindings": [
-      { "name": "EVENT_WRITER", "class_name": "EventWriterDO", "script_name": "events" }
+      { "name": "EVENT_WRITER", "class_name": "EventWriterDO", "script_name": "events" },
+      { "name": "CH_BUFFER", "class_name": "ClickHouseBufferDO" }
     ]
   },
+
+  // ClickHouseBufferDO is deployed as a LOCAL class (no script_name) to break
+  // the tail loop — its logs go nowhere. Uses its own migration tag.
+  "migrations": [
+    { "tag": "v1", "new_classes": ["ClickHouseBufferDO"] }
+  ],
 
   // TAIL_AUTH_SECRET must be set via `wrangler secret put TAIL_AUTH_SECRET` or in .dev.vars
   "vars": {
