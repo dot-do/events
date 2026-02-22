@@ -1,17 +1,26 @@
-import { defineConfig } from 'vitest/config'
-import path from 'path'
+import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config'
 
-export default defineConfig({
-  resolve: {
-    alias: {
-      'cloudflare:workers': path.resolve(__dirname, 'src/tests/__mocks__/cloudflare-workers.ts'),
-    },
-  },
+export default defineWorkersConfig({
   test: {
     globals: true,
-    environment: 'node',
-    include: ['src/**/*.test.ts', 'tests/**/*.test.ts', '../src/tests/**/*.test.ts'],
-    setupFiles: ['./src/tests/setup.ts'],
+    include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
+    poolOptions: {
+      workers: {
+        singleWorker: true,
+        isolatedStorage: false,
+        main: './src/tests/test-worker.ts',
+        miniflare: {
+          compatibilityDate: '2026-02-17',
+          compatibilityFlags: ['nodejs_compat'],
+          durableObjects: {
+            EVENT_EMITTER_TEST: {
+              className: 'EventEmitterTestDO',
+              useSQLite: true,
+            },
+          },
+        },
+      },
+    },
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'json-summary', 'html'],

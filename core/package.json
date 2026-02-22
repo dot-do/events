@@ -62,12 +62,14 @@
     "picomatch": "^4.0.3"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.10.15",
     "@cloudflare/workers-types": "^4.20250121.0",
     "@types/picomatch": "^4.0.2",
     "@vitest/coverage-v8": "^2.1.8",
     "tsup": "^8.0.0",
     "typescript": "^5.7.3",
-    "vitest": "^2.1.8"
+    "vitest": "^2.1.8",
+    "wrangler": "^4.0.0"
   },
   "peerDependencies": {
     "@cloudflare/workers-types": "^4.0.0"
