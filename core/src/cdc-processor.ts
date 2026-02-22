@@ -23,6 +23,13 @@ import {
 export type { CDCEvent } from './cdc-delta.js'
 export { isCdcEvent } from './types.js'
 
+/**
+ * Type guard for collection change events (CDC: insert/update/delete).
+ */
+export function isCollectionChangeEvent(event: { type?: string }): boolean {
+  return typeof event.type === 'string' && event.type.startsWith('collection.')
+}
+
 // ============================================================================
 // Types
 // ============================================================================
