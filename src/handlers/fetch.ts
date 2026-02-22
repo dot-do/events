@@ -174,33 +174,36 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
     // Authenticate using AUTH RPC binding directly
     const auth = request.headers.get('Authorization')
     const cookie = request.headers.get('Cookie')
-    const result = await env.AUTH.authenticate(auth, cookie)
+    let result: { ok: true; user: { id: string; email?: string; roles?: string[]; permissions?: string[]; [key: string]: unknown } } | { ok: false; status: number; error: string }
+    try {
+      result = await env.AUTH.authenticate(auth, cookie)
+    } catch (err) {
+      log.error('AUTH.authenticate RPC failed', { error: err instanceof Error ? err.message : String(err) })
+      return addCorrelationId(
+        Response.json({ error: 'Authentication service unavailable' }, { status: 503 }),
+        correlationId
+      )
+    }
 
     if (!result.ok) {
       const accept = request.headers.get('Accept') || ''
       if (accept.includes('text/html')) {
         const loginUrl = `${url.origin}/login?redirect_uri=${encodeURIComponent(url.pathname + url.search)}`
-        log.info('Redirecting to login', { status: 302 })
+        log.info('Redirecting to login', { status: 302, reason: result.error })
         return Response.redirect(loginUrl, 302)
       }
-      log.warn('Authentication failed', { status: result.status || 401 })
+      log.warn('Authentication failed', { status: result.status || 401, reason: result.error })
       return addCorrelationId(
         Response.json({ error: result.error || 'Authentication required' }, { status: result.status || 401 }),
         correlationId
       )
     }
 
-    if (!result.user?.roles?.includes('admin')) {
-      log.warn('Admin access denied', { user: result.user?.email, status: 403 })
-      return addCorrelationId(
-        Response.json({
-          error: 'Admin access required',
-          authenticated: true,
-          message: 'You are logged in but do not have admin privileges'
-        }, { status: 403 }),
-        correlationId
-      )
-    }
+    // Note: admin role check removed — any authenticated user can access the dashboard.
+    // To re-enable, uncomment the block below:
+    // if (!result.user?.roles?.includes('admin')) {
+    //   return addCorrelationId(Response.json({ error: 'Admin access required' }, { status: 403 }), correlationId)
+    // }
 
     // Attach user to request for downstream handlers
     const authReq = request as AuthRequest

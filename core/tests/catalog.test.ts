@@ -25,7 +25,7 @@ function createMockSqlStorage() {
 
   function parseInsertValues(sql: string, params: unknown[]): { table: string; columns: string[]; values: unknown[] } {
     // INSERT INTO table (col1, col2) VALUES (?, ?)
-    const match = sql.match(/INSERT INTO (\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i)
+    const match = sql.match(/INSERT(?: OR \w+)? INTO (\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i)
     if (!match) throw new Error(`Cannot parse INSERT: ${sql}`)
     const table = match[1]
     const columns = match[2].split(',').map(c => c.trim())

@@ -278,7 +278,7 @@ export async function handleEventsQuery(request: Request, env: Env): Promise<Res
     limit,
     provider: url.searchParams.get('provider') ?? undefined,
     format: url.searchParams.get('format') ?? 'parquet',
-    source: url.searchParams.get('source') ?? 'all', // events, tail, or all
+    source: url.searchParams.get('source') ?? 'events', // events, tail, or all (default: events to avoid tail scan timeout)
   }
 
   // Initialize timing trackers

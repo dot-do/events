@@ -806,7 +806,7 @@ describe('buildHistoryQuery', () => {
       docId: 'user-123',
     })
 
-    expect(query).toContain("type IN ('collection.insert', 'collection.update', 'collection.delete')")
+    expect(query).toContain("type IN ('collection.created', 'collection.updated', 'collection.deleted')")
   })
 
   it('includes docId filter', () => {
@@ -871,7 +871,7 @@ describe('buildHistoryQuery', () => {
     // Should have all necessary filters
     expect(query).toContain("docId = 'acc-xyz'")
     expect(query).toContain("collection = 'accounts'")
-    expect(query).toContain("type IN ('collection.insert', 'collection.update', 'collection.delete')")
+    expect(query).toContain("type IN ('collection.created', 'collection.updated', 'collection.deleted')")
 
     // Should order by timestamp ascending
     expect(query).toContain('ORDER BY ts ASC')

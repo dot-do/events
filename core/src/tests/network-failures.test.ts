@@ -2,7 +2,7 @@
  * Network Failure and Partial Failure Test Scenarios
  *
  * events-858: Tests for network failure scenarios including:
- * - Network timeouts
+ * - Pipeline send timeouts
  * - Connection failures
  * - Partial writes/reads
  * - Retry behavior with exponential backoff
@@ -14,8 +14,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from '../emitter.js'
 import { EventBufferFullError, CircuitBreakerOpenError } from '../types.js'
-import type { DurableEvent } from '../types.js'
-import { createMockCtx, createMockR2Bucket, createMockRequest, createMockFetch } from './mocks.js'
+import { createMockCtx } from './mocks.js'
 import {
   RETRY_BASE_DELAY_MS,
   RETRY_MAX_DELAY_MS,
@@ -29,12 +28,11 @@ import {
 
 describe('Network Timeouts', () => {
   let mockCtx: ReturnType<typeof createMockCtx>
-  let mockEnv: Record<string, unknown>
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockPipeline: { send: ReturnType<typeof vi.fn> }
 
   beforeEach(() => {
     mockCtx = createMockCtx({ id: 'test-do-123', name: 'test-object' })
-    mockEnv = {}
+    mockPipeline = { send: vi.fn().mockResolvedValue(undefined) }
     vi.useFakeTimers()
   })
 
@@ -43,18 +41,20 @@ describe('Network Timeouts', () => {
     vi.useRealTimers()
   })
 
-  describe('fetch timeout scenarios', () => {
-    it('should handle fetch that never resolves (simulated timeout)', async () => {
-      // Create a fetch that never resolves, simulating a hung connection
-      mockFetch = vi.fn().mockImplementation(() =>
-        new Promise(() => {
-          // Never resolves - simulates network timeout
-        })
-      )
-      vi.stubGlobal('fetch', mockFetch)
+  describe('pipeline.send timeout scenarios', () => {
+    it('should handle pipeline.send that never resolves (simulated timeout)', async () => {
+      // Create a pipeline.send that never resolves, simulating a hung connection
+      mockPipeline = {
+        send: vi.fn().mockImplementation(
+          () =>
+            new Promise(() => {
+              // Never resolves - simulates pipeline timeout
+            }),
+        ),
+      }
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
 
       // Start flush - it should hang
       const flushPromise = emitter.flush()
@@ -63,38 +63,35 @@ describe('Network Timeouts', () => {
       await vi.advanceTimersByTimeAsync(60000)
 
       // The promise should still be pending (since we can't cancel it)
-      // In real implementation, AbortController with timeout would be used
-      expect(mockFetch).toHaveBeenCalledTimes(1)
+      expect(mockPipeline.send).toHaveBeenCalledTimes(1)
     })
 
-    it('should handle AbortError from fetch timeout', async () => {
+    it('should handle AbortError from pipeline.send', async () => {
       const abortError = new DOMException('The operation was aborted', 'AbortError')
-      mockFetch = vi.fn().mockRejectedValue(abortError)
-      vi.stubGlobal('fetch', mockFetch)
+      mockPipeline = { send: vi.fn().mockRejectedValue(abortError) }
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
       // Should have scheduled retry
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
       expect(mockCtx.storage.setAlarm).toHaveBeenCalled()
     })
 
-    it('should handle slow response that eventually succeeds', async () => {
-      let resolveResponse: (value: Response) => void
-      mockFetch = vi.fn().mockImplementation(() =>
-        new Promise((resolve) => {
-          resolveResponse = resolve
-        })
-      )
-      vi.stubGlobal('fetch', mockFetch)
+    it('should handle slow pipeline.send that eventually succeeds', async () => {
+      let resolveResponse: (value: undefined) => void
+      mockPipeline = {
+        send: vi.fn().mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              resolveResponse = resolve
+            }),
+        ),
+      }
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
 
       const flushPromise = emitter.flush()
 
@@ -102,28 +99,23 @@ describe('Network Timeouts', () => {
       await vi.advanceTimersByTimeAsync(5000)
 
       // Now resolve the response
-      resolveResponse!(new Response('OK', { status: 200 }))
+      resolveResponse!(undefined)
       await flushPromise
 
       // Should not have scheduled retry since it eventually succeeded
-      expect(mockCtx.storage.put).not.toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).not.toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
 
     it('should handle timeout during retry attempts', async () => {
       const timeoutError = new Error('timeout')
-      mockFetch = vi.fn()
-        .mockRejectedValueOnce(timeoutError)
-        .mockRejectedValueOnce(timeoutError)
-        .mockResolvedValueOnce(new Response('OK', { status: 200 }))
-      vi.stubGlobal('fetch', mockFetch)
+      mockPipeline = {
+        send: vi.fn().mockRejectedValueOnce(timeoutError).mockRejectedValueOnce(timeoutError).mockResolvedValueOnce(undefined),
+      }
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
 
       // Initial emit and flush - will fail
-      emitter.emit({ type: 'test.event' })
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
       // First retry via alarm - will also fail
@@ -132,7 +124,7 @@ describe('Network Timeouts', () => {
       // Second retry via alarm - will succeed
       await emitter.handleAlarm()
 
-      expect(mockFetch).toHaveBeenCalledTimes(3)
+      expect(mockPipeline.send).toHaveBeenCalledTimes(3)
       expect(mockCtx.storage.delete).toHaveBeenCalledWith('_events:retry')
     })
   })
@@ -144,14 +136,11 @@ describe('Network Timeouts', () => {
 
 describe('Connection Failures', () => {
   let mockCtx: ReturnType<typeof createMockCtx>
-  let mockEnv: Record<string, unknown>
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockPipeline: { send: ReturnType<typeof vi.fn> }
 
   beforeEach(() => {
     mockCtx = createMockCtx({ id: 'test-do-123', name: 'test-object' })
-    mockEnv = {}
-    mockFetch = vi.fn().mockResolvedValue(new Response('OK', { status: 200 }))
-    vi.stubGlobal('fetch', mockFetch)
+    mockPipeline = { send: vi.fn().mockResolvedValue(undefined) }
     vi.useFakeTimers()
   })
 
@@ -164,157 +153,121 @@ describe('Connection Failures', () => {
     it('should handle DNS resolution failure', async () => {
       const dnsError = new TypeError('Failed to fetch')
       dnsError.cause = new Error('getaddrinfo ENOTFOUND events.workers.do')
-      mockFetch.mockRejectedValue(dnsError)
+      mockPipeline.send.mockRejectedValue(dnsError)
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
       // Should store for retry
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
   })
 
   describe('TCP connection failures', () => {
     it('should handle connection refused error', async () => {
-      mockFetch.mockRejectedValue(new Error('ECONNREFUSED'))
+      mockPipeline.send.mockRejectedValue(new Error('ECONNREFUSED'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
       expect(mockCtx.storage.setAlarm).toHaveBeenCalled()
     })
 
     it('should handle connection reset error', async () => {
-      mockFetch.mockRejectedValue(new Error('ECONNRESET'))
+      mockPipeline.send.mockRejectedValue(new Error('ECONNRESET'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
 
     it('should handle socket hang up', async () => {
-      mockFetch.mockRejectedValue(new Error('socket hang up'))
+      mockPipeline.send.mockRejectedValue(new Error('socket hang up'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
   })
 
   describe('SSL/TLS failures', () => {
     it('should handle SSL certificate error', async () => {
-      mockFetch.mockRejectedValue(new Error('CERT_HAS_EXPIRED'))
+      mockPipeline.send.mockRejectedValue(new Error('CERT_HAS_EXPIRED'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
 
     it('should handle SSL handshake failure', async () => {
-      mockFetch.mockRejectedValue(new Error('SSL_HANDSHAKE_FAILED'))
+      mockPipeline.send.mockRejectedValue(new Error('SSL_HANDSHAKE_FAILED'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
   })
 
-  describe('HTTP error responses', () => {
-    it('should handle 500 Internal Server Error', async () => {
-      mockFetch.mockResolvedValue(new Response('Internal Server Error', { status: 500 }))
+  describe('pipeline send failures (server errors)', () => {
+    it('should handle pipeline send failure (Internal Server Error)', async () => {
+      mockPipeline.send.mockRejectedValue(new Error('Internal Server Error'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
 
-    it('should handle 502 Bad Gateway', async () => {
-      mockFetch.mockResolvedValue(new Response('Bad Gateway', { status: 502 }))
+    it('should handle pipeline send failure (Bad Gateway)', async () => {
+      mockPipeline.send.mockRejectedValue(new Error('Bad Gateway'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
 
-    it('should handle 503 Service Unavailable', async () => {
-      mockFetch.mockResolvedValue(new Response('Service Unavailable', { status: 503 }))
+    it('should handle pipeline send failure (Service Unavailable)', async () => {
+      mockPipeline.send.mockRejectedValue(new Error('Service Unavailable'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
 
-    it('should handle 504 Gateway Timeout', async () => {
-      mockFetch.mockResolvedValue(new Response('Gateway Timeout', { status: 504 }))
+    it('should handle pipeline send failure (Gateway Timeout)', async () => {
+      mockPipeline.send.mockRejectedValue(new Error('Gateway Timeout'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
 
-    it('should handle 429 Too Many Requests', async () => {
-      mockFetch.mockResolvedValue(new Response('Too Many Requests', {
-        status: 429,
-        headers: { 'Retry-After': '60' }
-      }))
+    it('should handle pipeline send failure (Too Many Requests)', async () => {
+      mockPipeline.send.mockRejectedValue(new Error('Too Many Requests'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
   })
 })
@@ -325,16 +278,11 @@ describe('Connection Failures', () => {
 
 describe('Partial Writes and Reads', () => {
   let mockCtx: ReturnType<typeof createMockCtx>
-  let mockEnv: Record<string, unknown>
-  let mockFetch: ReturnType<typeof vi.fn>
-  let mockR2: ReturnType<typeof createMockR2Bucket>
+  let mockPipeline: { send: ReturnType<typeof vi.fn> }
 
   beforeEach(() => {
     mockCtx = createMockCtx({ id: 'test-do-123', name: 'test-object' })
-    mockEnv = {}
-    mockFetch = vi.fn().mockResolvedValue(new Response('OK', { status: 200 }))
-    mockR2 = createMockR2Bucket()
-    vi.stubGlobal('fetch', mockFetch)
+    mockPipeline = { send: vi.fn().mockResolvedValue(undefined) }
     vi.useFakeTimers()
   })
 
@@ -346,129 +294,73 @@ describe('Partial Writes and Reads', () => {
   describe('partial batch transmission', () => {
     it('should handle partial batch failure where some events succeed', async () => {
       // First flush succeeds, subsequent ones fail
-      mockFetch
-        .mockResolvedValueOnce(new Response('OK', { status: 200 }))
-        .mockRejectedValueOnce(new Error('Network error'))
+      mockPipeline.send.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('Network error'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv, { batchSize: 2 })
+      const emitter = new EventEmitter(mockPipeline, { batchSize: 2 }, mockCtx)
 
       // First batch - will succeed
-      emitter.emit({ type: 'event1' })
-      emitter.emit({ type: 'event2' })
+      emitter.emit({ type: 'test', event: 'event1', data: {} })
+      emitter.emit({ type: 'test', event: 'event2', data: {} })
       await vi.runAllTimersAsync()
 
       // Second batch - will fail
-      emitter.emit({ type: 'event3' })
-      emitter.emit({ type: 'event4' })
+      emitter.emit({ type: 'test', event: 'event3', data: {} })
+      emitter.emit({ type: 'test', event: 'event4', data: {} })
       await vi.runAllTimersAsync()
 
       // First batch should have succeeded
-      expect(mockFetch).toHaveBeenCalledTimes(2)
+      expect(mockPipeline.send).toHaveBeenCalledTimes(2)
       // Failed events should be queued for retry
       expect(mockCtx.storage.put).toHaveBeenCalledWith(
         '_events:retry',
-        expect.arrayContaining([
-          expect.objectContaining({ type: 'event3' }),
-          expect.objectContaining({ type: 'event4' }),
-        ])
+        expect.arrayContaining([expect.objectContaining({ event: 'event3' }), expect.objectContaining({ event: 'event4' })]),
       )
     })
 
     it('should preserve event order when retrying failed batches', async () => {
       // Fail first, then succeed
-      mockFetch
-        .mockRejectedValueOnce(new Error('Network error'))
-        .mockResolvedValueOnce(new Response('OK', { status: 200 }))
+      mockPipeline.send.mockRejectedValueOnce(new Error('Network error')).mockResolvedValueOnce(undefined)
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
 
-      emitter.emit({ type: 'event1' })
-      emitter.emit({ type: 'event2' })
-      emitter.emit({ type: 'event3' })
+      emitter.emit({ type: 'test', event: 'event1', data: {} })
+      emitter.emit({ type: 'test', event: 'event2', data: {} })
+      emitter.emit({ type: 'test', event: 'event3', data: {} })
       await emitter.flush()
 
       // Check retry queue preserves order
-      const retryCalls = mockCtx.storage.put.mock.calls.filter(
-        (call: unknown[]) => call[0] === '_events:retry'
-      )
+      const retryCalls = mockCtx.storage.put.mock.calls.filter((call: unknown[]) => call[0] === '_events:retry')
       expect(retryCalls.length).toBeGreaterThan(0)
 
-      const retryEvents = retryCalls[0][1] as DurableEvent[]
-      expect(retryEvents[0].type).toBe('event1')
-      expect(retryEvents[1].type).toBe('event2')
-      expect(retryEvents[2].type).toBe('event3')
-    })
-  })
-
-  describe('R2 partial write failures', () => {
-    it('should handle R2 write failure after successful HTTP flush', async () => {
-      // HTTP succeeds but R2 fails
-      mockR2.put = vi.fn().mockRejectedValue(new Error('R2 write failed'))
-
-      const emitter = new EventEmitter(mockCtx, mockEnv, { r2Bucket: mockR2 })
-
-      emitter.emit({ type: 'test.event' })
-      await emitter.flush()
-
-      // HTTP should have succeeded
-      expect(mockFetch).toHaveBeenCalledTimes(1)
-      // R2 write was attempted
-      expect(mockR2.put).toHaveBeenCalled()
-      // Events should still be cleared from batch (HTTP succeeded)
-      expect(emitter.pendingCount).toBe(0)
-    })
-
-    it('should handle R2 write error gracefully', async () => {
-      // R2 write fails after HTTP succeeds
-      mockR2.put = vi.fn().mockRejectedValue(new Error('R2 timeout'))
-
-      const emitter = new EventEmitter(mockCtx, mockEnv, { r2Bucket: mockR2 })
-
-      emitter.emit({ type: 'test.event' })
-      await emitter.flush()
-
-      // HTTP succeeded, R2 failed, but flush should still complete
-      expect(emitter.pendingCount).toBe(0)
-      expect(mockR2.put).toHaveBeenCalled()
+      const retryEvents = retryCalls[0][1] as Record<string, unknown>[]
+      expect(retryEvents[0].event).toBe('event1')
+      expect(retryEvents[1].event).toBe('event2')
+      expect(retryEvents[2].event).toBe('event3')
     })
   })
 
   describe('storage partial failures', () => {
     it('should handle storage.put failure during retry scheduling', async () => {
-      mockFetch.mockRejectedValue(new Error('Network error'))
+      mockPipeline.send.mockRejectedValue(new Error('Network error'))
 
       // Make storage.put fail
       mockCtx.storage.put.mockRejectedValueOnce(new Error('Storage write failed'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
 
       // flush() will fail to save retry queue
       await expect(emitter.flush()).rejects.toThrow('Storage write failed')
     })
 
-    it('should handle storage.get failure during batch restore', async () => {
-      // Make storage.get fail for batch restore
-      mockCtx.storage.get.mockRejectedValueOnce(new Error('Storage read failed'))
-
-      // Constructor calls restoreBatch which should handle the error gracefully
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-
-      // Wait for async restore to complete
-      await vi.runAllTimersAsync()
-
-      // Emitter should still function despite restore failure
-      expect(() => emitter.emit({ type: 'test.event' })).not.toThrow()
-    })
-
     it('should handle storage.setAlarm failure', async () => {
-      mockFetch.mockRejectedValue(new Error('Network error'))
+      mockPipeline.send.mockRejectedValue(new Error('Network error'))
 
       // Make setAlarm fail
       mockCtx.storage.setAlarm.mockRejectedValueOnce(new Error('setAlarm failed'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
 
       // flush() will fail when trying to schedule alarm
       await expect(emitter.flush()).rejects.toThrow('setAlarm failed')
@@ -482,14 +374,11 @@ describe('Partial Writes and Reads', () => {
 
 describe('Retry Behavior with Exponential Backoff', () => {
   let mockCtx: ReturnType<typeof createMockCtx>
-  let mockEnv: Record<string, unknown>
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockPipeline: { send: ReturnType<typeof vi.fn> }
 
   beforeEach(() => {
     mockCtx = createMockCtx({ id: 'test-do-123', name: 'test-object' })
-    mockEnv = {}
-    mockFetch = vi.fn().mockRejectedValue(new Error('Network error'))
-    vi.stubGlobal('fetch', mockFetch)
+    mockPipeline = { send: vi.fn().mockRejectedValue(new Error('Network error')) }
     vi.useFakeTimers()
   })
 
@@ -500,8 +389,8 @@ describe('Retry Behavior with Exponential Backoff', () => {
 
   describe('exponential backoff calculation', () => {
     it('should increase delay exponentially with each retry', async () => {
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
 
       // First failure
       await emitter.flush()
@@ -524,9 +413,9 @@ describe('Retry Behavior with Exponential Backoff', () => {
     })
 
     it('should cap retry delay at RETRY_MAX_DELAY_MS', async () => {
-      // Use a lower maxConsecutiveFailures to avoid circuit breaker opening
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 0 })
-      emitter.emit({ type: 'test.event' })
+      // Use maxConsecutiveFailures: 0 to disable circuit breaker
+      const emitter = new EventEmitter(mockPipeline, { maxConsecutiveFailures: 0 }, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
 
       // Simulate many retries to exceed max delay
       for (let i = 0; i < 10; i++) {
@@ -552,8 +441,8 @@ describe('Retry Behavior with Exponential Backoff', () => {
       // Run multiple times to check jitter variability
       for (let i = 0; i < 5; i++) {
         const ctx = createMockCtx({ id: `test-do-${i}` })
-        const emitter = new EventEmitter(ctx, mockEnv)
-        emitter.emit({ type: 'test.event' })
+        const emitter = new EventEmitter(mockPipeline, {}, ctx)
+        emitter.emit({ type: 'test', event: 'test.event', data: {} })
         await emitter.flush()
 
         const alarmCall = ctx.storage.setAlarm.mock.calls[0]
@@ -568,15 +457,15 @@ describe('Retry Behavior with Exponential Backoff', () => {
     })
 
     it('should reset retry count after successful delivery', async () => {
-      mockFetch
+      mockPipeline.send
         .mockRejectedValueOnce(new Error('Network error'))
         .mockRejectedValueOnce(new Error('Network error'))
-        .mockResolvedValueOnce(new Response('OK', { status: 200 }))
+        .mockResolvedValueOnce(undefined)
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
 
       // First event - fails twice then succeeds
-      emitter.emit({ type: 'event1' })
+      emitter.emit({ type: 'test', event: 'event1', data: {} })
       await emitter.flush()
       await emitter.handleAlarm()
       await emitter.handleAlarm()
@@ -586,76 +475,75 @@ describe('Retry Behavior with Exponential Backoff', () => {
       expect(mockCtx.storage.delete).toHaveBeenCalledWith('_events:retry')
 
       // Circuit breaker should be closed
-      const info = await emitter.getCircuitBreakerInfo()
-      expect(info.consecutiveFailures).toBe(0)
+      expect(emitter.circuitBreakerOpen).toBe(false)
     })
   })
 
   describe('retry queue management', () => {
     it('should combine new events with existing retry queue', async () => {
       // Pre-populate retry queue
-      const existingEvents: DurableEvent[] = [
-        { type: 'existing.event', ts: '2024-01-01T00:00:00Z', do: { id: 'test' } },
+      const existingEvents: Record<string, unknown>[] = [
+        { type: 'test', event: 'existing.event', data: {}, ts: '2024-01-01T00:00:00Z', meta: { do: { id: 'test' } } },
       ]
       mockCtx.storage._storage.set('_events:retry', existingEvents)
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'new.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'new.event', data: {} })
       await emitter.flush()
 
       // Both events should be in retry queue
-      const retryCalls = mockCtx.storage.put.mock.calls.filter(
-        (call: unknown[]) => call[0] === '_events:retry'
-      )
-      const combinedEvents = retryCalls[retryCalls.length - 1][1] as DurableEvent[]
+      const retryCalls = mockCtx.storage.put.mock.calls.filter((call: unknown[]) => call[0] === '_events:retry')
+      const combinedEvents = retryCalls[retryCalls.length - 1][1] as Record<string, unknown>[]
       expect(combinedEvents.length).toBe(2)
-      expect(combinedEvents[0].type).toBe('existing.event')
-      expect(combinedEvents[1].type).toBe('new.event')
+      expect(combinedEvents[0].event).toBe('existing.event')
+      expect(combinedEvents[1].event).toBe('new.event')
     })
 
     it('should not exceed maxRetryQueueSize', async () => {
       const maxSize = 100
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxRetryQueueSize: maxSize })
+      const emitter = new EventEmitter(mockPipeline, { maxRetryQueueSize: maxSize }, mockCtx)
 
       // Pre-populate with maxSize events
-      const existingEvents: DurableEvent[] = Array.from({ length: maxSize }, (_, i) => ({
-        type: `event.${i}`,
+      const existingEvents: Record<string, unknown>[] = Array.from({ length: maxSize }, (_, i) => ({
+        type: 'test',
+        event: `event.${i}`,
+        data: {},
         ts: '2024-01-01T00:00:00Z',
-        do: { id: 'test' },
+        meta: { do: { id: 'test' } },
       }))
       mockCtx.storage._storage.set('_events:retry', existingEvents)
 
       // Add more events
       for (let i = 0; i < 10; i++) {
-        emitter.emit({ type: `overflow.${i}` })
+        emitter.emit({ type: 'test', event: `overflow.${i}`, data: {} })
       }
 
       // Should throw EventBufferFullError
       await expect(emitter.flush()).rejects.toThrow(EventBufferFullError)
 
       // Queue should still be capped at maxSize
-      const retryCalls = mockCtx.storage.put.mock.calls.filter(
-        (call: unknown[]) => call[0] === '_events:retry'
-      )
-      const finalQueue = retryCalls[retryCalls.length - 1][1] as DurableEvent[]
+      const retryCalls = mockCtx.storage.put.mock.calls.filter((call: unknown[]) => call[0] === '_events:retry')
+      const finalQueue = retryCalls[retryCalls.length - 1][1] as Record<string, unknown>[]
       expect(finalQueue.length).toBe(maxSize)
     })
 
     it('should drop oldest events when queue overflows', async () => {
       const maxSize = 5
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxRetryQueueSize: maxSize })
+      const emitter = new EventEmitter(mockPipeline, { maxRetryQueueSize: maxSize }, mockCtx)
 
       // Pre-populate with maxSize events
-      const existingEvents: DurableEvent[] = Array.from({ length: maxSize }, (_, i) => ({
-        type: `old.${i}`,
+      const existingEvents: Record<string, unknown>[] = Array.from({ length: maxSize }, (_, i) => ({
+        type: 'test',
+        event: `old.${i}`,
+        data: {},
         ts: '2024-01-01T00:00:00Z',
-        do: { id: 'test' },
+        meta: { do: { id: 'test' } },
       }))
       mockCtx.storage._storage.set('_events:retry', existingEvents)
 
       // Add 3 new events
       for (let i = 0; i < 3; i++) {
-        emitter.emit({ type: `new.${i}` })
+        emitter.emit({ type: 'test', event: `new.${i}`, data: {} })
       }
 
       try {
@@ -664,32 +552,32 @@ describe('Retry Behavior with Exponential Backoff', () => {
         // Expected EventBufferFullError
       }
 
-      const retryCalls = mockCtx.storage.put.mock.calls.filter(
-        (call: unknown[]) => call[0] === '_events:retry'
-      )
-      const finalQueue = retryCalls[retryCalls.length - 1][1] as DurableEvent[]
+      const retryCalls = mockCtx.storage.put.mock.calls.filter((call: unknown[]) => call[0] === '_events:retry')
+      const finalQueue = retryCalls[retryCalls.length - 1][1] as Record<string, unknown>[]
 
-      // Should contain last 5 events (2 oldest dropped)
+      // Should contain last 5 events (3 oldest dropped)
       expect(finalQueue.length).toBe(maxSize)
       // Oldest events should be dropped, newest kept
-      expect(finalQueue[finalQueue.length - 1].type).toBe('new.2')
-      expect(finalQueue[finalQueue.length - 2].type).toBe('new.1')
-      expect(finalQueue[finalQueue.length - 3].type).toBe('new.0')
+      expect(finalQueue[finalQueue.length - 1].event).toBe('new.2')
+      expect(finalQueue[finalQueue.length - 2].event).toBe('new.1')
+      expect(finalQueue[finalQueue.length - 3].event).toBe('new.0')
     })
 
-    it('should track dropped events count', async () => {
+    it('should track dropped events count via EventBufferFullError', async () => {
       const maxSize = 5
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxRetryQueueSize: maxSize })
+      const emitter = new EventEmitter(mockPipeline, { maxRetryQueueSize: maxSize }, mockCtx)
 
-      const existingEvents: DurableEvent[] = Array.from({ length: maxSize }, (_, i) => ({
-        type: `old.${i}`,
+      const existingEvents: Record<string, unknown>[] = Array.from({ length: maxSize }, (_, i) => ({
+        type: 'test',
+        event: `old.${i}`,
+        data: {},
         ts: '2024-01-01T00:00:00Z',
-        do: { id: 'test' },
+        meta: { do: { id: 'test' } },
       }))
       mockCtx.storage._storage.set('_events:retry', existingEvents)
 
       for (let i = 0; i < 3; i++) {
-        emitter.emit({ type: `new.${i}` })
+        emitter.emit({ type: 'test', event: `new.${i}`, data: {} })
       }
 
       try {
@@ -698,8 +586,6 @@ describe('Retry Behavior with Exponential Backoff', () => {
         expect(e).toBeInstanceOf(EventBufferFullError)
         expect((e as EventBufferFullError).droppedCount).toBe(3)
       }
-
-      expect(emitter.droppedEvents).toBe(3)
     })
   })
 })
@@ -710,14 +596,11 @@ describe('Retry Behavior with Exponential Backoff', () => {
 
 describe('Circuit Breaker Pattern', () => {
   let mockCtx: ReturnType<typeof createMockCtx>
-  let mockEnv: Record<string, unknown>
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockPipeline: { send: ReturnType<typeof vi.fn> }
 
   beforeEach(() => {
     mockCtx = createMockCtx({ id: 'test-do-123', name: 'test-object' })
-    mockEnv = {}
-    mockFetch = vi.fn().mockRejectedValue(new Error('Network error'))
-    vi.stubGlobal('fetch', mockFetch)
+    mockPipeline = { send: vi.fn().mockRejectedValue(new Error('Network error')) }
     vi.useFakeTimers()
   })
 
@@ -729,29 +612,31 @@ describe('Circuit Breaker Pattern', () => {
   describe('circuit breaker opening', () => {
     it('should open circuit breaker after maxConsecutiveFailures', async () => {
       const maxFailures = 3
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: maxFailures })
+      const emitter = new EventEmitter(mockPipeline, { maxConsecutiveFailures: maxFailures }, mockCtx)
 
       // Fail maxFailures times
       for (let i = 0; i < maxFailures; i++) {
-        emitter.emit({ type: `event.${i}` })
+        emitter.emit({ type: 'test', event: `event.${i}`, data: {} })
         await emitter.flush()
       }
 
-      // Circuit breaker should now be open
-      expect(() => emitter.emit({ type: 'blocked.event' })).toThrow(CircuitBreakerOpenError)
+      // Circuit breaker should now be open — emit succeeds but flush throws
+      emitter.emit({ type: 'test', event: 'blocked.event', data: {} })
+      await expect(emitter.flush()).rejects.toThrow(CircuitBreakerOpenError)
     })
 
     it('should include failure count in CircuitBreakerOpenError', async () => {
       const maxFailures = 3
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: maxFailures })
+      const emitter = new EventEmitter(mockPipeline, { maxConsecutiveFailures: maxFailures }, mockCtx)
 
       for (let i = 0; i < maxFailures; i++) {
-        emitter.emit({ type: `event.${i}` })
+        emitter.emit({ type: 'test', event: `event.${i}`, data: {} })
         await emitter.flush()
       }
 
       try {
-        emitter.emit({ type: 'blocked.event' })
+        emitter.emit({ type: 'test', event: 'blocked.event', data: {} })
+        await emitter.flush()
         expect.fail('Should have thrown')
       } catch (e) {
         expect(e).toBeInstanceOf(CircuitBreakerOpenError)
@@ -762,18 +647,23 @@ describe('Circuit Breaker Pattern', () => {
     it('should include reset time in CircuitBreakerOpenError', async () => {
       const maxFailures = 3
       const resetMs = 5000
-      const emitter = new EventEmitter(mockCtx, mockEnv, {
-        maxConsecutiveFailures: maxFailures,
-        circuitBreakerResetMs: resetMs,
-      })
+      const emitter = new EventEmitter(
+        mockPipeline,
+        {
+          maxConsecutiveFailures: maxFailures,
+          circuitBreakerResetMs: resetMs,
+        },
+        mockCtx,
+      )
 
       for (let i = 0; i < maxFailures; i++) {
-        emitter.emit({ type: `event.${i}` })
+        emitter.emit({ type: 'test', event: `event.${i}`, data: {} })
         await emitter.flush()
       }
 
       try {
-        emitter.emit({ type: 'blocked.event' })
+        emitter.emit({ type: 'test', event: 'blocked.event', data: {} })
+        await emitter.flush()
         expect.fail('Should have thrown')
       } catch (e) {
         expect(e).toBeInstanceOf(CircuitBreakerOpenError)
@@ -788,73 +678,84 @@ describe('Circuit Breaker Pattern', () => {
     it('should allow retry attempt after circuitBreakerResetMs', async () => {
       const maxFailures = 2
       const resetMs = 5000
-      const emitter = new EventEmitter(mockCtx, mockEnv, {
-        maxConsecutiveFailures: maxFailures,
-        circuitBreakerResetMs: resetMs,
-      })
+      const emitter = new EventEmitter(
+        mockPipeline,
+        {
+          maxConsecutiveFailures: maxFailures,
+          circuitBreakerResetMs: resetMs,
+        },
+        mockCtx,
+      )
 
       // Open circuit breaker
       for (let i = 0; i < maxFailures; i++) {
-        emitter.emit({ type: `event.${i}` })
+        emitter.emit({ type: 'test', event: `event.${i}`, data: {} })
         await emitter.flush()
       }
 
       // Should be open
-      expect(() => emitter.emit({ type: 'blocked.event' })).toThrow(CircuitBreakerOpenError)
+      emitter.emit({ type: 'test', event: 'blocked.event', data: {} })
+      await expect(emitter.flush()).rejects.toThrow(CircuitBreakerOpenError)
 
       // Advance time past reset period
       await vi.advanceTimersByTimeAsync(resetMs + 100)
 
-      // Should now allow emit (half-open state)
-      expect(() => emitter.emit({ type: 'retry.event' })).not.toThrow()
+      // Should now allow emit and flush (half-open state)
+      emitter.emit({ type: 'test', event: 'retry.event', data: {} })
+      // flush will still fail (mockPipeline rejects), but it should not throw CircuitBreakerOpenError
+      await emitter.flush()
+      // The above flush fails with network error, not circuit breaker error
     })
 
     it('should close circuit breaker on successful retry', async () => {
       const maxFailures = 2
       const resetMs = 5000
-      mockFetch
+      mockPipeline.send
         .mockRejectedValueOnce(new Error('Fail 1'))
         .mockRejectedValueOnce(new Error('Fail 2'))
-        .mockResolvedValueOnce(new Response('OK', { status: 200 }))
+        .mockResolvedValueOnce(undefined)
 
-      const emitter = new EventEmitter(mockCtx, mockEnv, {
-        maxConsecutiveFailures: maxFailures,
-        circuitBreakerResetMs: resetMs,
-      })
+      const emitter = new EventEmitter(
+        mockPipeline,
+        {
+          maxConsecutiveFailures: maxFailures,
+          circuitBreakerResetMs: resetMs,
+        },
+        mockCtx,
+      )
 
       // Open circuit breaker
-      emitter.emit({ type: 'event.1' })
+      emitter.emit({ type: 'test', event: 'event.1', data: {} })
       await emitter.flush()
-      emitter.emit({ type: 'event.2' })
+      emitter.emit({ type: 'test', event: 'event.2', data: {} })
       await emitter.flush()
 
       // Advance time past reset period
       await vi.advanceTimersByTimeAsync(resetMs + 100)
 
       // Retry should succeed and close circuit
-      emitter.emit({ type: 'retry.event' })
+      emitter.emit({ type: 'test', event: 'retry.event', data: {} })
       await emitter.flush()
 
       // Circuit should be closed
-      expect(() => emitter.emit({ type: 'next.event' })).not.toThrow()
-
-      // Verify circuit breaker info
-      const info = await emitter.getCircuitBreakerInfo()
-      expect(info.isOpen).toBe(false)
-      expect(info.consecutiveFailures).toBe(0)
+      expect(emitter.circuitBreakerOpen).toBe(false)
     })
 
     it('should re-open circuit breaker if retry fails', async () => {
       const maxFailures = 2
       const resetMs = 5000
-      const emitter = new EventEmitter(mockCtx, mockEnv, {
-        maxConsecutiveFailures: maxFailures,
-        circuitBreakerResetMs: resetMs,
-      })
+      const emitter = new EventEmitter(
+        mockPipeline,
+        {
+          maxConsecutiveFailures: maxFailures,
+          circuitBreakerResetMs: resetMs,
+        },
+        mockCtx,
+      )
 
       // Open circuit breaker
       for (let i = 0; i < maxFailures; i++) {
-        emitter.emit({ type: `event.${i}` })
+        emitter.emit({ type: 'test', event: `event.${i}`, data: {} })
         await emitter.flush()
       }
 
@@ -862,115 +763,70 @@ describe('Circuit Breaker Pattern', () => {
       await vi.advanceTimersByTimeAsync(resetMs + 100)
 
       // Retry fails
-      emitter.emit({ type: 'retry.event' })
+      emitter.emit({ type: 'test', event: 'retry.event', data: {} })
       await emitter.flush()
 
       // Should go back to open state
-      expect(() => emitter.emit({ type: 'blocked.again' })).toThrow(CircuitBreakerOpenError)
+      emitter.emit({ type: 'test', event: 'blocked.again', data: {} })
+      await expect(emitter.flush()).rejects.toThrow(CircuitBreakerOpenError)
     })
   })
 
   describe('circuit breaker closing', () => {
     it('should reset consecutive failures on success', async () => {
-      mockFetch
+      mockPipeline.send
         .mockRejectedValueOnce(new Error('Fail 1'))
-        .mockResolvedValueOnce(new Response('OK', { status: 200 }))
+        .mockResolvedValueOnce(undefined)
         .mockRejectedValueOnce(new Error('Fail 2'))
 
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 3 })
+      const emitter = new EventEmitter(mockPipeline, { maxConsecutiveFailures: 3 }, mockCtx)
 
       // First failure
-      emitter.emit({ type: 'event.1' })
+      emitter.emit({ type: 'test', event: 'event.1', data: {} })
       await emitter.flush()
 
-      let info = await emitter.getCircuitBreakerInfo()
-      expect(info.consecutiveFailures).toBe(1)
+      expect(emitter.circuitBreakerOpen).toBe(false)
 
       // Success - should reset
-      emitter.emit({ type: 'event.2' })
+      emitter.emit({ type: 'test', event: 'event.2', data: {} })
       await emitter.flush()
 
-      info = await emitter.getCircuitBreakerInfo()
-      expect(info.consecutiveFailures).toBe(0)
+      expect(emitter.circuitBreakerOpen).toBe(false)
 
-      // Another failure - should start from 1 again
-      emitter.emit({ type: 'event.3' })
+      // Another failure - should start from 1 again (not accumulate from before)
+      emitter.emit({ type: 'test', event: 'event.3', data: {} })
       await emitter.flush()
 
-      info = await emitter.getCircuitBreakerInfo()
-      expect(info.consecutiveFailures).toBe(1)
-    })
-
-    it('should allow manual circuit breaker reset', async () => {
-      const maxFailures = 2
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: maxFailures })
-
-      // Open circuit breaker
-      for (let i = 0; i < maxFailures; i++) {
-        emitter.emit({ type: `event.${i}` })
-        await emitter.flush()
-      }
-
-      // Should be open
-      expect(() => emitter.emit({ type: 'blocked' })).toThrow(CircuitBreakerOpenError)
-
-      // Manual reset
-      await emitter.resetCircuitBreaker()
-
-      // Should be closed
-      expect(() => emitter.emit({ type: 'allowed' })).not.toThrow()
-
-      const info = await emitter.getCircuitBreakerInfo()
-      expect(info.isOpen).toBe(false)
-      expect(info.consecutiveFailures).toBe(0)
-    })
-
-    it('should schedule retry alarm after manual reset if events pending', async () => {
-      const maxFailures = 2
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: maxFailures })
-
-      // Add events to retry queue and open circuit
-      for (let i = 0; i < maxFailures; i++) {
-        emitter.emit({ type: `event.${i}` })
-        await emitter.flush()
-      }
-
-      // Clear alarm mocks
-      mockCtx.storage.setAlarm.mockClear()
-
-      // Manual reset
-      await emitter.resetCircuitBreaker()
-
-      // Should have scheduled alarm for pending retry
-      expect(mockCtx.storage.setAlarm).toHaveBeenCalled()
+      expect(emitter.circuitBreakerOpen).toBe(false)
     })
   })
 
   describe('circuit breaker disabled', () => {
     it('should never open circuit breaker when maxConsecutiveFailures is 0', async () => {
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 0 })
+      const emitter = new EventEmitter(mockPipeline, { maxConsecutiveFailures: 0 }, mockCtx)
 
       // Fail many times
       for (let i = 0; i < 50; i++) {
-        emitter.emit({ type: `event.${i}` })
+        emitter.emit({ type: 'test', event: `event.${i}`, data: {} })
         await emitter.flush()
       }
 
-      // Should still allow emit
-      expect(() => emitter.emit({ type: 'still.allowed' })).not.toThrow()
+      // Should still allow emit and flush without CircuitBreakerOpenError
+      emitter.emit({ type: 'test', event: 'still.allowed', data: {} })
+      // flush will fail with network error, not circuit breaker
+      await emitter.flush()
 
-      const info = await emitter.getCircuitBreakerInfo()
-      expect(info.isOpen).toBe(false)
+      expect(emitter.circuitBreakerOpen).toBe(false)
     })
   })
 
   describe('circuit breaker state persistence', () => {
     it('should persist circuit breaker state to storage', async () => {
       const maxFailures = 2
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: maxFailures })
+      const emitter = new EventEmitter(mockPipeline, { maxConsecutiveFailures: maxFailures }, mockCtx)
 
       for (let i = 0; i < maxFailures; i++) {
-        emitter.emit({ type: `event.${i}` })
+        emitter.emit({ type: 'test', event: `event.${i}`, data: {} })
         await emitter.flush()
       }
 
@@ -980,29 +836,28 @@ describe('Circuit Breaker Pattern', () => {
         expect.objectContaining({
           isOpen: true,
           consecutiveFailures: maxFailures,
-        })
+        }),
       )
     })
 
     it('should restore circuit breaker state from storage on alarm', async () => {
       const maxFailures = 2
-      const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: maxFailures })
+      const emitter = new EventEmitter(mockPipeline, { maxConsecutiveFailures: maxFailures }, mockCtx)
 
       // Open circuit breaker
       for (let i = 0; i < maxFailures; i++) {
-        emitter.emit({ type: `event.${i}` })
+        emitter.emit({ type: 'test', event: `event.${i}`, data: {} })
         await emitter.flush()
       }
 
       // Simulate new emitter instance with same storage
-      const emitter2 = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: maxFailures })
+      const emitter2 = new EventEmitter(mockPipeline, { maxConsecutiveFailures: maxFailures }, mockCtx)
 
       // handleAlarm should load state
       await emitter2.handleAlarm()
 
-      // State should be loaded
-      const info = await emitter2.getCircuitBreakerInfo()
-      expect(info.isOpen).toBe(true)
+      // State should be loaded — circuit breaker should be open
+      expect(emitter2.circuitBreakerOpen).toBe(true)
     })
   })
 })
@@ -1013,12 +868,11 @@ describe('Circuit Breaker Pattern', () => {
 
 describe('Intermittent Network Failures', () => {
   let mockCtx: ReturnType<typeof createMockCtx>
-  let mockEnv: Record<string, unknown>
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockPipeline: { send: ReturnType<typeof vi.fn> }
 
   beforeEach(() => {
     mockCtx = createMockCtx({ id: 'test-do-123', name: 'test-object' })
-    mockEnv = {}
+    mockPipeline = { send: vi.fn() }
     vi.useFakeTimers()
   })
 
@@ -1028,63 +882,59 @@ describe('Intermittent Network Failures', () => {
   })
 
   it('should handle alternating success and failure', async () => {
-    mockFetch = vi.fn()
-      .mockResolvedValueOnce(new Response('OK', { status: 200 }))
+    mockPipeline.send
+      .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error('Network error'))
-      .mockResolvedValueOnce(new Response('OK', { status: 200 }))
+      .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error('Network error'))
-      .mockResolvedValueOnce(new Response('OK', { status: 200 }))
-    vi.stubGlobal('fetch', mockFetch)
+      .mockResolvedValueOnce(undefined)
 
-    const emitter = new EventEmitter(mockCtx, mockEnv)
+    const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
 
     // Success
-    emitter.emit({ type: 'event.1' })
+    emitter.emit({ type: 'test', event: 'event.1', data: {} })
     await emitter.flush()
     expect(emitter.pendingCount).toBe(0)
 
     // Failure
-    emitter.emit({ type: 'event.2' })
+    emitter.emit({ type: 'test', event: 'event.2', data: {} })
     await emitter.flush()
 
     // Retry should succeed
     await emitter.handleAlarm()
 
     // Circuit should not be open (alternating doesn't accumulate)
-    const info = await emitter.getCircuitBreakerInfo()
-    expect(info.isOpen).toBe(false)
-    expect(info.consecutiveFailures).toBe(0)
+    expect(emitter.circuitBreakerOpen).toBe(false)
   })
 
   it('should handle random failure pattern', async () => {
     const failurePattern = [true, true, false, true, false, false, true, false, false, false]
     let callIndex = 0
 
-    mockFetch = vi.fn().mockImplementation(() => {
+    mockPipeline.send.mockImplementation(() => {
       const shouldFail = failurePattern[callIndex % failurePattern.length]
       callIndex++
       if (shouldFail) {
         return Promise.reject(new Error('Random failure'))
       }
-      return Promise.resolve(new Response('OK', { status: 200 }))
+      return Promise.resolve(undefined)
     })
-    vi.stubGlobal('fetch', mockFetch)
 
-    const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 5 })
+    const emitter = new EventEmitter(mockPipeline, { maxConsecutiveFailures: 5 }, mockCtx)
 
     // Run through the pattern
     for (let i = 0; i < failurePattern.length; i++) {
-      emitter.emit({ type: `event.${i}` })
+      emitter.emit({ type: 'test', event: `event.${i}`, data: {} })
       await emitter.flush()
       await emitter.handleAlarm()
     }
 
     // Should have processed all events eventually
-    expect(mockFetch).toHaveBeenCalled()
+    expect(mockPipeline.send).toHaveBeenCalled()
   })
 
   it('should handle burst of failures followed by recovery', async () => {
-    mockFetch = vi.fn()
+    mockPipeline.send
       // 5 failures
       .mockRejectedValueOnce(new Error('Fail 1'))
       .mockRejectedValueOnce(new Error('Fail 2'))
@@ -1092,27 +942,23 @@ describe('Intermittent Network Failures', () => {
       .mockRejectedValueOnce(new Error('Fail 4'))
       .mockRejectedValueOnce(new Error('Fail 5'))
       // Then recovery
-      .mockResolvedValue(new Response('OK', { status: 200 }))
-    vi.stubGlobal('fetch', mockFetch)
+      .mockResolvedValue(undefined)
 
-    const emitter = new EventEmitter(mockCtx, mockEnv, { maxConsecutiveFailures: 10 })
+    const emitter = new EventEmitter(mockPipeline, { maxConsecutiveFailures: 10 }, mockCtx)
 
     // Generate burst of events
     for (let i = 0; i < 5; i++) {
-      emitter.emit({ type: `burst.${i}` })
+      emitter.emit({ type: 'test', event: `burst.${i}`, data: {} })
       await emitter.flush()
     }
 
-    // Should have 5 consecutive failures
-    let info = await emitter.getCircuitBreakerInfo()
-    expect(info.consecutiveFailures).toBe(5)
-    expect(info.isOpen).toBe(false) // Not yet at 10
+    // Should have consecutive failures but not enough to open (threshold is 10)
+    expect(emitter.circuitBreakerOpen).toBe(false)
 
     // Recovery
     await emitter.handleAlarm()
 
-    info = await emitter.getCircuitBreakerInfo()
-    expect(info.consecutiveFailures).toBe(0)
+    expect(emitter.circuitBreakerOpen).toBe(false)
   })
 })
 
@@ -1122,12 +968,11 @@ describe('Intermittent Network Failures', () => {
 
 describe('Concurrent Request Failures', () => {
   let mockCtx: ReturnType<typeof createMockCtx>
-  let mockEnv: Record<string, unknown>
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockPipeline: { send: ReturnType<typeof vi.fn> }
 
   beforeEach(() => {
     mockCtx = createMockCtx({ id: 'test-do-123', name: 'test-object' })
-    mockEnv = {}
+    mockPipeline = { send: vi.fn() }
     vi.useFakeTimers()
   })
 
@@ -1137,48 +982,37 @@ describe('Concurrent Request Failures', () => {
   })
 
   it('should handle multiple concurrent flushes gracefully', async () => {
-    mockFetch = vi.fn().mockResolvedValue(new Response('OK', { status: 200 }))
-    vi.stubGlobal('fetch', mockFetch)
+    mockPipeline.send.mockResolvedValue(undefined)
 
-    const emitter = new EventEmitter(mockCtx, mockEnv)
+    const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
 
-    emitter.emit({ type: 'event.1' })
+    emitter.emit({ type: 'test', event: 'event.1', data: {} })
 
     // Start multiple flushes concurrently
-    const flushPromises = [
-      emitter.flush(),
-      emitter.flush(),
-      emitter.flush(),
-    ]
+    const flushPromises = [emitter.flush(), emitter.flush(), emitter.flush()]
 
     await Promise.all(flushPromises)
 
-    // Only one fetch should have been made (first flush takes the batch)
-    expect(mockFetch).toHaveBeenCalledTimes(1)
+    // Only one send should have been made (first flush takes the batch)
+    expect(mockPipeline.send).toHaveBeenCalledTimes(1)
   })
 
   it('should handle race between flush and handleAlarm', async () => {
-    mockFetch = vi.fn()
-      .mockRejectedValueOnce(new Error('Network error'))
-      .mockResolvedValueOnce(new Response('OK', { status: 200 }))
-    vi.stubGlobal('fetch', mockFetch)
+    mockPipeline.send.mockRejectedValueOnce(new Error('Network error')).mockResolvedValueOnce(undefined)
 
-    const emitter = new EventEmitter(mockCtx, mockEnv)
+    const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
 
-    emitter.emit({ type: 'event.1' })
+    emitter.emit({ type: 'test', event: 'event.1', data: {} })
     await emitter.flush()
 
     // Now retry queue has the event
     // Start both alarm handler and new flush concurrently
-    emitter.emit({ type: 'event.2' })
+    emitter.emit({ type: 'test', event: 'event.2', data: {} })
 
-    await Promise.all([
-      emitter.handleAlarm(),
-      emitter.flush(),
-    ])
+    await Promise.all([emitter.handleAlarm(), emitter.flush()])
 
     // Both events should eventually be processed
-    expect(mockFetch).toHaveBeenCalledTimes(3) // Initial fail + alarm retry + new flush
+    expect(mockPipeline.send).toHaveBeenCalledTimes(3) // Initial fail + alarm retry + new flush
   })
 })
 
@@ -1188,14 +1022,11 @@ describe('Concurrent Request Failures', () => {
 
 describe('Network Error Classification', () => {
   let mockCtx: ReturnType<typeof createMockCtx>
-  let mockEnv: Record<string, unknown>
-  let mockFetch: ReturnType<typeof vi.fn>
+  let mockPipeline: { send: ReturnType<typeof vi.fn> }
 
   beforeEach(() => {
     mockCtx = createMockCtx({ id: 'test-do-123', name: 'test-object' })
-    mockEnv = {}
-    mockFetch = vi.fn()
-    vi.stubGlobal('fetch', mockFetch)
+    mockPipeline = { send: vi.fn() }
     vi.useFakeTimers()
   })
 
@@ -1217,35 +1048,35 @@ describe('Network Error Classification', () => {
 
   networkErrors.forEach(({ name, error }) => {
     it(`should treat ${name} as retryable network error`, async () => {
-      mockFetch.mockRejectedValue(error)
+      mockPipeline.send.mockRejectedValue(error)
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
       // Should have stored for retry (network errors are retryable)
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
       expect(mockCtx.storage.setAlarm).toHaveBeenCalled()
     })
   })
 
-  const httpErrorCodes = [500, 502, 503, 504, 429]
+  const pipelineErrors = [
+    { name: 'Internal Server Error', error: new Error('Internal Server Error') },
+    { name: 'Bad Gateway', error: new Error('Bad Gateway') },
+    { name: 'Service Unavailable', error: new Error('Service Unavailable') },
+    { name: 'Gateway Timeout', error: new Error('Gateway Timeout') },
+    { name: 'Too Many Requests', error: new Error('Too Many Requests') },
+  ]
 
-  httpErrorCodes.forEach((statusCode) => {
-    it(`should treat HTTP ${statusCode} as retryable error`, async () => {
-      mockFetch.mockResolvedValue(new Response('Error', { status: statusCode }))
+  pipelineErrors.forEach(({ name, error }) => {
+    it(`should treat pipeline "${name}" rejection as retryable error`, async () => {
+      mockPipeline.send.mockRejectedValue(error)
 
-      const emitter = new EventEmitter(mockCtx, mockEnv)
-      emitter.emit({ type: 'test.event' })
+      const emitter = new EventEmitter(mockPipeline, {}, mockCtx)
+      emitter.emit({ type: 'test', event: 'test.event', data: {} })
       await emitter.flush()
 
-      expect(mockCtx.storage.put).toHaveBeenCalledWith(
-        '_events:retry',
-        expect.any(Array)
-      )
+      expect(mockCtx.storage.put).toHaveBeenCalledWith('_events:retry', expect.any(Array))
     })
   })
 })

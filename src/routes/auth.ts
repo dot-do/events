@@ -103,23 +103,22 @@ export async function handleAuth(
   env: Env,
   url: URL,
 ): Promise<Response | null> {
-  // Login - proxy to oauth.do/login with returnTo
+  // Login — proxy to oauth.do via OAUTH service binding.
+  // oauth.do handles cross-domain auth: uses oauth.do/api/callback as the common
+  // WorkOS redirect_uri, then bounces back to events.do/callback with a one-time code.
   if (url.pathname === '/login') {
     let returnTo = url.searchParams.get('redirect_uri') || url.searchParams.get('returnTo') || '/events'
-
-    // Prevent redirect loops to /login
-    if (returnTo === '/login' || returnTo.startsWith('/login?')) {
-      returnTo = '/events'
-    }
-
-    // Validate redirect URI to prevent open redirects
+    if (returnTo === '/login' || returnTo.startsWith('/login?')) returnTo = '/events'
     const safeReturnTo = validateRedirectUri(returnTo, url.origin, '/events')
-
-    // Proxy to oauth.do via RPC
-    return env.OAUTH.login(safeReturnTo)
+    const loginUrl = new URL('/login', url.origin)
+    loginUrl.searchParams.set('returnTo', safeReturnTo)
+    return env.OAUTH.fetch(new Request(loginUrl.toString(), {
+      headers: request.headers,
+      redirect: 'manual',
+    }))
   }
 
-  // Callback - exchange code for token via oauth.do/exchange
+  // Callback — exchange one-time code via oauth.do RPC
   if (url.pathname === '/callback') {
     return handleCallback(request, env, url)
   }
@@ -220,30 +219,16 @@ async function handleCallback(request: Request, env: Env, url: URL): Promise<Res
     return internalError('No access token received', { headers: corsHeaders() })
   }
 
-  // Set auth cookie and redirect
+  log.info('Setting auth cookie and redirecting', { tokenLength: accessToken.length })
   const maxAge = 3600 * 24 * 7 // 7 days
-  const cookie = `auth=${accessToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`
-  log.info('Setting cookie and redirecting', { redirectTo: sanitize.url(returnTo) })
-
-  // Validate redirect URI to prevent open redirects
+  const cookieHeader = `auth=${accessToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`
   const redirectTo = validateRedirectUri(returnTo, url.origin, '/events')
-
-  // Debug mode - return JSON instead of redirect
-  if (debug) {
-    return successResponse({
-      tokenLength: accessToken.length,
-      redirectTo,
-      cookieSet: true,
-    }, {
-      headers: { 'Set-Cookie': cookie }
-    })
-  }
 
   return new Response(null, {
     status: 302,
     headers: {
       'Location': redirectTo,
-      'Set-Cookie': cookie,
+      'Set-Cookie': cookieHeader,
     },
   })
 }

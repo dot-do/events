@@ -30,7 +30,8 @@
 
   // Service bindings
   "services": [
-    { "binding": "AUTH", "service": "auth", "entrypoint": "AuthService" },
+    { "binding": "AUTH", "service": "auth", "entrypoint": "AuthRPC" },
+    { "binding": "AUTH_HTTP", "service": "auth" },
     { "binding": "OAUTH", "service": "oauth" }
   ],
 
