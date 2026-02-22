@@ -139,6 +139,23 @@ export async function handleFetch(request: Request, env: Env, ctx: ExecutionCont
   const authResponse = await handleAuth(request, env, url)
   if (authResponse) return addCorrelationId(authResponse, correlationId)
 
+  // Debug: set test cookie for browser testing (signs a test JWT via oauth.do)
+  if (url.pathname === '/debug/set-test-cookie') {
+    try {
+      const token = await env.OAUTH.signTestJwt()
+      const maxAge = 3600 * 24 * 7
+      return new Response(null, {
+        status: 302,
+        headers: {
+          'Location': '/events',
+          'Set-Cookie': `auth=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`,
+        },
+      })
+    } catch (err) {
+      return Response.json({ error: String(err) }, { status: 500 })
+    }
+  }
+
   // Event ingest endpoint — canonical path is /e
   // /ingest is deprecated; kept for backwards compatibility with a Deprecation header
   if (url.pathname === '/e' || url.pathname === '/ingest') {
