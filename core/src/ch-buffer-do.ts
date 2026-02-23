@@ -34,10 +34,14 @@ export interface BufferEnv {
 }
 
 /**
- * Maps a raw event record to the ClickHouse `default.events` NDJSON row shape.
- * `data` and `meta` are serialized to JSON strings.
+ * Maps a raw event record to the ClickHouse `platform.events` NDJSON row shape.
+ * `actor`, `data`, and `meta` are serialized to JSON strings for the native JSON columns.
  */
 export function toNdjsonRow(r: Record<string, unknown>): string {
+  // Normalize actor: if string (legacy), wrap as { id }; if missing, empty object
+  const rawActor = r.actor
+  const actor = typeof rawActor === 'string' ? (rawActor ? { id: rawActor } : {}) : rawActor ?? {}
+
   return JSON.stringify({
     id: r.id ?? crypto.randomUUID(),
     ns: r.ns ?? '',
@@ -46,7 +50,7 @@ export function toNdjsonRow(r: Record<string, unknown>): string {
     event: r.event ?? '',
     url: r.url ?? '',
     source: r.source ?? '',
-    actor: r.actor ?? '',
+    actor: typeof actor === 'string' ? actor : JSON.stringify(actor),
     data: typeof r.data === 'string' ? r.data : JSON.stringify(r.data ?? {}),
     meta: typeof r.meta === 'string' ? r.meta : JSON.stringify(r.meta ?? {}),
   })
@@ -154,7 +158,7 @@ export class ClickHouseBufferDO extends DurableObject<BufferEnv> {
       const ndjson = batch.map(toNdjsonRow).join('\n')
 
       const url = new URL(chUrl.trim())
-      url.searchParams.set('query', 'INSERT INTO default.events FORMAT JSONEachRow')
+      url.searchParams.set('query', 'INSERT INTO platform.events FORMAT JSONEachRow')
 
       const resp = await fetch(url.toString(), {
         method: 'POST',
