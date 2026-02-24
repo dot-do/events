@@ -211,16 +211,18 @@ export class EventsService extends WorkerEntrypoint<Env> {
   // -------------------------------------------------------------------------
 
   private async chQuery(query: string, params: Record<string, string | number> = {}): Promise<{ data: Record<string, unknown>[]; meta: Array<{ name: string; type: string }>; elapsed: number }> {
-    const url = this.env.CLICKHOUSE_URL
+    const rawUrl = this.env.CLICKHOUSE_URL
     const password = this.env.CLICKHOUSE_PASSWORD
-    if (!url || !password) throw new Error('CLICKHOUSE_URL / CLICKHOUSE_PASSWORD not configured')
+    if (!rawUrl || !password) throw new Error('CLICKHOUSE_URL / CLICKHOUSE_PASSWORD not configured')
 
-    const body = new URLSearchParams({
-      query,
-      default_format: 'JSONCompact',
-      database: CH_DATABASE,
-      ...Object.fromEntries(Object.entries(params).map(([k, v]) => [`param_${k}`, String(v)])),
-    })
+    // Build URL with config + params in query string, SQL in POST body
+    const trimmed = rawUrl.trim()
+    const chUrl = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`)
+    chUrl.searchParams.set('default_format', 'JSONCompact')
+    chUrl.searchParams.set('database', CH_DATABASE)
+    for (const [k, v] of Object.entries(params)) {
+      chUrl.searchParams.set(`param_${k}`, String(v))
+    }
 
     let lastError: Error | undefined
     for (let attempt = 0; attempt <= CH_MAX_RETRIES; attempt++) {
@@ -228,13 +230,14 @@ export class EventsService extends WorkerEntrypoint<Env> {
       const timer = setTimeout(() => controller.abort(), CH_TIMEOUT_MS)
 
       try {
-        const resp = await fetch(url, {
+        const resp = await fetch(chUrl.toString(), {
           method: 'POST',
           headers: {
+            'Content-Type': 'text/plain',
             'X-ClickHouse-User': 'default',
             'X-ClickHouse-Key': password,
           },
-          body: body.toString(),
+          body: query,
           signal: controller.signal,
         })
 
