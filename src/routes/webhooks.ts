@@ -65,6 +65,7 @@ async function sendWebhookEvent(
   response: Response,
   env: Env,
   ctx: ExecutionContext,
+  ray: string,
 ): Promise<void> {
   const result = await response.clone().json() as { event?: NormalizedWebhookEvent }
   if (!result.event) return
@@ -89,11 +90,14 @@ async function sendWebhookEvent(
   const pipelineWrite = env.EVENTS_PIPELINE
     ? env.EVENTS_PIPELINE.send([{
         id: ulid(),
-        ns: `webhook.${result.event.webhook.provider}`,
+        ray,
+        ns: result.event.webhook.provider,
         ts: result.event.ts,
         type: 'webhook',
         event: result.event.type,
-        source: result.event.source,
+        url: result.event.source,
+        source: result.event.webhook.provider,
+        actor: { id: result.event.webhook.provider, deliveryId: result.event.webhook.deliveryId },
         data: {
           provider: result.event.webhook.provider,
           eventType: result.event.webhook.eventType,
@@ -139,7 +143,7 @@ export async function handleWebhooks(
 
     // Send to EventWriterDO (flat) + headlessly pipeline (canonical)
     if (response.status === 200) {
-      await sendWebhookEvent(response, env, ctx)
+      await sendWebhookEvent(response, env, ctx, request.headers.get('cf-ray') || '')
     }
 
     const cpuTime = performance.now() - startTime
@@ -161,7 +165,7 @@ export async function handleWebhooks(
 
       // Send to EventWriterDO (flat) + headlessly pipeline (canonical)
       if (response.status === 200) {
-        await sendWebhookEvent(response, env, ctx)
+        await sendWebhookEvent(response, env, ctx, request.headers.get('cf-ray') || '')
       }
 
       const cpuTime = performance.now() - startTime
