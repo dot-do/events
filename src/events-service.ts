@@ -6,10 +6,10 @@
  *   Copied from the original BufferService — same shard distribution logic.
  *
  * Read:
- *   env.EVENTS.search(filters)   — paginated event search
- *   env.EVENTS.facets(options)    — grouped aggregation on a dimension
- *   env.EVENTS.count(options)     — count with optional groupBy
- *   env.EVENTS.sql(query, params) — raw SQL escape hatch
+ *   env.EVENTS.search(filters, scope?)   — paginated event search
+ *   env.EVENTS.facets(options, scope?)    — grouped aggregation on a dimension
+ *   env.EVENTS.count(options, scope?)     — count with optional groupBy
+ *   env.EVENTS.sql(query, params)         — raw SQL escape hatch
  *
  * ClickHouse reads hit the HTTP API directly (parameterized, retry on 5xx).
  */
@@ -29,11 +29,11 @@ export interface EventFilters {
   type?: string
   /** Source identifier */
   source?: string
-  /** ISO-8601 or relative ("1h", "7d", "30m") */
+  /** ISO-8601 or relative ("1h", "7d", "30m", "2w") */
   since?: string
   /** ISO-8601 upper bound */
   until?: string
-  /** Pagination cursor (offset) */
+  /** Pagination offset (default 0) */
   cursor?: number
   /** Page size (default 50, max 1000) */
   limit?: number
@@ -44,43 +44,40 @@ export interface EventFilters {
 export interface EventFacetsOptions {
   /** Dimension to group by */
   dimension: 'type' | 'event' | 'source' | 'ns'
-  ns?: string
-  since?: string
-  until?: string
+  /** Optional filters to narrow the facet query */
+  filters?: Omit<EventFilters, 'cursor' | 'limit' | 'sort'>
   /** Max groups returned (default 100) */
   limit?: number
 }
 
 export interface EventCountOptions {
-  ns?: string
-  event?: string
-  type?: string
-  source?: string
-  since?: string
-  until?: string
+  /** Optional filters to narrow the count */
+  filters?: Omit<EventFilters, 'cursor' | 'limit' | 'sort'>
   /** Optional groupBy dimension */
   groupBy?: 'type' | 'event' | 'source' | 'ns'
 }
 
 export interface EventSearchResult {
-  items: Record<string, unknown>[]
+  data: Record<string, unknown>[]
   total: number
-  cursor: number | null
+  limit: number
+  offset: number
+  hasMore: boolean
 }
 
 export interface EventFacetResult {
-  dimension: string
-  buckets: Array<{ key: string; count: number }>
+  facets: Array<{ value: string; count: number }>
+  total: number
 }
 
 export interface EventCountResult {
-  total: number
-  groups?: Array<{ key: string; count: number }>
+  count: number
+  groups?: Array<{ value: string; count: number }>
 }
 
 export interface SqlResult {
-  rows: Record<string, unknown>[]
-  meta: Array<{ name: string; type: string }>
+  data: Record<string, unknown>[]
+  rows: number
   elapsed: number
 }
 
@@ -90,8 +87,10 @@ export interface SqlResult {
 
 const CH_DATABASE = 'platform'
 const CH_TABLE = 'events'
+const CH_COLUMNS = 'id, ns, ts, type, event, source, url, data'
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 1000
+const DEFAULT_WINDOW_DAYS = 7
 const CH_TIMEOUT_MS = 10_000
 const CH_MAX_RETRIES = 2
 
@@ -99,12 +98,12 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
-/** Convert relative duration ("1h", "7d", "30m") to ISO-8601 timestamp. */
+/** Convert relative duration ("1h", "7d", "30m", "2w") to ISO-8601 timestamp. */
 function parseSince(since: string): string {
-  const match = since.match(/^(\d+)([mhd])$/)
+  const match = since.match(/^(\d+)([mhdw])$/)
   if (!match) return since // assume ISO-8601 already
   const [, amount, unit] = match
-  const ms = { m: 60_000, h: 3_600_000, d: 86_400_000 }[unit!]!
+  const ms = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }[unit!]!
   return new Date(Date.now() - Number(amount) * ms).toISOString()
 }
 
@@ -113,16 +112,34 @@ interface WhereResult {
   params: Record<string, string | number>
 }
 
-function buildWhereClause(filters: {
-  ns?: string | undefined
-  event?: string | undefined
-  type?: string | undefined
-  source?: string | undefined
-  since?: string | undefined
-  until?: string | undefined
-}): WhereResult {
+function buildWhereClause(
+  filters: {
+    ns?: string | undefined
+    event?: string | undefined
+    type?: string | undefined
+    source?: string | undefined
+    since?: string | undefined
+    until?: string | undefined
+  },
+  scope?: string | string[] | undefined,
+): WhereResult {
   const parts: string[] = []
   const params: Record<string, string | number> = {}
+
+  // Scope — namespace-level LIKE filtering
+  if (scope) {
+    const scopes = Array.isArray(scope) ? scope : [scope]
+    if (scopes.length === 1) {
+      parts.push('ns LIKE {scope0:String}')
+      params.scope0 = `%${scopes[0]}%`
+    } else {
+      const conditions = scopes.map((s, i) => {
+        params[`scope${i}`] = `%${s}%`
+        return `ns LIKE {scope${i}:String}`
+      })
+      parts.push(`(${conditions.join(' OR ')})`)
+    }
+  }
 
   if (filters.ns) {
     parts.push('ns = {ns:String}')
@@ -144,12 +161,18 @@ function buildWhereClause(filters: {
     parts.push('source = {source:String}')
     params.source = filters.source
   }
+
+  // Time window — default to last 7 days when no time filter is specified
   if (filters.since) {
-    parts.push('timestamp >= {since:DateTime64(3)}')
+    parts.push('ts >= {since:DateTime64(3)}')
     params.since = parseSince(filters.since)
+  } else if (!filters.until) {
+    parts.push('ts >= {since:DateTime64(3)}')
+    params.since = new Date(Date.now() - DEFAULT_WINDOW_DAYS * 86_400_000).toISOString()
   }
+
   if (filters.until) {
-    parts.push('timestamp <= {until:DateTime64(3)}')
+    parts.push('ts <= {until:DateTime64(3)}')
     params.until = filters.until
   }
 
@@ -171,6 +194,12 @@ const MAX_SHARD_ATTEMPTS = 8
 let shardCount = MIN_SHARDS
 let shardCountLastRead = 0
 let nextShard = Math.floor(Math.random() * MIN_SHARDS)
+
+// ---------------------------------------------------------------------------
+// Read-only guard for sql()
+// ---------------------------------------------------------------------------
+
+const FORBIDDEN_SQL = /^\s*(INSERT|ALTER|DROP|TRUNCATE|CREATE|ATTACH|DETACH|RENAME|OPTIMIZE)\b/i
 
 // ---------------------------------------------------------------------------
 // EventsService
@@ -287,26 +316,27 @@ export class EventsService extends WorkerEntrypoint<Env> {
   // Read: search
   // -------------------------------------------------------------------------
 
-  async search(filters: EventFilters = {}): Promise<EventSearchResult> {
+  async search(filters: EventFilters = {}, scope?: string | string[]): Promise<EventSearchResult> {
     const limit = clamp(filters.limit ?? DEFAULT_LIMIT, 1, MAX_LIMIT)
-    const cursor = filters.cursor ?? 0
+    const offset = filters.cursor ?? 0
     const sort = filters.sort ?? 'desc'
-    const { clause, params } = buildWhereClause(filters)
+    const { clause, params } = buildWhereClause(filters, scope)
 
     const countQuery = `SELECT count() AS total FROM ${CH_TABLE} ${clause}`
-    const dataQuery = `SELECT * FROM ${CH_TABLE} ${clause} ORDER BY timestamp ${sort} LIMIT {limit:UInt32} OFFSET {offset:UInt32}`
+    const dataQuery = `SELECT ${CH_COLUMNS} FROM ${CH_TABLE} ${clause} ORDER BY ts ${sort} LIMIT {limit:UInt32} OFFSET {offset:UInt32}`
 
-    const allParams = { ...params, limit, offset: cursor }
+    const allParams = { ...params, limit, offset }
 
     const [countResult, dataResult] = await Promise.all([this.chQuery(countQuery, allParams), this.chQuery(dataQuery, allParams)])
 
     const total = Number(countResult.data[0]?.total ?? 0)
-    const nextCursor = cursor + limit < total ? cursor + limit : null
 
     return {
-      items: dataResult.data,
+      data: dataResult.data,
       total,
-      cursor: nextCursor,
+      limit,
+      offset,
+      hasMore: offset + limit < total,
     }
   }
 
@@ -314,8 +344,8 @@ export class EventsService extends WorkerEntrypoint<Env> {
   // Read: facets
   // -------------------------------------------------------------------------
 
-  async facets(options: EventFacetsOptions): Promise<EventFacetResult> {
-    const { dimension, ns, since, until, limit: maxBuckets } = options
+  async facets(options: EventFacetsOptions, scope?: string | string[]): Promise<EventFacetResult> {
+    const { dimension, filters, limit: maxBuckets } = options
     const bucketLimit = clamp(maxBuckets ?? 100, 1, 1000)
 
     // Validate dimension to prevent injection
@@ -324,27 +354,27 @@ export class EventsService extends WorkerEntrypoint<Env> {
       throw new Error(`Invalid dimension: ${dimension}`)
     }
 
-    const { clause, params } = buildWhereClause({ ns, since, until })
-    const query = `SELECT ${dimension} AS key, count() AS count FROM ${CH_TABLE} ${clause} GROUP BY ${dimension} ORDER BY count DESC LIMIT {bucketLimit:UInt32}`
+    const { clause, params } = buildWhereClause(filters ?? {}, scope)
+    const query = `SELECT ${dimension} AS value, count() AS count FROM ${CH_TABLE} ${clause} GROUP BY ${dimension} ORDER BY count DESC LIMIT {bucketLimit:UInt32}`
 
     const result = await this.chQuery(query, { ...params, bucketLimit })
 
-    return {
-      dimension,
-      buckets: result.data.map((row) => ({
-        key: String(row.key ?? ''),
-        count: Number(row.count ?? 0),
-      })),
-    }
+    const facets = result.data.map((row) => ({
+      value: String(row.value ?? ''),
+      count: Number(row.count ?? 0),
+    }))
+    const total = facets.reduce((sum, f) => sum + f.count, 0)
+
+    return { facets, total }
   }
 
   // -------------------------------------------------------------------------
   // Read: count
   // -------------------------------------------------------------------------
 
-  async count(options: EventCountOptions = {}): Promise<EventCountResult> {
-    const { groupBy, ...filters } = options
-    const { clause, params } = buildWhereClause(filters)
+  async count(options: EventCountOptions = {}, scope?: string | string[]): Promise<EventCountResult> {
+    const { groupBy, filters } = options
+    const { clause, params } = buildWhereClause(filters ?? {}, scope)
 
     if (groupBy) {
       const allowedDimensions = ['type', 'event', 'source', 'ns'] as const
@@ -352,21 +382,21 @@ export class EventsService extends WorkerEntrypoint<Env> {
         throw new Error(`Invalid groupBy: ${groupBy}`)
       }
 
-      const query = `SELECT ${groupBy} AS key, count() AS count FROM ${CH_TABLE} ${clause} GROUP BY ${groupBy} ORDER BY count DESC`
+      const query = `SELECT ${groupBy} AS value, count() AS count FROM ${CH_TABLE} ${clause} GROUP BY ${groupBy} ORDER BY count DESC`
       const result = await this.chQuery(query, params)
 
       const groups = result.data.map((row) => ({
-        key: String(row.key ?? ''),
+        value: String(row.value ?? ''),
         count: Number(row.count ?? 0),
       }))
-      const total = groups.reduce((sum, g) => sum + g.count, 0)
+      const count = groups.reduce((sum, g) => sum + g.count, 0)
 
-      return { total, groups }
+      return { count, groups }
     }
 
-    const query = `SELECT count() AS total FROM ${CH_TABLE} ${clause}`
+    const query = `SELECT count() AS count FROM ${CH_TABLE} ${clause}`
     const result = await this.chQuery(query, params)
-    return { total: Number(result.data[0]?.total ?? 0) }
+    return { count: Number(result.data[0]?.count ?? 0) }
   }
 
   // -------------------------------------------------------------------------
@@ -374,11 +404,13 @@ export class EventsService extends WorkerEntrypoint<Env> {
   // -------------------------------------------------------------------------
 
   async sql(query: string, params: Record<string, string | number> = {}): Promise<SqlResult> {
+    if (FORBIDDEN_SQL.test(query)) throw new Error('Write operations not allowed via sql()')
+
     const start = Date.now()
     const result = await this.chQuery(query, params)
     return {
-      rows: result.data,
-      meta: result.meta,
+      data: result.data,
+      rows: result.data.length,
       elapsed: Date.now() - start,
     }
   }
