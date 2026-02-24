@@ -70,7 +70,7 @@ const app = API({
   events: {
     scope: '*',
     topLevelRoutes: true,
-    auth: 'admin',
+    auth: 'superadmin',
   },
   landing: async (c) => {
     const url = new URL(c.req.url)
