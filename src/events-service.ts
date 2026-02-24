@@ -98,13 +98,13 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
-/** Convert relative duration ("1h", "7d", "30m", "2w") to ISO-8601 timestamp. */
+/** Convert relative duration ("1h", "7d", "30m", "2w") to DateTime64-compatible timestamp. */
 function parseSince(since: string): string {
   const match = since.match(/^(\d+)([mhdw])$/)
-  if (!match) return since // assume ISO-8601 already
+  if (!match) return since.replace(/Z$/, '') // strip trailing Z for DateTime64(3)
   const [, amount, unit] = match
   const ms = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }[unit!]!
-  return new Date(Date.now() - Number(amount) * ms).toISOString()
+  return new Date(Date.now() - Number(amount) * ms).toISOString().replace(/Z$/, '')
 }
 
 interface WhereResult {
@@ -168,7 +168,7 @@ function buildWhereClause(
     params.since = parseSince(filters.since)
   } else if (!filters.until) {
     parts.push('ts >= {since:DateTime64(3)}')
-    params.since = new Date(Date.now() - DEFAULT_WINDOW_DAYS * 86_400_000).toISOString()
+    params.since = new Date(Date.now() - DEFAULT_WINDOW_DAYS * 86_400_000).toISOString().replace(/Z$/, '')
   }
 
   if (filters.until) {
