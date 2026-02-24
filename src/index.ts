@@ -32,7 +32,7 @@ import { EventWriterDO } from './event-writer-do'
 import { ShardCoordinatorDO } from './shard-coordinator-do'
 import { SubscriptionShardCoordinatorDO } from './subscription-shard-coordinator-do'
 import { RateLimiterDO } from './middleware/rate-limiter-do'
-import { BufferService } from './buffer-service'
+import { EventsService } from './events-service'
 
 // Import handlers
 import { handleFetch } from './handlers/fetch'
@@ -40,7 +40,10 @@ import { handleQueue } from './handlers/queue'
 import { handleScheduled } from './handlers/scheduled'
 
 // Re-export DOs for wrangler
-export { CatalogDO, SubscriptionDO, CDCProcessorDO, SchemaRegistryDO, EventWriterDO, ShardCoordinatorDO, SubscriptionShardCoordinatorDO, RateLimiterDO, ClickHouseBufferDO, BufferService }
+export { CatalogDO, SubscriptionDO, CDCProcessorDO, SchemaRegistryDO, EventWriterDO, ShardCoordinatorDO, SubscriptionShardCoordinatorDO, RateLimiterDO, ClickHouseBufferDO, EventsService }
+
+// Backward-compat alias — existing consumers that reference BufferService keep working
+export { EventsService as BufferService }
 
 export default {
   fetch: handleFetch,

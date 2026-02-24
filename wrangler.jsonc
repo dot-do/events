@@ -65,7 +65,8 @@
     { "tag": "v6", "new_sqlite_classes": ["SchemaRegistryDO"] },
     { "tag": "v7", "new_classes": ["ShardCoordinatorDO"] },
     { "tag": "v8", "new_classes": ["SubscriptionShardCoordinatorDO"] },
-    { "tag": "v9", "new_classes": ["ClickHouseBufferDO"] }
+    { "tag": "v9", "new_classes": ["ClickHouseBufferDO"] },
+    { "tag": "v10", "new_classes": ["EventsService"] }
   ],
 
   // Queue for CDC/subscription fanout
