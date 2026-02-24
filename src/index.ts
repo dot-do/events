@@ -70,6 +70,7 @@ const app = API({
   events: {
     scope: '*',
     topLevelRoutes: true,
+    auth: true,
   },
   landing: async (c) => {
     const url = new URL(c.req.url)
