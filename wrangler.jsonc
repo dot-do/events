@@ -15,8 +15,8 @@
     { "pattern": "events.do/*", "zone_name": "events.do" }
   ],
 
-  // Headlessly pipeline — used ONLY by webhook handler to forward canonical-shaped
-  // events to headless.ly. The ingest route and tail worker do NOT use this.
+  // Headlessly pipeline — used by webhook handler and tail worker to forward
+  // events to headless.ly ClickHouse (R2 → S3Queue → streams.ingest MV).
   "pipelines": [
     { "binding": "EVENTS_PIPELINE", "pipeline": "d8f32274e86b42f68624144111579a26" }
   ],

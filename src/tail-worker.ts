@@ -1,11 +1,13 @@
 /**
- * Tail Worker - Capture worker traces and write to Parquet
+ * Tail Worker - Capture worker traces and write to Parquet + Pipeline
  *
- * Architecture:
- * - Uses shared EventWriterDO via Workers RPC (type-safe direct calls)
- * - This worker is NOT tailed (prevents infinite loops)
- * - Full logging/observability in the DO
- * - Sharded writers for high throughput (from lakehouse pattern)
+ * Dual-write architecture:
+ * 1. EventWriterDO → Parquet on R2 (events.do lakehouse, flat typed columns)
+ * 2. EVENTS_PIPELINE → R2 → S3Queue → ClickHouse (minimal records, MV normalizes)
+ *
+ * The pipeline path sends only { id, ts, source: 'tail', data: <full trace> }.
+ * All normalization (ns, type, event, url, ray, actor) is derived downstream
+ * in the ClickHouse S3Queue MV (streams.ingest).
  *
  * Loop prevention:
  * - events.do worker IS tailed -> traces come here
@@ -15,6 +17,7 @@
 
 import { ingestWithOverflow } from './event-writer-do'
 import type { EventRecord } from './event-writer'
+import { ulid } from './event-writer'
 import type { Env as FullEnv } from './env'
 import { logger, sanitize } from './logger'
 import { ClickHouseBufferDO } from '../core/src/ch-buffer-do'
@@ -24,7 +27,7 @@ export { ClickHouseBufferDO }
 
 const log = logger.child({ component: 'tail' })
 
-type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'TAIL_AUTH_SECRET'>
+type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'EVENTS_PIPELINE' | 'TAIL_AUTH_SECRET'>
 
 // ============================================================================
 // Auth helper
@@ -203,13 +206,26 @@ export default {
 
     if (records.length === 0) return
 
-    // Send to EventWriterDO (Parquet on R2) — events.do's own storage path.
-    // NOTE: Do NOT send to EVENTS_PIPELINE here. The headlessly-tail worker
-    // handles pipeline ingestion with the canonical EventRecord shape.
-    // This tail worker uses a flat Parquet-optimized schema that doesn't
-    // match the platform's expected { id, ns, ts, type, event, source, data }.
+    // 1. EventWriterDO (Parquet on R2) — events.do's own lakehouse storage
     const result = await ingestWithOverflow(env, records, 'tail')
     if (!result.ok) log.error('Failed DO ingest', { shard: result.shard })
     else log.info('DO ingested', { shard: result.shard, buffered: result.buffered })
+
+    // 2. Pipeline → R2 → S3Queue → ClickHouse (minimal records, MV normalizes)
+    //    Sends { id, ts, source, data } only — MV derives ns/type/event/url/ray/actor
+    if (env.EVENTS_PIPELINE) {
+      const pipelineRecords = records.map((r) => ({
+        id: ulid(),
+        ts: r.ts,
+        source: 'tail',
+        data: r.payload,
+      }))
+      try {
+        await env.EVENTS_PIPELINE.send(pipelineRecords)
+        log.info('Pipeline sent', { count: pipelineRecords.length })
+      } catch (err) {
+        log.error('Pipeline send failed', { error: String(err) })
+      }
+    }
   },
 }
