@@ -32,7 +32,9 @@
   "services": [
     { "binding": "AUTH", "service": "auth", "entrypoint": "AuthRPC" },
     { "binding": "AUTH_HTTP", "service": "oauth" },
-    { "binding": "OAUTH", "service": "oauth" }
+    { "binding": "OAUTH", "service": "oauth" },
+    // Self-binding: eventsConvention reads events via EVENTS RPC
+    { "binding": "EVENTS", "service": "events", "entrypoint": "EventsService" }
   ],
 
   // Analytics Engine for metrics

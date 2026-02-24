@@ -35,7 +35,9 @@
     "wrangler": "^4.0.0"
   },
   "dependencies": {
+    "@dotdo/api": "workspace:*",
     "@dotdo/events": "file:./core",
+    "hono": "^4.7.0",
     "hyparquet": "^1.24.1",
     "hyparquet-compressors": "^1.1.1",
     "@dotdo/hyparquet-writer": "github:dot-do/hyparquet-writer",
