@@ -1,4 +1,4 @@
-export type { EventType, EpcisEventType, BaseEvent, RecordingEvent } from './base.js'
+export type { EventType, EpcisEventType, BaseEvent, Actor, RecordingEvent } from './base.js'
 
 export type { CdcEventData, CdcEvent } from './cdc.js'
 export type { ActionEventData, ActionEvent } from './action.js'

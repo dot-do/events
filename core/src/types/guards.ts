@@ -181,7 +181,7 @@ export function isBaseEvent(value: unknown): value is BaseEvent {
     typeof v.event === 'string' &&
     typeof v.url === 'string' &&
     typeof v.source === 'string' &&
-    typeof v.actor === 'string' &&
+    typeof v.actor === 'object' && v.actor !== null &&
     typeof v.data === 'object' &&
     v.data !== null &&
     typeof v.meta === 'object' &&

@@ -6,6 +6,7 @@
  */
 
 export { EventEmitterTestDO } from './test-do.js'
+export { ClickHouseBufferDO } from '../ch-buffer-do.js'
 
 export default {
   fetch: () => new Response('ok'),

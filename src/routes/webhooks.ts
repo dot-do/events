@@ -14,6 +14,23 @@ import { corsHeaders } from '../utils'
 import { checkRateLimit, type RateLimitEnv } from '../middleware/rate-limit'
 import { logger } from '../logger'
 
+const ULID_ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+
+function ulid(): string {
+  let str = ''
+  let ts = Date.now()
+  for (let i = 9; i >= 0; i--) {
+    str = ULID_ENCODING[ts % 32] + str
+    ts = Math.floor(ts / 32)
+  }
+  const random = new Uint8Array(16)
+  crypto.getRandomValues(random)
+  for (let i = 0; i < 16; i++) {
+    str += ULID_ENCODING[random[i] % 32]
+  }
+  return str
+}
+
 const log = logger.child({ component: 'Webhooks' })
 
 /** More lenient rate limits for server-to-server webhook traffic */
@@ -71,7 +88,7 @@ async function sendWebhookEvent(
   // 2. Canonical shape for headless.ly pipeline: { id, ns, ts, type, event, source, data }
   const pipelineWrite = env.EVENTS_PIPELINE
     ? env.EVENTS_PIPELINE.send([{
-        id: crypto.randomUUID(),
+        id: ulid(),
         ns: `webhook.${result.event.webhook.provider}`,
         ts: result.event.ts,
         type: 'webhook',

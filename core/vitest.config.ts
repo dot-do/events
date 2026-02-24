@@ -17,6 +17,7 @@ export default defineWorkersConfig({
               className: 'EventEmitterTestDO',
               useSQLite: true,
             },
+            CH_BUFFER: 'ClickHouseBufferDO',
           },
         },
       },

@@ -19,6 +19,7 @@ export type { PipelineLike, ResolvedEmitterOptions } from './types.js'
 export type {
   EventType,
   EpcisEventType,
+  Actor,
   BaseEvent,
   Event,
   EventBatch,
@@ -504,5 +505,5 @@ export {
 } from './config.js'
 
 // === ClickHouse Buffer DO ===
-export { ClickHouseBufferDO, toNdjsonRow, FLUSH_INTERVAL_MS, FIRST_SHARD_LIMITS, DEFAULT_LIMITS } from './ch-buffer-do.js'
+export { ClickHouseBufferDO, toNdjsonRow, FLUSH_INTERVAL_MS, SHARD_LIMITS } from './ch-buffer-do.js'
 export type { BufferEnv } from './ch-buffer-do.js'

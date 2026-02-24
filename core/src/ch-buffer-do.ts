@@ -2,11 +2,11 @@
  * ClickHouseBufferDO — Batched event buffer for real-time ClickHouse ingestion.
  *
  * Hibernatable WebSocket DO that accumulates events in memory and flushes to
- * ClickHouse in batches (~100ms intervals). Callers open a WebSocket, send
- * JSON arrays of events, and close. The DO batches and inserts via HTTP.
+ * ClickHouse in batches (~50ms intervals). BufferService distributes events
+ * across 8-64 shards via round-robin — each shard handles 1/N of the load.
  *
- * Overload protection: returns 429 when buffer exceeds limits (bytes, count,
- * or connection count). Shard-0 has lower limits to trigger scale-out faster.
+ * Overload protection: returns 429 when buffer exceeds limits so BufferService
+ * can scale out to more shards.
  *
  * Durability: Events in the buffer are NOT persisted to DO storage.
  * The Pipeline -> R2 -> S3Queue path is the durable log of record.
@@ -15,14 +15,32 @@
  */
 import { DurableObject } from 'cloudflare:workers'
 
+const ULID_ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/
+
+function ulid(): string {
+  let str = ''
+  let ts = Date.now()
+  for (let i = 9; i >= 0; i--) {
+    str = ULID_ENCODING[ts % 32] + str
+    ts = Math.floor(ts / 32)
+  }
+  const random = new Uint8Array(16)
+  crypto.getRandomValues(random)
+  for (let i = 0; i < 16; i++) {
+    str += ULID_ENCODING[random[i] % 32]
+  }
+  return str
+}
+
 /** Flush interval — accumulate events for this long before sending to ClickHouse. */
-export const FLUSH_INTERVAL_MS = 100
+export const FLUSH_INTERVAL_MS = 50
 
-/** Shard-0 limits — lower thresholds for faster scale-out. */
-export const FIRST_SHARD_LIMITS = { bytes: 10 * 1024 * 1024, count: 10_000, conns: 200 } as const
+/** Safety alarm delay — fallback flush for events buffered without a time-based flush. */
+export const ALARM_SAFETY_MS = 150
 
-/** Default limits for all other shards. */
-export const DEFAULT_LIMITS = { bytes: 50 * 1024 * 1024, count: 50_000, conns: 1000 } as const
+/** All shards have the same limits — BufferService handles distribution. */
+export const SHARD_LIMITS = { bytes: 50 * 1024 * 1024, count: 50_000, conns: 1000 } as const
 
 /** ClickHouse fetch timeout to prevent hung connections. */
 const CH_FETCH_TIMEOUT_MS = 10_000
@@ -35,7 +53,8 @@ export interface BufferEnv {
 
 /**
  * Maps a raw event record to the ClickHouse `platform.events` NDJSON row shape.
- * `actor`, `data`, and `meta` are serialized to JSON strings for the native JSON columns.
+ * `actor`, `data`, and `meta` are native JSON columns — passed as raw objects
+ * so the outer JSON.stringify produces proper nested JSON for JSONEachRow format.
  */
 export function toNdjsonRow(r: Record<string, unknown>): string {
   // Normalize actor: if string (legacy), wrap as { id }; if missing, empty object
@@ -43,16 +62,16 @@ export function toNdjsonRow(r: Record<string, unknown>): string {
   const actor = typeof rawActor === 'string' ? (rawActor ? { id: rawActor } : {}) : rawActor ?? {}
 
   return JSON.stringify({
-    id: r.id ?? crypto.randomUUID(),
+    id: typeof r.id === 'string' && ULID_RE.test(r.id) ? r.id : ulid(),
     ns: r.ns ?? '',
     ts: r.ts ?? new Date().toISOString(),
     type: r.type ?? '',
     event: r.event ?? '',
     url: r.url ?? '',
     source: r.source ?? '',
-    actor: typeof actor === 'string' ? actor : JSON.stringify(actor),
-    data: typeof r.data === 'string' ? r.data : JSON.stringify(r.data ?? {}),
-    meta: typeof r.meta === 'string' ? r.meta : JSON.stringify(r.meta ?? {}),
+    actor,
+    data: typeof r.data === 'string' ? JSON.parse(r.data) : (r.data ?? {}),
+    meta: typeof r.meta === 'string' ? JSON.parse(r.meta) : (r.meta ?? {}),
   })
 }
 
@@ -60,27 +79,6 @@ export class ClickHouseBufferDO extends DurableObject<BufferEnv> {
   buffer: Array<Record<string, unknown>> = []
   bufferBytes = 0
   lastFlushTime = 0
-  limits: { bytes: number; count: number; conns: number }
-
-  constructor(ctx: DurableObjectState, env: BufferEnv) {
-    super(ctx, env)
-    this.limits = this.detectLimits(ctx, env)
-  }
-
-  /** Detect whether this is shard-0 (lower limits) or a default shard. */
-  private detectLimits(
-    ctx: DurableObjectState,
-    env: BufferEnv,
-  ): { bytes: number; count: number; conns: number } {
-    try {
-      if (env.CH_BUFFER && ctx.id.toString() === env.CH_BUFFER.idFromName('shard-0').toString()) {
-        return { ...FIRST_SHARD_LIMITS }
-      }
-    } catch {
-      // env.CH_BUFFER may not exist in test environments
-    }
-    return { ...DEFAULT_LIMITS }
-  }
 
   // -- WebSocket upgrade (only entry point) ----------------------------------
 
@@ -91,9 +89,9 @@ export class ClickHouseBufferDO extends DurableObject<BufferEnv> {
 
     // Reject new connections when overloaded
     if (
-      this.bufferBytes >= this.limits.bytes ||
-      this.buffer.length >= this.limits.count ||
-      this.ctx.getWebSockets().length >= this.limits.conns
+      this.bufferBytes >= SHARD_LIMITS.bytes ||
+      this.buffer.length >= SHARD_LIMITS.count ||
+      this.ctx.getWebSockets().length >= SHARD_LIMITS.conns
     ) {
       return new Response('Buffer overloaded', { status: 429 })
     }
@@ -122,6 +120,11 @@ export class ClickHouseBufferDO extends DurableObject<BufferEnv> {
     if (now - this.lastFlushTime >= FLUSH_INTERVAL_MS) {
       this.lastFlushTime = now
       await this.flush()
+    } else {
+      // Safety net: set an alarm to flush stranded events if no more messages arrive.
+      // Without this, events buffered between flushes could sit indefinitely
+      // if the connection goes idle (hibernated) with no close event.
+      this.ctx.storage.setAlarm(Date.now() + ALARM_SAFETY_MS)
     }
   }
 
@@ -136,8 +139,12 @@ export class ClickHouseBufferDO extends DurableObject<BufferEnv> {
     console.error('[ch-buffer] WebSocket error:', error)
   }
 
-  /** No-op: safely handles any legacy in-flight alarms. */
-  async alarm(): Promise<void> {}
+  /** Safety-net flush: drain any stranded events left in the buffer. */
+  async alarm(): Promise<void> {
+    if (this.buffer.length > 0) {
+      await this.flush()
+    }
+  }
 
   // -- Flush logic -----------------------------------------------------------
 

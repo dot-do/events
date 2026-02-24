@@ -5,6 +5,7 @@
  * Failure path: pipeline.send() fails → persist to DO storage → alarm retry
  */
 
+import type { Actor } from './types/base.js'
 import type { Event, EventEmitterOptions, EventLogger, PipelineLike, ResolvedEmitterOptions } from './types.js'
 import { EventBufferFullError, CircuitBreakerOpenError } from './types.js'
 import { ulid } from './ulid.js'
@@ -31,7 +32,7 @@ export type EmitInput = {
   ns?: string | undefined
   url?: string | undefined
   source?: string | undefined
-  actor?: string | undefined
+  actor?: Actor | undefined
   meta?: Record<string, unknown> | undefined
   id?: string | undefined
   ts?: string | undefined
@@ -109,7 +110,7 @@ export class EventEmitter {
       event: input.event,
       url: input.url ?? '',
       source: input.source ?? 'events.do',
-      actor: input.actor ?? '',
+      actor: input.actor ?? {},
       data: input.data,
       meta: { ...input.meta, do: this.doIdentity },
     } as Event
