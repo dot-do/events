@@ -9,11 +9,10 @@
 
 const ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ' // Crockford Base32
 
-export function ulid(): string {
-  const now = Date.now()
+export function ulid(timestamp?: number): string {
   let str = ''
   // Timestamp (48 bits = 10 chars)
-  let ts = now
+  let ts = timestamp ?? Date.now()
   for (let i = 9; i >= 0; i--) {
     str = ENCODING[ts % 32] + str
     ts = Math.floor(ts / 32)

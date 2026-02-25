@@ -18,9 +18,9 @@ import { DurableObject } from 'cloudflare:workers'
 const ULID_ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/
 
-function ulid(): string {
+function ulid(timestamp?: number): string {
   let str = ''
-  let ts = Date.now()
+  let ts = timestamp ?? Date.now()
   for (let i = 9; i >= 0; i--) {
     str = ULID_ENCODING[ts % 32] + str
     ts = Math.floor(ts / 32)
@@ -63,8 +63,9 @@ export function toNdjsonRow(r: Record<string, unknown>): string {
 
   return JSON.stringify({
     id: typeof r.id === 'string' && ULID_RE.test(r.id) ? r.id : ulid(),
+    ray: r.ray ?? '',
     ns: r.ns ?? '',
-    ts: r.ts ?? new Date().toISOString(),
+    domain: r.domain ?? '',
     type: r.type ?? '',
     event: r.event ?? '',
     url: r.url ?? '',
