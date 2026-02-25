@@ -1,231 +1,88 @@
 /**
- * Tail Worker - Capture worker traces and write to Parquet + Pipeline
+ * Tail Worker — Pipeline-only (events.do canonical)
  *
- * Dual-write architecture:
- * 1. EventWriterDO → Parquet on R2 (events.do lakehouse, flat typed columns)
- * 2. EVENTS_PIPELINE → R2 → S3Queue → ClickHouse (minimal records, MV normalizes)
+ * Captures ALL trace types from tailed workers and forwards to Pipeline.
+ * Pipeline → R2 → S3Queue → ClickHouse (~10-90s latency, durable).
  *
- * The pipeline path sends only { id, ts, source: 'tail', data: <full trace> }.
+ * Sends MINIMAL records: { id, source, data }. No ts — derived from ULID.
  * All normalization (ns, type, event, url, ray, actor) is derived downstream
- * in the ClickHouse S3Queue MV (streams.ingest).
+ * in the ClickHouse S3Queue MV (streams.ingest). This means improving
+ * normalization only requires recreating the MV — no worker redeployment.
  *
- * Loop prevention:
- * - events.do worker IS tailed -> traces come here
- * - This worker is NOT tailed -> chain stops
- * - DO can log freely, its logs are part of this worker's execution
+ * `data` contains the ENTIRE TraceItem — logs, exceptions, diagnostics,
+ * cpu/wall time, DO IDs, request headers, cf object, everything.
+ * The MV extracts: hostname from data.event.request.url → ns,
+ * cf-ray from data.event.request.headers → ray,
+ * data.event.request.cf → actor geo, and classifies type/event from event shape.
+ *
+ * Only two things MUST stay at source:
+ *   1. maskTrace() — redact sensitive data BEFORE it hits R2 (durable log)
+ *   2. Self-filter — prevent infinite loops (tail worker traces itself)
+ *
+ * This worker is NOT tailed (prevents infinite loops).
  */
 
-import { ingestWithOverflow } from './event-writer-do'
-import type { EventRecord } from './event-writer'
-import { ulid } from './event-writer'
-import type { Env as FullEnv } from './env'
-import { logger, sanitize } from './logger'
-import { ClickHouseBufferDO } from '../core/src/ch-buffer-do'
+import { ulid } from '../core/src/ulid'
 
-// Re-export for wrangler (tail worker deploys its own ClickHouseBufferDO)
-export { ClickHouseBufferDO }
+// =============================================================================
+// Sensitive data masking — prevent API keys from leaking into R2/ClickHouse
+// =============================================================================
 
-const log = logger.child({ component: 'tail' })
+const SENSITIVE_HEADERS = new Set(['authorization', 'x-api-key', 'x-auth-token', 'cookie'])
+const SENSITIVE_PARAMS = /[?&](apikey|api_key|token)=[^&]*/gi
 
-type Env = Pick<FullEnv, 'EVENTS_BUCKET' | 'EVENT_WRITER' | 'EVENTS_PIPELINE' | 'TAIL_AUTH_SECRET'>
-
-// ============================================================================
-// Auth helper
-// ============================================================================
-function checkAuth(request: Request, env: Env): Response | null {
-  const secret = env.TAIL_AUTH_SECRET
-  if (!secret) {
-    // If no secret is configured, deny all requests as a safe default
-    return Response.json({ error: 'Server misconfigured: no auth secret' }, { status: 500 })
+function maskTrace(trace: TraceItem): unknown {
+  const data = JSON.parse(JSON.stringify(trace))
+  const evt = data.event as Record<string, unknown> | null
+  if (evt && typeof evt === 'object') {
+    const req = (evt as { request?: { url?: string; headers?: Record<string, string> } }).request
+    if (req) {
+      if (req.headers && typeof req.headers === 'object') {
+        for (const key of Object.keys(req.headers)) {
+          if (SENSITIVE_HEADERS.has(key.toLowerCase())) {
+            req.headers[key] = '[REDACTED]'
+          }
+        }
+      }
+      if (typeof req.url === 'string') {
+        req.url = req.url.replace(SENSITIVE_PARAMS, (match) => {
+          const eqIdx = match.indexOf('=')
+          return match.slice(0, eqIdx + 1) + '[REDACTED]'
+        })
+      }
+    }
   }
-  const authHeader = request.headers.get('Authorization')
-  if (!authHeader || authHeader !== `Bearer ${secret}`) {
-    return Response.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-  return null
+  return data
 }
 
-// ============================================================================
-// Exports
-// ============================================================================
+// =============================================================================
+// Tail handler — Pipeline-only (no Buffer DO to avoid feedback loop)
+// =============================================================================
+
+interface TailEnv {
+  EVENTS_PIPELINE: { send(events: unknown[]): Promise<void> }
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url)
-
-    // All HTTP endpoints require authentication
-    const authError = checkAuth(request, env)
-    if (authError) return authError
-
-    // Status endpoint
-    if (url.pathname === '/status') {
-      return Response.json({
-        service: 'tail',
-        architecture: 'shared-do-immediate',
-      })
-    }
-
-    // List recent files (now under 'events/' prefix, not 'tail/')
-    if (url.pathname === '/stats') {
-      const listed = await env.EVENTS_BUCKET.list({
-        prefix: 'events/',
-        limit: 100,
-      })
-
-      const sorted = listed.objects.sort((a, b) =>
-        (b.uploaded?.getTime() ?? 0) - (a.uploaded?.getTime() ?? 0)
-      )
-
-      const files = await Promise.all(
-        sorted.slice(0, 20).map(async (obj) => {
-          const head = await env.EVENTS_BUCKET.head(obj.key)
-          return {
-            key: obj.key,
-            size: obj.size,
-            uploaded: obj.uploaded?.toISOString(),
-            ...head?.customMetadata,
-          } as { key: string; size: number; uploaded?: string; events?: string; cpuMs?: string }
-        })
-      )
-
-      // Summary
-      const totalEvents = files.reduce((s, f) => s + parseInt(f.events ?? '0'), 0)
-      const totalBytes = files.reduce((s, f) => s + (f.size ?? 0), 0)
-      const avgCpuMs = files.length > 0
-        ? files.reduce((s, f) => s + parseFloat(f.cpuMs ?? '0'), 0) / files.length
-        : 0
-
-      return Response.json({
-        summary: {
-          files: files.length,
-          totalEvents,
-          totalBytes,
-          avgEventsPerFile: files.length > 0 ? Math.round(totalEvents / files.length) : 0,
-          avgBytesPerEvent: totalEvents > 0 ? Math.round(totalBytes / totalEvents) : 0,
-          avgCpuMs: avgCpuMs.toFixed(2),
-        },
-        files,
-      })
-    }
-
-    return Response.json({
-      service: 'tail',
-      architecture: 'shared-do-immediate',
-      endpoints: ['/status', '/stats'],
-    })
-  },
-
-  async tail(events: TraceItem[], env: Env): Promise<void> {
-    log.info('tail() called', { eventCount: events.length })
-
+  async tail(events: TraceItem[], env: TailEnv): Promise<void> {
     if (events.length === 0) return
 
-    // Parse trace events into records
-    const records: EventRecord[] = []
+    const records: Record<string, unknown>[] = []
+
     for (const trace of events) {
-      // Skip self to prevent any potential loops (belt + suspenders)
-      if (trace.scriptName === 'tail') continue
+      // Skip tail/otel workers to prevent infinite loops
+      if (trace.scriptName === 'tail' || trace.scriptName === 'otel') continue
 
-      // Determine event type and extract request info
-      let eventType = 'unknown'
-      let method: string | undefined
-      let url: string | undefined
-      let statusCode: number | undefined
-
-      // Check execution model for DO events
-      const execModel = (trace as { executionModel?: string }).executionModel
-      const entrypoint = (trace as { entrypoint?: string }).entrypoint
-
-      if (trace.event) {
-        if ('request' in trace.event) {
-          eventType = 'fetch'
-          const req = trace.event.request as { method?: string; url?: string }
-          method = req.method
-          url = req.url
-
-          if ('response' in trace.event) {
-            const res = trace.event.response as { status?: number }
-            statusCode = res.status
-          }
-        } else if ('rpcMethod' in trace.event) {
-          // Durable Object RPC call
-          const rpcMethod = (trace.event as { rpcMethod?: string }).rpcMethod
-          eventType = entrypoint ? `do.${entrypoint}.${rpcMethod}` : `rpc.${rpcMethod}`
-          method = rpcMethod
-        } else if ('scheduledTime' in trace.event) {
-          eventType = 'scheduled'
-        } else if ('queue' in trace.event) {
-          eventType = 'queue'
-        } else if ('alarm' in trace.event || (trace.event as { type?: string }).type === 'alarm') {
-          eventType = entrypoint ? `do.${entrypoint}.alarm` : 'alarm'
-        } else if ('type' in trace.event) {
-          eventType = String(trace.event.type)
-        }
-      } else if (execModel === 'durableObject' && entrypoint) {
-        // DO event without specific event info
-        eventType = `do.${entrypoint}`
-      }
-
-      // Calculate duration from logs or event
-      let durationMs: number | undefined
-      if (trace.eventTimestamp && trace.logs.length > 0) {
-        const lastLog = trace.logs[trace.logs.length - 1]
-        if (lastLog?.timestamp) {
-          durationMs = lastLog.timestamp - trace.eventTimestamp
-        }
-      }
-
-      // Safely serialize entire TraceItem (TraceLog/TraceException aren't serializable for RPC)
-      let safePayload: unknown
-      try {
-        // JSON round-trip to strip non-serializable values
-        // Then sanitize to remove any sensitive data from logs/traces
-        const serialized = JSON.parse(JSON.stringify(trace))
-        safePayload = sanitize.payload(serialized)
-      } catch (e) {
-        log.warn('Serialization error', { error: sanitize.errorMessage(String(e)) })
-        safePayload = { event: { type: eventType }, scriptName: trace.scriptName }
-      }
-
-      // Create event record
-      const record: EventRecord = {
-        ts: new Date(trace.eventTimestamp ?? Date.now()).toISOString(),
-        type: `tail.${trace.scriptName ?? 'unknown'}.${eventType}`,
+      const eventTime = trace.eventTimestamp ?? Date.now()
+      records.push({
+        id: ulid(eventTime),
         source: 'tail',
-        scriptName: trace.scriptName ?? 'unknown',
-        outcome: trace.outcome,
-        eventType,
-        method,
-        url,
-        statusCode,
-        durationMs,
-        payload: safePayload,
-      }
-
-      records.push(record)
+        data: maskTrace(trace),
+      })
     }
 
     if (records.length === 0) return
 
-    // 1. EventWriterDO (Parquet on R2) — events.do's own lakehouse storage
-    const result = await ingestWithOverflow(env, records, 'tail')
-    if (!result.ok) log.error('Failed DO ingest', { shard: result.shard })
-    else log.info('DO ingested', { shard: result.shard, buffered: result.buffered })
-
-    // 2. Pipeline → R2 → S3Queue → ClickHouse (minimal records, MV normalizes)
-    //    Sends { id, ts, source, data } only — MV derives ns/type/event/url/ray/actor
-    if (env.EVENTS_PIPELINE) {
-      const pipelineRecords = records.map((r) => ({
-        id: ulid(),
-        ts: r.ts,
-        source: 'tail',
-        data: r.payload,
-      }))
-      try {
-        await env.EVENTS_PIPELINE.send(pipelineRecords)
-        log.info('Pipeline sent', { count: pipelineRecords.length })
-      } catch (err) {
-        log.error('Pipeline send failed', { error: String(err) })
-      }
-    }
+    await env.EVENTS_PIPELINE.send(records)
   },
 }

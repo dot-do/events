@@ -96,8 +96,7 @@
 
   // Tail worker for event streaming
   "tail_consumers": [
-    { "service": "tail" },
-    { "service": "headlessly-tail" }
+    { "service": "tail" }
   ],
 
   // Development environment
