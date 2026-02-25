@@ -70,19 +70,30 @@ async function sendWebhookEvent(
     else log.info('Ingested webhook event', { shard: r.shard, buffered: r.buffered })
   })
 
-  // 2. Canonical shape for headless.ly pipeline: { id, ns, type, event, source, data }
+  // 2. Canonical shape for headless.ly pipeline
+  const provider = result.event.webhook.provider
+  const eventType = result.event.webhook.eventType
+  const payload = result.event.payload as Record<string, unknown> | undefined
+
+  // Derive ns from payload: github.com/{owner}, stripe customer, etc.
+  const ns = provider === 'github'
+    ? `github.com/${(payload?.organization as Record<string, unknown>)?.login ?? (payload?.repository as Record<string, unknown>)?.owner?.login ?? provider}`
+    : provider === 'stripe'
+      ? `stripe/${(payload?.account as string) ?? 'unknown'}`
+      : provider
+
   const pipelineWrite = env.EVENTS_PIPELINE
     ? emit(env.EVENTS_PIPELINE, {
-        ns: result.event.webhook.provider,
-        type: 'webhook',
-        event: result.event.type,
+        ns,
+        type: `${provider}.${eventType}`,
+        event: `${provider}.${eventType}`,
         url: result.event.source,
-        source: result.event.webhook.provider,
+        source: provider,
         ray,
-        actor: { id: result.event.webhook.provider, deliveryId: result.event.webhook.deliveryId },
+        actor: { id: provider, deliveryId: result.event.webhook.deliveryId },
         data: {
-          provider: result.event.webhook.provider,
-          eventType: result.event.webhook.eventType,
+          provider,
+          eventType,
           deliveryId: result.event.webhook.deliveryId,
           verified: result.event.webhook.verified,
           payload: result.event.payload,
