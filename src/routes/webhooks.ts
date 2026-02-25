@@ -13,23 +13,7 @@ import type { EventRecord } from '../event-writer'
 import { corsHeaders } from '../utils'
 import { checkRateLimit, type RateLimitEnv } from '../middleware/rate-limit'
 import { logger } from '../logger'
-
-const ULID_ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
-
-function ulid(): string {
-  let str = ''
-  let ts = Date.now()
-  for (let i = 9; i >= 0; i--) {
-    str = ULID_ENCODING[ts % 32] + str
-    ts = Math.floor(ts / 32)
-  }
-  const random = new Uint8Array(16)
-  crypto.getRandomValues(random)
-  for (let i = 0; i < 16; i++) {
-    str += ULID_ENCODING[random[i] % 32]
-  }
-  return str
-}
+import { emit } from '../../core/src/emit.js'
 
 const log = logger.child({ component: 'Webhooks' })
 
@@ -86,17 +70,15 @@ async function sendWebhookEvent(
     else log.info('Ingested webhook event', { shard: r.shard, buffered: r.buffered })
   })
 
-  // 2. Canonical shape for headless.ly pipeline: { id, ns, ts, type, event, source, data }
+  // 2. Canonical shape for headless.ly pipeline: { id, ns, type, event, source, data }
   const pipelineWrite = env.EVENTS_PIPELINE
-    ? env.EVENTS_PIPELINE.send([{
-        id: ulid(),
-        ray,
+    ? emit(env.EVENTS_PIPELINE, {
         ns: result.event.webhook.provider,
-        ts: result.event.ts,
         type: 'webhook',
         event: result.event.type,
         url: result.event.source,
         source: result.event.webhook.provider,
+        ray,
         actor: { id: result.event.webhook.provider, deliveryId: result.event.webhook.deliveryId },
         data: {
           provider: result.event.webhook.provider,
@@ -105,8 +87,6 @@ async function sendWebhookEvent(
           verified: result.event.webhook.verified,
           payload: result.event.payload,
         },
-      }]).catch((err) => {
-        log.error('Pipeline send failed', { error: String(err) })
       })
     : Promise.resolve()
 
