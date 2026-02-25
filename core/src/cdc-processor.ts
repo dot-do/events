@@ -730,6 +730,10 @@ export class CDCProcessorDO extends DurableObject<Env> {
    * Alarm handler - triggers flush
    */
   async alarm(): Promise<void> {
-    await this.flushInternal()
+    try {
+      await this.flushInternal()
+    } catch (err) {
+      console.error('[CDCProcessor] Alarm flush failed:', err)
+    }
   }
 }

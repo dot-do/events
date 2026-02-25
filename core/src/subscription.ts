@@ -1725,72 +1725,80 @@ export class SubscriptionDO extends DurableObject<Env> {
    * @returns A promise that resolves when alarm processing completes
    */
   async alarm(): Promise<void> {
-    const now = Date.now()
+    try {
+      const now = Date.now()
 
-    // Close any batches whose windows have expired
-    this.sql.exec(
-      `UPDATE batch_deliveries
-       SET window_end = ?, next_attempt_at = ?
-       WHERE status = 'pending'
-       AND window_end IS NULL
-       AND window_start + (
-         SELECT batch_window_ms FROM subscriptions WHERE id = batch_deliveries.subscription_id
-       ) <= ?`,
-      now,
-      now,
-      now
-    )
+      // Close any batches whose windows have expired
+      this.sql.exec(
+        `UPDATE batch_deliveries
+         SET window_end = ?, next_attempt_at = ?
+         WHERE status = 'pending'
+         AND window_end IS NULL
+         AND window_start + (
+           SELECT batch_window_ms FROM subscriptions WHERE id = batch_deliveries.subscription_id
+         ) <= ?`,
+        now,
+        now,
+        now
+      )
 
-    // Process batch deliveries ready for delivery
-    const readyBatches = this.sql.exec(
-      `SELECT id FROM batch_deliveries
-       WHERE status IN ('pending', 'failed')
-       AND window_end IS NOT NULL
-       AND next_attempt_at <= ?
-       ORDER BY next_attempt_at ASC
-       LIMIT ?`,
-      now,
-      SUBSCRIPTION_BATCH_LIMIT
-    ).toArray()
+      // Process batch deliveries ready for delivery
+      const readyBatches = this.sql.exec(
+        `SELECT id FROM batch_deliveries
+         WHERE status IN ('pending', 'failed')
+         AND window_end IS NOT NULL
+         AND next_attempt_at <= ?
+         ORDER BY next_attempt_at ASC
+         LIMIT ?`,
+        now,
+        SUBSCRIPTION_BATCH_LIMIT
+      ).toArray()
 
-    for (const row of readyBatches) {
-      await this.deliverBatch(getString(row as SqlRow, 'id'))
+      for (const row of readyBatches) {
+        await this.deliverBatch(getString(row as SqlRow, 'id'))
+      }
+
+      // Process individual failed deliveries ready for retry
+      const ready = this.sql.exec(
+        `SELECT id FROM deliveries
+         WHERE status = 'failed' AND next_attempt_at <= ?
+         AND batch_id IS NULL
+         ORDER BY next_attempt_at ASC
+         LIMIT ?`,
+        now,
+        SUBSCRIPTION_BATCH_LIMIT
+      ).toArray()
+
+      for (const row of ready) {
+        await this.deliverOne(getString(row as SqlRow, 'id'))
+      }
+    } catch (err) {
+      console.error('[SubscriptionManager] Alarm failed:', err)
     }
 
-    // Process individual failed deliveries ready for retry
-    const ready = this.sql.exec(
-      `SELECT id FROM deliveries
-       WHERE status = 'failed' AND next_attempt_at <= ?
-       AND batch_id IS NULL
-       ORDER BY next_attempt_at ASC
-       LIMIT ?`,
-      now,
-      SUBSCRIPTION_BATCH_LIMIT
-    ).toArray()
-
-    for (const row of ready) {
-      await this.deliverOne(getString(row as SqlRow, 'id'))
-    }
-
-    // Schedule next alarm if more retries/batches pending
+    // Always reschedule — never let pending deliveries stall
     await this.scheduleRetryAlarm()
     await this.scheduleBatchAlarm()
 
     // Check for open batches that need window-end alarms
-    const openBatch = this.sql.exec(
-      `SELECT MIN(b.window_start + s.batch_window_ms) as next_window
-       FROM batch_deliveries b
-       JOIN subscriptions s ON b.subscription_id = s.id
-       WHERE b.status = 'pending'
-       AND b.window_end IS NULL`
-    ).one()
+    try {
+      const openBatch = this.sql.exec(
+        `SELECT MIN(b.window_start + s.batch_window_ms) as next_window
+         FROM batch_deliveries b
+         JOIN subscriptions s ON b.subscription_id = s.id
+         WHERE b.status = 'pending'
+         AND b.window_end IS NULL`
+      ).one()
 
-    if (openBatch?.next_window) {
-      const nextWindow = getNumber(openBatch as SqlRow, 'next_window')
-      const currentAlarm = await this.ctx.storage.getAlarm()
-      if (!currentAlarm || nextWindow < currentAlarm) {
-        await this.ctx.storage.setAlarm(nextWindow)
+      if (openBatch?.next_window) {
+        const nextWindow = getNumber(openBatch as SqlRow, 'next_window')
+        const currentAlarm = await this.ctx.storage.getAlarm()
+        if (!currentAlarm || nextWindow < currentAlarm) {
+          await this.ctx.storage.setAlarm(nextWindow)
+        }
       }
+    } catch (err) {
+      console.error('[SubscriptionManager] Batch window alarm scheduling failed:', err)
     }
   }
 

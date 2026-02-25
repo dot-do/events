@@ -591,17 +591,21 @@ export class SubscriptionShardCoordinatorDO extends DurableObject<Env> {
   // ──────────────────────────────────────────────────────────────────────────
 
   async alarm(): Promise<void> {
-    log.info('Health check running')
+    try {
+      log.info('Health check running')
 
-    // Clean up stale metrics (older than metrics window)
-    const cutoff = Date.now() - this.config.metricsWindowMs
-    for (const state of this.prefixStates.values()) {
-      state.metrics = state.metrics.filter(m => m.lastReportTime > cutoff)
+      // Clean up stale metrics (older than metrics window)
+      const cutoff = Date.now() - this.config.metricsWindowMs
+      for (const state of this.prefixStates.values()) {
+        state.metrics = state.metrics.filter(m => m.lastReportTime > cutoff)
+      }
+
+      await this.persist()
+    } catch (error) {
+      logError(log, 'Health check alarm failed', error)
     }
 
-    await this.persist()
-
-    // Schedule next health check
+    // Always reschedule — never let the health check loop die
     this.ctx.storage.setAlarm(Date.now() + this.config.healthCheckIntervalMs)
   }
 

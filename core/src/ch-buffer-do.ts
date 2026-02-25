@@ -142,8 +142,12 @@ export class ClickHouseBufferDO extends DurableObject<BufferEnv> {
 
   /** Safety-net flush: drain any stranded events left in the buffer. */
   async alarm(): Promise<void> {
-    if (this.buffer.length > 0) {
-      await this.flush()
+    try {
+      if (this.buffer.length > 0) {
+        await this.flush()
+      }
+    } catch (err) {
+      console.error('[CHBufferDO] Alarm flush failed:', err)
     }
   }
 

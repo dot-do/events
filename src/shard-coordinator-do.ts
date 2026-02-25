@@ -583,14 +583,18 @@ export class ShardCoordinatorDO extends DurableObject<Env> {
   // ──────────────────────────────────────────────────────────────────────────
 
   async alarm(): Promise<void> {
-    // Periodic health check and potential scale down
-    const stats = await this.getStats()
-    log.info('Health check', { shards: stats.activeShards.length, avgUtilization: parseFloat(stats.averageUtilization.toFixed(2)) })
+    try {
+      // Periodic health check and potential scale down
+      const stats = await this.getStats()
+      log.info('Health check', { shards: stats.activeShards.length, avgUtilization: parseFloat(stats.averageUtilization.toFixed(2)) })
 
-    // Try to scale if needed
-    await this.maybeScale()
+      // Try to scale if needed
+      await this.maybeScale()
+    } catch (error) {
+      logError(log, 'Health check alarm failed', error)
+    }
 
-    // Schedule next health check
+    // Always reschedule — never let the health check loop die
     this.ctx.storage.setAlarm(Date.now() + this.config.healthCheckIntervalMs)
   }
 

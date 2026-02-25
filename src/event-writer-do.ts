@@ -360,11 +360,13 @@ export class EventWriterDO extends DurableObject<Env> {
 
       return result
     } catch (err) {
+      const log = logger.child({ component: 'EventWriterDO', shard: this.shardId })
+      logError(log, 'Ingest failed', err, { eventCount: events.length })
       recordWriterDOMetric(this.env.ANALYTICS, 'ingest', 'error', {
         events: events.length,
         shard: this.shardId,
       }, timer.elapsed())
-      throw err
+      return { ok: false, buffered: this.buffer.length, shard: this.shardId }
     } finally {
       this.pendingWrites--
     }
@@ -459,15 +461,20 @@ export class EventWriterDO extends DurableObject<Env> {
       if (this.buffer.length > 0) {
         await this.flush()
       }
+    } catch (error) {
+      logError(log, 'Alarm flush failed — will retry', error, {
+        bufferSize: this.buffer.length,
+      })
+      // Reschedule so we retry the flush
+      this.scheduleFlush()
+    }
 
+    try {
       // Clean up expired dedup markers to prevent unbounded storage growth
       await this.cleanupExpiredDedupMarkers()
     } catch (error) {
-      logError(log, 'Alarm handler failed', error, {
-        bufferSize: this.buffer.length,
-        flushScheduled: this.flushScheduled,
-      })
-      throw error
+      logError(log, 'Dedup marker cleanup failed', error)
+      // Non-fatal — markers just accumulate until next successful cleanup
     }
   }
 
@@ -605,7 +612,7 @@ export class EventWriterDO extends DurableObject<Env> {
     } catch (error) {
       // On error, put events back in buffer (storage still has them persisted)
       const log = logger.child({ component: 'EventWriterDO', shard: this.shardId })
-      logError(log, 'Flush failed - events returned to buffer', error, { eventCount: events.length })
+      logError(log, 'Flush failed — events returned to buffer', error, { eventCount: events.length })
       this.buffer.unshift(...events)
 
       // Record failed flush metric
@@ -617,7 +624,7 @@ export class EventWriterDO extends DurableObject<Env> {
       // Record R2 write failure
       recordR2WriteMetric(this.env.ANALYTICS, 'error', events.length, 0, timer.elapsed())
 
-      throw error
+      return null
     }
   }
 }
