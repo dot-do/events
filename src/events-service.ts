@@ -87,7 +87,7 @@ export interface SqlResult {
 
 const CH_DATABASE = 'platform'
 const CH_TABLE = 'events'
-const CH_COLUMNS = 'id, ns, ts, type, event, source, url, data'
+const CH_COLUMNS = 'id, ns, ULIDStringToDateTime(id) AS ts, type, event, source, url, data'
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 1000
 const DEFAULT_WINDOW_DAYS = 7
@@ -164,15 +164,15 @@ function buildWhereClause(
 
   // Time window — default to last 7 days when no time filter is specified
   if (filters.since) {
-    parts.push('ts >= {since:DateTime64(3)}')
+    parts.push('ULIDStringToDateTime(id) >= {since:DateTime64(3)}')
     params.since = parseSince(filters.since)
   } else if (!filters.until) {
-    parts.push('ts >= {since:DateTime64(3)}')
+    parts.push('ULIDStringToDateTime(id) >= {since:DateTime64(3)}')
     params.since = new Date(Date.now() - DEFAULT_WINDOW_DAYS * 86_400_000).toISOString().replace(/Z$/, '')
   }
 
   if (filters.until) {
-    parts.push('ts <= {until:DateTime64(3)}')
+    parts.push('ULIDStringToDateTime(id) <= {until:DateTime64(3)}')
     params.until = filters.until
   }
 

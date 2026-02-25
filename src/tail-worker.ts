@@ -76,7 +76,7 @@ export default {
       const eventTime = trace.eventTimestamp ?? Date.now()
       records.push({
         id: ulid(eventTime),
-        source: 'tail',
+        source: trace.scriptName || 'tail',
         data: maskTrace(trace),
       })
     }

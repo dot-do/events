@@ -13,7 +13,7 @@ import type { EventRecord } from '../event-writer'
 import { corsHeaders } from '../utils'
 import { checkRateLimit, type RateLimitEnv } from '../middleware/rate-limit'
 import { logger } from '../logger'
-import { emit } from '../../core/src/emit.js'
+import { emitEvents } from '../../core/src/emit.js'
 
 const log = logger.child({ component: 'Webhooks' })
 
@@ -70,7 +70,7 @@ async function sendWebhookEvent(
     else log.info('Ingested webhook event', { shard: r.shard, buffered: r.buffered })
   })
 
-  // 2. Canonical shape for headless.ly pipeline
+  // 2. Canonical shape for headless.ly pipeline + BufferDO (dual-write)
   const provider = result.event.webhook.provider
   const eventType = result.event.webhook.eventType
   const payload = result.event.payload as Record<string, unknown> | undefined
@@ -82,8 +82,10 @@ async function sendWebhookEvent(
       ? `stripe/${(payload?.account as string) ?? 'unknown'}`
       : provider
 
-  const pipelineWrite = env.EVENTS_PIPELINE
-    ? emit(env.EVENTS_PIPELINE, {
+  ctx.waitUntil(
+    emitEvents(
+      { EVENTS_PIPELINE: env.EVENTS_PIPELINE, EVENTS: env.EVENTS },
+      {
         ns,
         type: `${provider}.${eventType}`,
         event: `${provider}.${eventType}`,
@@ -98,11 +100,11 @@ async function sendWebhookEvent(
           verified: result.event.webhook.verified,
           payload: result.event.payload,
         },
-      })
-    : Promise.resolve()
+      },
+      ctx,
+    ),
+  )
 
-  // Run both in parallel — pipeline write in background so it doesn't block response
-  ctx.waitUntil(pipelineWrite)
   await doWrite
 }
 

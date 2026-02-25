@@ -43,6 +43,8 @@ export interface Env extends WebhookEnv {
   BENCHMARK_BUCKET: R2Bucket
   /** Headlessly pipeline — used ONLY by webhook handler to forward canonical events to headless.ly */
   EVENTS_PIPELINE?: Pipeline<Record<string, unknown>>
+  /** Self-binding for EventsService RPC (BufferDO writes) */
+  EVENTS?: { ingest(events: Record<string, unknown>[]): Promise<void> }
   CATALOG: DurableObjectNamespace<CatalogDO>
   SUBSCRIPTIONS: DurableObjectNamespace<SubscriptionDO>
   CDC_PROCESSOR: DurableObjectNamespace<CDCProcessorDO>

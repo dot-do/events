@@ -13,5 +13,8 @@
   // Buffer DO (direct CH insert) is reserved for POST /e ingest only.
   "pipelines": [
     { "binding": "EVENTS_PIPELINE", "pipeline": "d8f32274e86b42f68624144111579a26" }
+  ],
+  "migrations": [
+    { "tag": "v2", "deleted_classes": ["ClickHouseBufferDO"] }
   ]
 }

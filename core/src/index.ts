@@ -364,8 +364,8 @@ export { createSnapshot, restoreSnapshot, listSnapshots, deleteSnapshot } from '
 
 // === Shared Emit ===
 
-export { emit, emitBatch } from './emit.js'
-export type { EmitEvent, Pipeline } from './emit.js'
+export { emit, emitBatch, emitEvents, emitRawRecords, formatRecord } from './emit.js'
+export type { EmitEvent, EmitEnv, Pipeline } from './emit.js'
 
 // === Utilities ===
 

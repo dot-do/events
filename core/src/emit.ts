@@ -87,3 +87,72 @@ export async function emitBatch(pipeline: Pipeline, events: EmitEvent[]): Promis
     console.error('[emitBatch] Pipeline send failed:', err)
   }
 }
+
+// =============================================================================
+// Unified emission — Pipeline (durable) + BufferDO (real-time ClickHouse)
+// =============================================================================
+
+export interface EmitEnv {
+  EVENTS_PIPELINE?: Pipeline
+  EVENTS?: { ingest(events: Record<string, unknown>[]): Promise<void> }
+}
+
+export function formatRecord(event: EmitEvent): Record<string, unknown> {
+  return {
+    id: ulid(event.timestamp),
+    ray: event.ray ?? '',
+    ns: event.ns,
+    domain: event.domain ?? '',
+    type: event.type,
+    event: event.event,
+    url: event.url ?? '',
+    source: event.source,
+    actor: event.actor ?? {},
+    data: event.data,
+    meta: event.meta ?? {},
+  }
+}
+
+/**
+ * Unified event emission — Pipeline (durable) + BufferDO (real-time CH).
+ * Either binding can be absent. Errors caught and logged.
+ * BufferDO writes are non-blocking when ctx is provided.
+ */
+export async function emitEvents(
+  env: EmitEnv,
+  events: EmitEvent | EmitEvent[],
+  ctx?: { waitUntil(p: Promise<unknown>): void },
+): Promise<void> {
+  const batch = Array.isArray(events) ? events : [events]
+  if (batch.length === 0) return
+  const records = batch.map(formatRecord)
+  await _sendRecords(env, records, ctx)
+}
+
+/**
+ * Emit pre-formatted records (for CDC and other producers that build their own shape).
+ */
+export async function emitRawRecords(
+  env: EmitEnv,
+  records: Record<string, unknown>[],
+  ctx?: { waitUntil(p: Promise<unknown>): void },
+): Promise<void> {
+  if (records.length === 0) return
+  await _sendRecords(env, records, ctx)
+}
+
+async function _sendRecords(
+  env: EmitEnv,
+  records: Record<string, unknown>[],
+  ctx?: { waitUntil(p: Promise<unknown>): void },
+): Promise<void> {
+  if (env.EVENTS_PIPELINE) {
+    try { await env.EVENTS_PIPELINE.send(records) }
+    catch (err) { console.error('[emit] Pipeline send failed:', err) }
+  }
+  if (env.EVENTS) {
+    const p = env.EVENTS.ingest(records).catch((err: unknown) =>
+      console.error('[emit] BufferDO ingest failed:', err))
+    ctx ? ctx.waitUntil(p) : await p
+  }
+}
