@@ -452,14 +452,23 @@ export class EventWriterDO extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     this.flushScheduled = false
+    const log = logger.child({ component: 'EventWriterDO', shard: this.shardId })
 
-    // Flush any buffered events
-    if (this.buffer.length > 0) {
-      await this.flush()
+    try {
+      // Flush any buffered events
+      if (this.buffer.length > 0) {
+        await this.flush()
+      }
+
+      // Clean up expired dedup markers to prevent unbounded storage growth
+      await this.cleanupExpiredDedupMarkers()
+    } catch (error) {
+      logError(log, 'Alarm handler failed', error, {
+        bufferSize: this.buffer.length,
+        flushScheduled: this.flushScheduled,
+      })
+      throw error
     }
-
-    // Clean up expired dedup markers to prevent unbounded storage growth
-    await this.cleanupExpiredDedupMarkers()
   }
 
   // ──────────────────────────────────────────────────────────────────────────

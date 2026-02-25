@@ -16,6 +16,7 @@
  */
 
 import { readParquetRecords, mergeParquetRecords, writeCompactedParquet } from './compaction.js'
+import { ulid } from './ulid.js'
 
 // ============================================================================
 // Types
@@ -93,23 +94,6 @@ const DEFAULT_MAX_BYTES = 100 * 1024 * 1024 // 100MB
 const DEFAULT_MAX_EVENTS = 1_000_000 // 1M events
 const DEFAULT_PREFIXES = ['events']
 const DEFAULT_DAYS_BACK = 7
-
-// ULID generation
-const ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
-
-function ulid(): string {
-  const now = Date.now()
-  let str = ''
-  let ts = now
-  for (let i = 9; i >= 0; i--) {
-    str = ENCODING[ts % 32] + str
-    ts = Math.floor(ts / 32)
-  }
-  for (let i = 0; i < 16; i++) {
-    str += ENCODING[Math.floor(Math.random() * 32)]
-  }
-  return str
-}
 
 // ============================================================================
 // Main Compaction Function
