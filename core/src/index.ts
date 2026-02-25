@@ -362,6 +362,11 @@ export { compactEventStream } from './event-compaction.js'
 export type { SnapshotOptions, SnapshotResult } from './snapshot.js'
 export { createSnapshot, restoreSnapshot, listSnapshots, deleteSnapshot } from './snapshot.js'
 
+// === Shared Emit ===
+
+export { emit, emitBatch } from './emit.js'
+export type { EmitEvent, Pipeline } from './emit.js'
+
 // === Utilities ===
 
 export { ulid } from './ulid.js'

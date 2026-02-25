@@ -142,20 +142,20 @@ export function createLogger(baseContext: LogContext = {}, minLevel: LogLevel = 
       entry.context = mergedContext
     }
 
-    // Output as JSON to the appropriate console method
-    const output = JSON.stringify(entry)
+    // Output as structured object so tail workers receive queryable JSON
+    // (not a stringified string) — enables ClickHouse columnar JSON indexing
     switch (level) {
       case 'debug':
-        console.debug(output)
+        console.debug(entry)
         break
       case 'info':
-        console.info(output)
+        console.info(entry)
         break
       case 'warn':
-        console.warn(output)
+        console.warn(entry)
         break
       case 'error':
-        console.error(output)
+        console.error(entry)
         break
     }
   }

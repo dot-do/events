@@ -58,7 +58,7 @@ describe('Logger', () => {
       log.info('Test message')
 
       expect(consoleSpy.info).toHaveBeenCalledTimes(1)
-      const output = JSON.parse(consoleSpy.info.mock.calls[0][0] as string)
+      const output = consoleSpy.info.mock.calls[0][0]
       expect(output.level).toBe('info')
       expect(output.message).toBe('Test message')
       expect(output.timestamp).toBeDefined()
@@ -68,7 +68,7 @@ describe('Logger', () => {
       const log = createLogger({ component: 'test', requestId: 'abc123' })
       log.info('Test message')
 
-      const output = JSON.parse(consoleSpy.info.mock.calls[0][0] as string)
+      const output = consoleSpy.info.mock.calls[0][0]
       expect(output.context.component).toBe('test')
       expect(output.context.requestId).toBe('abc123')
     })
@@ -77,7 +77,7 @@ describe('Logger', () => {
       const log = createLogger({ component: 'test' })
       log.info('Test message', { userId: 'user1' })
 
-      const output = JSON.parse(consoleSpy.info.mock.calls[0][0] as string)
+      const output = consoleSpy.info.mock.calls[0][0]
       expect(output.context.component).toBe('test')
       expect(output.context.userId).toBe('user1')
     })
@@ -86,7 +86,7 @@ describe('Logger', () => {
       const log = createLogger({ correlationId: 'corr-123', component: 'test' })
       log.info('Test message')
 
-      const output = JSON.parse(consoleSpy.info.mock.calls[0][0] as string)
+      const output = consoleSpy.info.mock.calls[0][0]
       expect(output.correlationId).toBe('corr-123')
       expect(output.context.component).toBe('test')
       // correlationId should not be in context
@@ -127,7 +127,7 @@ describe('Logger', () => {
 
       childLog.info('Child message')
 
-      const output = JSON.parse(consoleSpy.info.mock.calls[0][0] as string)
+      const output = consoleSpy.info.mock.calls[0][0]
       expect(output.correlationId).toBe('corr-123')
       expect(output.context.component).toBe('child')
       expect(output.context.namespace).toBe('ns1')
@@ -325,7 +325,7 @@ describe('Logger', () => {
       expect(requestContext.path).toBe('/api/test')
 
       logger.info('Test message')
-      const output = JSON.parse(consoleSpy.info.mock.calls[0][0] as string)
+      const output = consoleSpy.info.mock.calls[0][0]
       expect(output.correlationId).toBe('req-corr-123')
     })
 
@@ -335,7 +335,7 @@ describe('Logger', () => {
       const { logger } = createLoggerFromRequest(request, { namespace: 'test-ns' })
 
       logger.info('Test message')
-      const output = JSON.parse(consoleSpy.info.mock.calls[0][0] as string)
+      const output = consoleSpy.info.mock.calls[0][0]
       expect(output.context.namespace).toBe('test-ns')
     })
   })
@@ -396,7 +396,7 @@ describe('Logger', () => {
 
       logError(log, 'Operation failed', error)
 
-      const output = JSON.parse(consoleSpy.error.mock.calls[0][0] as string)
+      const output = consoleSpy.error.mock.calls[0][0]
       expect(output.message).toBe('Operation failed')
       expect(output.correlationId).toBe('err-test')
       expect(output.context.error.name).toBe('Error')
@@ -408,7 +408,7 @@ describe('Logger', () => {
 
       logError(log, 'Operation failed', 'string error')
 
-      const output = JSON.parse(consoleSpy.error.mock.calls[0][0] as string)
+      const output = consoleSpy.error.mock.calls[0][0]
       expect(output.context.error).toContain('string error')
     })
 
@@ -418,7 +418,7 @@ describe('Logger', () => {
 
       logError(log, 'Operation failed', error, { userId: 'user123', action: 'delete' })
 
-      const output = JSON.parse(consoleSpy.error.mock.calls[0][0] as string)
+      const output = consoleSpy.error.mock.calls[0][0]
       expect(output.context.userId).toBe('user123')
       expect(output.context.action).toBe('delete')
     })
@@ -555,7 +555,7 @@ describe('createRequestLogger', () => {
 
     log.info('Test message')
 
-    const output = JSON.parse(consoleSpy.mock.calls[0][0] as string)
+    const output = consoleSpy.mock.calls[0][0]
     expect(output.correlationId).toBe('corr-456')
     expect(output.context.requestId).toBe('req-123')
     expect(output.context.namespace).toBe('test-ns')

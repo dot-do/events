@@ -210,7 +210,7 @@ export class EventsService extends WorkerEntrypoint<Env> {
   // Private: ClickHouse HTTP query
   // -------------------------------------------------------------------------
 
-  private async chQuery(query: string, params: Record<string, string | number> = {}): Promise<{ data: Record<string, unknown>[]; meta: Array<{ name: string; type: string }>; elapsed: number }> {
+  private async chQuery(query: string, params: Record<string, string | number> = {}): Promise<{ data: Record<string, unknown>[]; meta: Array<{ name: string; type: string }>; elapsed: number; networkMs: number }> {
     const rawUrl = this.env.CLICKHOUSE_URL
     const password = this.env.CLICKHOUSE_PASSWORD
     if (!rawUrl || !password) throw new Error('CLICKHOUSE_URL / CLICKHOUSE_PASSWORD not configured')
@@ -230,6 +230,7 @@ export class EventsService extends WorkerEntrypoint<Env> {
       const timer = setTimeout(() => controller.abort(), CH_TIMEOUT_MS)
 
       try {
+        const fetchStart = performance.now()
         const resp = await fetch(chUrl.toString(), {
           method: 'POST',
           headers: {
@@ -250,10 +251,13 @@ export class EventsService extends WorkerEntrypoint<Env> {
             rows: number
             elapsed: number
           }
+          const networkMs = Math.round(performance.now() - fetchStart)
           // Convert columnar JSONCompact → array of objects
           const names = json.meta.map((m) => m.name)
           const data = json.data.map((row) => Object.fromEntries(names.map((n, i) => [n, row[i]])))
-          return { data, meta: json.meta, elapsed: json.elapsed }
+          const chMs = Math.round(json.elapsed * 1000)
+          console.log(`[ch] ${data.length} rows, ${networkMs}ms network, ${chMs}ms ch-exec${attempt > 0 ? `, attempt ${attempt + 1}` : ''}`)
+          return { data, meta: json.meta, elapsed: json.elapsed, networkMs }
         }
 
         // Retry on 5xx
@@ -322,24 +326,28 @@ export class EventsService extends WorkerEntrypoint<Env> {
   async search(filters: EventFilters = {}, scope?: string | string[]): Promise<EventSearchResult> {
     const limit = clamp(filters.limit ?? DEFAULT_LIMIT, 1, MAX_LIMIT)
     const offset = filters.cursor ?? 0
-    const sort = filters.sort ?? 'desc'
     const { clause, params } = buildWhereClause(filters, scope)
 
-    const countQuery = `SELECT count() AS total FROM ${CH_TABLE} ${clause}`
-    const dataQuery = `SELECT ${CH_COLUMNS} FROM ${CH_TABLE} ${clause} ORDER BY ts ${sort} LIMIT {limit:UInt32} OFFSET {offset:UInt32}`
+    // Fetch limit+1 to determine hasMore without a separate count query
+    const fetchLimit = limit + 1
+    const dataQuery = `SELECT ${CH_COLUMNS} FROM ${CH_TABLE} ${clause} ORDER BY id DESC LIMIT {fetchLimit:UInt32} OFFSET {offset:UInt32}`
 
-    const allParams = { ...params, limit, offset }
+    const allParams = { ...params, fetchLimit, offset }
 
-    const [countResult, dataResult] = await Promise.all([this.chQuery(countQuery, allParams), this.chQuery(dataQuery, allParams)])
+    const t0 = performance.now()
+    const dataResult = await this.chQuery(dataQuery, allParams)
+    const queryMs = Math.round(performance.now() - t0)
+    console.log(`[events] search: ${dataResult.data.length} rows, ${queryMs}ms (ch: ${Math.round(dataResult.elapsed * 1000)}ms)`)
 
-    const total = Number(countResult.data[0]?.total ?? 0)
+    const hasMore = dataResult.data.length > limit
+    const data = hasMore ? dataResult.data.slice(0, limit) : dataResult.data
 
     return {
-      data: dataResult.data,
-      total,
+      data,
+      total: hasMore ? offset + limit + 1 : offset + data.length, // estimate — exact count not available without extra query
       limit,
       offset,
-      hasMore: offset + limit < total,
+      hasMore,
     }
   }
 
@@ -360,13 +368,16 @@ export class EventsService extends WorkerEntrypoint<Env> {
     const { clause, params } = buildWhereClause(filters ?? {}, scope)
     const query = `SELECT ${dimension} AS value, count() AS count FROM ${CH_TABLE} ${clause} GROUP BY ${dimension} ORDER BY count DESC LIMIT {bucketLimit:UInt32}`
 
+    const t0 = performance.now()
     const result = await this.chQuery(query, { ...params, bucketLimit })
+    const queryMs = Math.round(performance.now() - t0)
 
     const facets = result.data.map((row) => ({
       value: String(row.value ?? ''),
       count: Number(row.count ?? 0),
     }))
     const total = facets.reduce((sum, f) => sum + f.count, 0)
+    console.log(`[events] facets(${dimension}): ${facets.length} buckets, ${queryMs}ms (ch: ${Math.round(result.elapsed * 1000)}ms)`)
 
     return { facets, total }
   }
