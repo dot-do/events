@@ -25,6 +25,13 @@
 import { ulid } from '../core/src/ulid'
 
 // =============================================================================
+// Pricing — flat per-request pricing in USD microcents (1 USD = 100,000,000)
+// =============================================================================
+
+/** Per-request price: $0.00001 = 1,000 microcents. Matches PRICING.request in apps/api/src/lib/pricing.ts */
+const REQUEST_PRICE_MICROCENTS = 1_000
+
+// =============================================================================
 // Sensitive data masking — prevent API keys from leaking into R2/ClickHouse
 // =============================================================================
 
@@ -74,10 +81,14 @@ export default {
       if (trace.scriptName === 'tail' || trace.scriptName === 'otel') continue
 
       const eventTime = trace.eventTimestamp ?? Date.now()
+      const masked = maskTrace(trace) as Record<string, unknown>
+      // Stamp flat per-request pricing into event data (emission-time pricing)
+      masked.cost = 0
+      masked.price = REQUEST_PRICE_MICROCENTS
       records.push({
         id: ulid(eventTime),
         source: trace.scriptName || 'tail',
-        data: maskTrace(trace),
+        data: masked,
       })
     }
 
