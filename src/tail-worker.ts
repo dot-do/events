@@ -82,7 +82,10 @@ export default {
 
       const eventTime = trace.eventTimestamp ?? Date.now()
       const masked = maskTrace(trace) as Record<string, unknown>
-      // Stamp flat per-request pricing into event data (emission-time pricing)
+      // Stamp flat per-request pricing into event data (emission-time pricing).
+      // `cost` and `price` are reserved top-level keys on tail event data — ClickHouse
+      // queries extract them as ev.data.cost.:Int64 and ev.data.price.:Int64.
+      // TraceItem does not natively contain these fields, so no collision risk.
       masked.cost = 0
       masked.price = REQUEST_PRICE_MICROCENTS
       records.push({
